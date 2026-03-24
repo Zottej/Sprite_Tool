@@ -1,0 +1,3 @@
+@echo off
+echo Starting JOA Sprite Padder...
+npm run dev
