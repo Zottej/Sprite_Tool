@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { 
   Trash2, Plus, Archive, CheckSquare, Square, 
-  Target, FolderSync, Save, AlertTriangle, Eraser, RotateCcw, Search, MapPin, Pencil, MoreHorizontal, FlipHorizontal, FlipVertical
+  Target, FolderSync, Save, AlertTriangle, Eraser, RotateCcw, Search, MapPin, Pencil, MoreHorizontal, FlipHorizontal, FlipVertical, Droplets, Grid
 } from 'lucide-react';
 import JSZip from 'jszip';
 
@@ -32,6 +32,7 @@ interface SpriteData {
   contrast?: number;
   saturation?: number;
   hue?: number;
+  opacity?: number;
   originalImg?: HTMLImageElement; // Store original for reset
   scale?: number;
   rotation?: number;
@@ -40,7 +41,50 @@ interface SpriteData {
   flipH?: boolean;
   flipV?: boolean;
   regions?: Region[];
+  grayscale?: number;
+  sepia?: number;
+  invert?: number;
+  blur?: number;
+  exposure?: number;
+  outlineColor?: string;
+  outlineWidth?: number;
+  shadowX?: number;
+  shadowY?: number;
+  shadowBlur?: number;
+  shadowColor?: string;
+  glowIntensity?: number;
+  glowColor?: string;
 }
+
+const getSpriteFilter = (sprite: SpriteData) => {
+  const b = sprite.brightness ?? 100;
+  const c = sprite.contrast ?? 100;
+  const s = sprite.saturation ?? 100;
+  const o = sprite.opacity ?? 100;
+  const hRotate = sprite.hue ?? 0;
+  const gs = sprite.grayscale ?? 0;
+  const sp = sprite.sepia ?? 0;
+  const inv = sprite.invert ?? 0;
+  const bl = sprite.blur ?? 0;
+  const exp = sprite.exposure ?? 100;
+
+  let filter = `brightness(${b * (exp / 100)}%) contrast(${c}%) saturate(${s}%) hue-rotate(${hRotate}deg) opacity(${o}%) grayscale(${gs}%) sepia(${sp}%) invert(${inv}%) blur(${bl}px)`;
+  
+  if (sprite.shadowColor && (sprite.shadowX || sprite.shadowY || sprite.shadowBlur)) {
+    filter += ` drop-shadow(${sprite.shadowX || 0}px ${sprite.shadowY || 0}px ${sprite.shadowBlur || 0}px ${sprite.shadowColor})`;
+  }
+  
+  if (sprite.glowColor && sprite.glowIntensity) {
+    filter += ` drop-shadow(0 0 ${sprite.glowIntensity}px ${sprite.glowColor})`;
+  }
+  
+  if (sprite.outlineColor && sprite.outlineWidth) {
+    const w = sprite.outlineWidth;
+    const oc = sprite.outlineColor;
+    filter += ` drop-shadow(${w}px 0 0 ${oc}) drop-shadow(-${w}px 0 0 ${oc}) drop-shadow(0 ${w}px 0 ${oc}) drop-shadow(0 -${w}px 0 ${oc})`;
+  }
+  return filter;
+};
 
 const generateId = () => {
   try { return crypto.randomUUID(); } catch (e) { return Math.random().toString(36).substring(2, 15) + Date.now().toString(36); }
@@ -91,12 +135,7 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
     ctx.imageSmoothingEnabled = false;
     ctx.clearRect(0, 0, w, h);
     
-    // Apply filters
-    const b = sprite.brightness ?? 100;
-    const c = sprite.contrast ?? 100;
-    const s = sprite.saturation ?? 100;
-    const hRotate = sprite.hue ?? 0;
-    ctx.filter = `brightness(${b}%) contrast(${c}%) saturate(${s}%) hue-rotate(${hRotate}deg)`;
+    ctx.filter = getSpriteFilter(sprite);
 
     if (sprite.pixelation && sprite.pixelation > 1) {
       const p = sprite.pixelation;
@@ -291,15 +330,15 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose }) =>
     
     const ctx = canvas.getContext('2d')!;
     const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    const x = (e.clientX - rect.left) / zoom;
+    const y = (e.clientY - rect.top) / zoom;
 
     setMousePos({ x, y });
 
     if (!isDrawing) return;
 
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
+    const scaleX = canvas.width / (rect.width / zoom);
+    const scaleY = canvas.height / (rect.height / zoom);
     
     ctx.globalCompositeOperation = 'destination-out';
     ctx.beginPath();
@@ -356,7 +395,7 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose }) =>
               onMouseMove={erase}
               onMouseEnter={(e) => {
                 const rect = e.currentTarget.getBoundingClientRect();
-                setMousePos({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+                setMousePos({ x: (e.clientX - rect.left) / zoom, y: (e.clientY - rect.top) / zoom });
               }}
               onMouseLeave={() => {
                 setIsDrawing(false);
@@ -508,7 +547,7 @@ const TaggingModal: React.FC<TaggingModalProps> = ({ sprite, onSave, onClose }) 
     ctx.drawImage(sprite.img, 0, 0);
 
     // Draw existing regions
-    regions.forEach(r => {
+    regions.forEach((r: Region) => {
       ctx.strokeStyle = '#ffcc00';
       ctx.lineWidth = 2 / zoom;
       ctx.strokeRect(r.x, r.y, r.w, r.h);
@@ -573,7 +612,7 @@ const TaggingModal: React.FC<TaggingModalProps> = ({ sprite, onSave, onClose }) 
   };
 
   const jsonOutput = JSON.stringify(
-    regions.map(({ label, x, y, w, h }) => ({ label, x, y, w, h })), 
+    regions.map(({ label, x, y, w, h }: Region) => ({ label, x, y, w, h })), 
     null, 2
   );
 
@@ -612,7 +651,7 @@ const TaggingModal: React.FC<TaggingModalProps> = ({ sprite, onSave, onClose }) 
             <div className="sidebar-section">
               <span className="section-title">Zonas Registradas</span>
               <div className="region-list">
-                {regions.map(r => (
+                {regions.map((r: Region) => (
                   <div key={r.id} className="region-item">
                     <div className="region-info">
                       <span className="region-label">{r.label}</span>
@@ -683,15 +722,15 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose }) => {
     
     const ctx = canvas.getContext('2d')!;
     const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    const x = (e.clientX - rect.left) / zoom;
+    const y = (e.clientY - rect.top) / zoom;
 
     setMousePos({ x, y });
 
     if (!isDrawing) return;
 
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
+    const scaleX = canvas.width / (rect.width / zoom);
+    const scaleY = canvas.height / (rect.height / zoom);
     
     ctx.globalCompositeOperation = 'source-over';
     ctx.fillStyle = paintColor;
@@ -739,7 +778,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose }) => {
               onMouseMove={draw}
               onMouseEnter={(e) => {
                 const rect = e.currentTarget.getBoundingClientRect();
-                setMousePos({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+                setMousePos({ x: (e.clientX - rect.left) / zoom, y: (e.clientY - rect.top) / zoom });
               }}
               onMouseLeave={() => {
                 setIsDrawing(false);
@@ -807,7 +846,7 @@ const App: React.FC = () => {
   const commitSprites = (newSprites: SpriteData[]) => {
     setSprites(newSprites);
     const newHistory = history.slice(0, historyIndex + 1);
-    newHistory.push([...newSprites.map(s => ({...s, padding: {...s.padding}}))]);
+    newHistory.push([...newSprites.map((s: SpriteData) => ({...s, padding: {...s.padding}}))]);
     if (newHistory.length > 50) newHistory.shift();
     setHistory(newHistory);
     setHistoryIndex(newHistory.length - 1);
@@ -841,8 +880,14 @@ const App: React.FC = () => {
     return () => window.removeEventListener('keydown', handleKey);
   }, [historyIndex, history]);
   const [targets, setTargets] = useState({ top: 100, bottom: 100, left: 100, right: 100 });
-  const [dirHandle, setDirHandle] = useState<any>(null);
+  const [dirHandle, setDirHandle] = useState<FileSystemDirectoryHandle | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  const [showGridlines, setShowGridlines] = useState(false);
+  const [highlightedYs, setHighlightedYs] = useState<number[]>([]);
+  const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
+
+  useEffect(() => {
+  }, []);
 
   const handleFiles = async (files: FileList | File[]) => {
     const newSprites: SpriteData[] = [];
@@ -877,20 +922,21 @@ const App: React.FC = () => {
         brightness: 100,
         contrast: 100,
         saturation: 100,
-        hue: 0
+        hue: 0,
+        opacity: 100
       });
     }
     if (newSprites.length > 0) {
       const merged = [...sprites, ...newSprites];
       commitSprites(merged);
-      setSelection(newSprites.map(s => s.id));
+      setSelection(newSprites.map((s: SpriteData) => s.id));
     }
   };
 
   const toggleSelect = (id: string, multi: boolean) => {
     if (multi) {
       setSelection(prev => {
-        const newSel = prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id];
+        const newSel = prev.includes(id) ? prev.filter((i: string) => i !== id) : [...prev, id];
         if (!newSel.includes(id) && referenceId === id) setReferenceId(null);
         return newSel;
       });
@@ -922,7 +968,7 @@ const App: React.FC = () => {
         const ctx = canvas.getContext('2d')!;
         ctx.imageSmoothingEnabled = false;
         
-        ctx.filter = `brightness(${s.brightness ?? 100}%) contrast(${s.contrast ?? 100}%) saturate(${s.saturation ?? 100}%) hue-rotate(${s.hue ?? 0}deg)`;
+        ctx.filter = `brightness(${s.brightness ?? 100}%) contrast(${s.contrast ?? 100}%) saturate(${s.saturation ?? 100}%) opacity(${s.opacity ?? 100}%) hue-rotate(${s.hue ?? 0}deg)`;
 
         const rot = (s.rotation || 0) * Math.PI / 180;
         const ox = s.offsetX || 0;
@@ -974,15 +1020,33 @@ const App: React.FC = () => {
   };
 
   const updateBulkScale = (val: number) => {
-    const next = sprites.map(s => selection.includes(s.id) ? { ...s, scale: val } : s);
+    const next = sprites.map((s: SpriteData) => selection.includes(s.id) ? { ...s, scale: val } : s);
+    commitSprites(next);
+  };
+
+  const updateBulkWidth = (val: number) => {
+    const next = sprites.map((s: SpriteData) => {
+      if (!selection.includes(s.id)) return s;
+      const newScale = val / s.img.width;
+      return { ...s, scale: newScale };
+    });
+    commitSprites(next);
+  };
+
+  const updateBulkHeight = (val: number) => {
+    const next = sprites.map((s: SpriteData) => {
+      if (!selection.includes(s.id)) return s;
+      const newScale = val / s.img.height;
+      return { ...s, scale: newScale };
+    });
     commitSprites(next);
   };
 
   const applyReferenceScale = () => {
-    const ref = sprites.find(s => s.id === referenceId);
+    const ref = sprites.find((s: SpriteData) => s.id === referenceId);
     if (!ref) return;
     const refW = ref.img.width * (ref.scale || 1);
-    const next = sprites.map(s => {
+    const next = sprites.map((s: SpriteData) => {
       if (!selection.includes(s.id) || s.id === referenceId) return s;
       const newScale = refW / s.img.width;
       return { ...s, scale: newScale };
@@ -991,7 +1055,7 @@ const App: React.FC = () => {
   };
 
   const applyAlignment = () => {
-    const next = sprites.map(s => {
+    const next = sprites.map((s: SpriteData) => {
       if (!selection.includes(s.id) || !s.anchor) return s;
       const sc = s.scale || 1;
       return {
@@ -1016,12 +1080,12 @@ const App: React.FC = () => {
     const refH = ref.img.height * refSc + ref.padding.top + ref.padding.bottom;
     
     // Proportional anchor position in the reference frame
-    const rLeft = (ref.padding.left + ref.anchor.x * refSc) / refW;
-    const rTop = (ref.padding.top + ref.anchor.y * refSc) / refH;
+    const rLeft = Math.max(0.001, Math.min(0.999, (ref.padding.left + ref.anchor.x * refSc) / refW));
+    const rTop = Math.max(0.001, Math.min(0.999, (ref.padding.top + ref.anchor.y * refSc) / refH));
     const rRight = 1 - rLeft;
     const rBottom = 1 - rTop;
 
-    const next = sprites.map(s => {
+    const next = sprites.map((s: SpriteData) => {
       if (!selection.includes(s.id) || s.id === referenceId || !s.anchor) return s;
       
       const sc = s.scale || 1;
@@ -1048,17 +1112,103 @@ const App: React.FC = () => {
   };
 
   const updateBulkPadding = (side: keyof Padding, val: number) => {
-     const next = sprites.map(s => selection.includes(s.id) ? { ...s, padding: { ...s.padding, [side]: val } } : s);
+     const next = sprites.map((s: SpriteData) => selection.includes(s.id) ? { ...s, padding: { ...s.padding, [side]: val } } : s);
      commitSprites(next);
   };
 
   const updateBulkPixelation = (val: number) => {
-    const next = sprites.map(s => selection.includes(s.id) ? { ...s, pixelation: val } : s);
+    const next = sprites.map((s: SpriteData) => selection.includes(s.id) ? { ...s, pixelation: val } : s);
     commitSprites(next);
   };
 
-  const updateBulkFilter = (prop: keyof SpriteData, val: number) => {
-    const next = sprites.map(s => selection.includes(s.id) ? { ...s, [prop]: val } : s);
+  const updateBulkFilter = (prop: keyof SpriteData, val: number | string) => {
+    const next = sprites.map((s: SpriteData) => selection.includes(s.id) ? { ...s, [prop]: val } : s);
+    commitSprites(next);
+  };
+
+  const applyReferenceFilters = () => {
+    const ref = sprites.find((s: SpriteData) => s.id === referenceId);
+    if (!ref) return;
+    const next = sprites.map((s: SpriteData) => {
+      if (!selection.includes(s.id) || s.id === referenceId) return s;
+      return { 
+        ...s, 
+        brightness: ref.brightness ?? 100,
+        contrast: ref.contrast ?? 100,
+        saturation: ref.saturation ?? 100,
+        hue: ref.hue ?? 0,
+        opacity: ref.opacity ?? 100,
+        grayscale: ref.grayscale ?? 0,
+        sepia: ref.sepia ?? 0,
+        invert: ref.invert ?? 0,
+        blur: ref.blur ?? 0,
+        exposure: ref.exposure ?? 100,
+        outlineColor: ref.outlineColor,
+        outlineWidth: ref.outlineWidth,
+        shadowX: ref.shadowX,
+        shadowY: ref.shadowY,
+        shadowBlur: ref.shadowBlur,
+        shadowColor: ref.shadowColor,
+        glowIntensity: ref.glowIntensity,
+        glowColor: ref.glowColor
+      };
+    });
+    commitSprites(next);
+  };
+
+  const detectIntrinsicPixelSize = (img: HTMLImageElement): number => {
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return 1;
+    canvas.width = img.width;
+    canvas.height = img.height;
+    ctx.drawImage(img, 0, 0);
+    const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+
+    const getGcd = (a: number, b: number): number => {
+      while (b) { a %= b; [a, b] = [b, a]; }
+      return a;
+    };
+
+    let resultGcd = 0;
+    const sampleRows = [Math.floor(canvas.height / 2), Math.floor(canvas.height / 4), Math.floor(3 * canvas.height / 4)];
+    
+    sampleRows.forEach(row => {
+      let run = 1;
+      for (let x = 1; x < canvas.width; x++) {
+        const idx1 = (row * canvas.width + (x - 1)) * 4;
+        const idx2 = (row * canvas.width + x) * 4;
+        const same = data[idx1] === data[idx2] && data[idx1+1] === data[idx2+1] && data[idx1+2] === data[idx2+2] && data[idx1+3] === data[idx2+3];
+        if (same) {
+          run++;
+        } else {
+          if (run > 0 && data[idx1+3] > 0) { // Only count non-transparent runs
+            resultGcd = resultGcd === 0 ? run : getGcd(resultGcd, run);
+          }
+          run = 1;
+        }
+      }
+    });
+
+    return resultGcd || 1;
+  };
+
+  const applyReferencePixelation = () => {
+    const ref = sprites.find((s: SpriteData) => s.id === referenceId);
+    if (!ref) return;
+    
+    const refBase = detectIntrinsicPixelSize(ref.img);
+    const refTarget = refBase * (ref.scale || 1) * (ref.pixelation || 1);
+
+    const next = sprites.map((s: SpriteData) => {
+      if (!selection.includes(s.id) || s.id === referenceId) return s;
+      const sBase = detectIntrinsicPixelSize(s.img);
+      const sTargetPixelation = refTarget / (sBase * (s.scale || 1));
+      return { 
+        ...s, 
+        pixelation: Math.max(1, Math.round(sTargetPixelation))
+      };
+    });
     commitSprites(next);
   };
 
@@ -1073,7 +1223,7 @@ const App: React.FC = () => {
       canvas.height = sh + s.padding.top + s.padding.bottom;
       const ctx = canvas.getContext('2d')!;
       ctx.imageSmoothingEnabled = false;
-      ctx.filter = `brightness(${s.brightness ?? 100}%) contrast(${s.contrast ?? 100}%) saturate(${s.saturation ?? 100}%) hue-rotate(${s.hue ?? 0}deg)`;
+      ctx.filter = getSpriteFilter(s);
 
       const rot = (s.rotation || 0) * Math.PI / 180;
       const ox = s.offsetX || 0;
@@ -1125,7 +1275,13 @@ const App: React.FC = () => {
       {/* TOP BAR */}
       <header className="top-bar">
         <div className="logo-group">
-          <h1>JOA Engine <span style={{ color: 'var(--text-muted)', fontSize: '0.7rem' }}>SYNC v6</span></h1>
+          <h1 style={{ display: 'flex', alignItems: 'center' }}>
+            JOA Engine <span style={{ color: 'var(--text-muted)', fontSize: '0.7rem', marginLeft: '4px' }}>SYNC v6</span>
+            <label style={{ marginLeft: '16px', fontSize: '0.7rem', display: 'inline-flex', alignItems: 'center', cursor: 'pointer', fontWeight: 'normal', color: 'var(--text-muted)', userSelect: 'none' }}>
+              <input type="checkbox" checked={showGridlines} onChange={(e) => setShowGridlines(e.target.checked)} style={{ marginRight: '6px', cursor: 'pointer' }} />
+              Guías
+            </label>
+          </h1>
         </div>
         <div className="top-actions">
            <button className="btn btn-primary" onClick={() => document.getElementById('grid-up')?.click()}>
@@ -1139,8 +1295,47 @@ const App: React.FC = () => {
         </div>
       </header>
 
-      <div className="main-content">
-        <div className="grid-container" onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); handleFiles(e.dataTransfer.files); }}>
+      <div className="main-content" style={{ position: 'relative', display: 'flex' }}
+        onMouseMove={(e) => {
+          if (draggingIndex !== null) {
+            const container = document.querySelector('.grid-container');
+            if (container) {
+              const rect = container.getBoundingClientRect();
+              const scroll = container.scrollTop;
+              const newY = e.clientY - rect.top + scroll;
+              setHighlightedYs(prev => prev.map((y, i) => i === draggingIndex ? newY : y));
+            }
+          }
+        }}
+        onMouseUp={() => setDraggingIndex(null)}
+        onMouseLeave={() => setDraggingIndex(null)}
+      >
+        {showGridlines && (
+          <div className="left-ruler" onClick={(e) => {
+            if (draggingIndex !== null) return;
+            const rect = e.currentTarget.getBoundingClientRect();
+            const container = document.querySelector('.grid-container');
+            const scroll = container?.scrollTop || 0;
+            const newY = e.clientY - rect.top + scroll;
+            setHighlightedYs(prev => [...prev, newY]);
+          }}>
+            {/* Tick marks every 50px */}
+            {Array.from({ length: 100 }).map((_, i) => (
+              <div key={i} className="ruler-tick" style={{ top: i * 50 }}>
+                <span>{i * 50}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="grid-container" style={{ position: 'relative', flex: 1 }} onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); handleFiles(e.dataTransfer.files); }}>
+          {showGridlines && <div className="grid-overlay" />}
+          {showGridlines && highlightedYs.map((y, idx) => (
+            <div key={idx} className="active-guide-line" style={{ top: y }} 
+              onMouseDown={(e) => { e.stopPropagation(); setDraggingIndex(idx); }}
+              onDoubleClick={() => setHighlightedYs(prev => prev.filter((_, i) => i !== idx))}
+              title="Doble clic para quitar, arrastrar para mover" 
+            />
+          ))}
           {sprites.length === 0 ? (
             <div className="empty-state">
                <label className="dropzone-full" style={{ background: 'rgba(107, 102, 255, 0.02)' }}>
@@ -1151,19 +1346,19 @@ const App: React.FC = () => {
             </div>
           ) : (
             <div className="sprite-grid" style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${280 * gridZoom}px, 1fr))` }}>
-              {sprites.map(s => (
+              {sprites.map((s: SpriteData) => (
                 <SpriteModule key={s.id} sprite={s} 
                   isSelected={selection.includes(s.id)}
                   isReference={referenceId === s.id}
                   onToggleSelect={toggleSelect} 
                   onSetReference={(id) => setReferenceId(id)}
                   onRemove={(id) => {
-                    const next = sprites.filter(x => x.id !== id);
+                    const next = sprites.filter((x: SpriteData) => x.id !== id);
                     commitSprites(next);
                     if (referenceId === id) setReferenceId(null);
                   }} 
                   onSetAnchor={(id, x, y) => {
-                    const next = sprites.map(item => item.id === id ? { ...item, anchor: { x, y } } : item);
+                    const next = sprites.map((item: SpriteData) => item.id === id ? { ...item, anchor: { x, y } } : item);
                     commitSprites(next);
                   }}
                   onOpenEraser={(id) => setEraserTargetId(id)}
@@ -1171,7 +1366,7 @@ const App: React.FC = () => {
                   onOpenTagging={(id) => setTaggingTargetId(id)}
                   onOpenPaint={(id) => setPaintTargetId(id)}
                   onUpdateSprite={(id, updates) => {
-                    const next = sprites.map(s => s.id === id ? { ...s, ...updates } : s);
+                    const next = sprites.map((s: SpriteData) => s.id === id ? { ...s, ...updates } : s);
                     commitSprites(next);
                   }}
                 />
@@ -1225,7 +1420,7 @@ const App: React.FC = () => {
                <FolderSync size={16} /> Igualar Resolución
             </button>
             <button className="btn btn-outline" style={{ marginTop: '8px', width: '100%', borderColor: referenceId ? '#ffcc00' : undefined, color: referenceId ? '#ffcc00' : undefined }} 
-              onClick={applyReferenceAlignment} disabled={!referenceId || selection.length < 2}>
+              onClick={applyReferenceAlignment} disabled={!referenceId || selection.length === 0}>
                <Save size={16} /> Alinear por Referencia
             </button>
           </div>
@@ -1234,10 +1429,26 @@ const App: React.FC = () => {
             <span className="card-title">Ajuste Dinámico - Dimensiones</span>
             <div className="slider-group">
               <div className="slider-item">
-                <div className="slider-label"><span>Escala (Resolución)</span><span>{firstSelected ? (firstSelected.scale || 1).toFixed(2) : 1}x</span></div>
+                <div className="slider-label"><span>Escala</span><span>{firstSelected ? (firstSelected.scale || 1).toFixed(2) : 1}x</span></div>
                 <input type="range" min="0.1" max="4" step="0.05" value={firstSelected ? (firstSelected.scale || 1) : 1}
                   onChange={(e) => updateBulkScale(parseFloat(e.target.value))} disabled={selection.length === 0}
                 />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '8px' }}>
+                <div className="slider-item" style={{ marginBottom: 0 }}>
+                  <div className="slider-label"><span>Ancho (px)</span></div>
+                  <input type="number" step="1" style={{ width: '100%', background: '#1a1a1a', border: '1px solid #333', color: 'white', padding: '4px', borderRadius: '4px' }}
+                    value={firstSelected ? Math.round(firstSelected.img.width * (firstSelected.scale || 1)) : 0}
+                    onChange={(e) => updateBulkWidth(parseInt(e.target.value) || 0)} disabled={selection.length === 0}
+                  />
+                </div>
+                <div className="slider-item" style={{ marginBottom: 0 }}>
+                  <div className="slider-label"><span>Alto (px)</span></div>
+                  <input type="number" step="1" style={{ width: '100%', background: '#1a1a1a', border: '1px solid #333', color: 'white', padding: '4px', borderRadius: '4px' }}
+                    value={firstSelected ? Math.round(firstSelected.img.height * (firstSelected.scale || 1)) : 0}
+                    onChange={(e) => updateBulkHeight(parseInt(e.target.value) || 0)} disabled={selection.length === 0}
+                  />
+                </div>
               </div>
               {(['top', 'right', 'bottom', 'left'] as const).map(side => (
                 <div key={side} className="slider-item">
@@ -1283,6 +1494,94 @@ const App: React.FC = () => {
                   onChange={(e) => updateBulkFilter('hue', parseInt(e.target.value))} disabled={selection.length === 0}
                 />
               </div>
+              <div className="slider-item">
+                <div className="slider-label"><span>Opacidad</span><span>{firstSelected ? (firstSelected.opacity ?? 100) : 100}%</span></div>
+                <input type="range" min="0" max="100" value={firstSelected ? (firstSelected.opacity ?? 100) : 100}
+                  onChange={(e) => updateBulkFilter('opacity', parseInt(e.target.value))} disabled={selection.length === 0}
+                />
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                <div className="slider-item">
+                  <div className="slider-label"><span>Gris</span><span>{firstSelected ? (firstSelected.grayscale ?? 0) : 0}%</span></div>
+                  <input type="range" min="0" max="100" value={firstSelected ? (firstSelected.grayscale ?? 0) : 0}
+                    onChange={(e) => updateBulkFilter('grayscale', parseInt(e.target.value))} disabled={selection.length === 0}
+                  />
+                </div>
+                <div className="slider-item">
+                  <div className="slider-label"><span>Sepia</span><span>{firstSelected ? (firstSelected.sepia ?? 0) : 0}%</span></div>
+                  <input type="range" min="0" max="100" value={firstSelected ? (firstSelected.sepia ?? 0) : 0}
+                    onChange={(e) => updateBulkFilter('sepia', parseInt(e.target.value))} disabled={selection.length === 0}
+                  />
+                </div>
+                <div className="slider-item">
+                  <div className="slider-label"><span>Invertir</span><span>{firstSelected ? (firstSelected.invert ?? 0) : 0}%</span></div>
+                  <input type="range" min="0" max="100" value={firstSelected ? (firstSelected.invert ?? 0) : 0}
+                    onChange={(e) => updateBulkFilter('invert', parseInt(e.target.value))} disabled={selection.length === 0}
+                  />
+                </div>
+                <div className="slider-item">
+                  <div className="slider-label"><span>Blur (px)</span><span>{firstSelected ? (firstSelected.blur ?? 0) : 0}</span></div>
+                  <input type="range" min="0" max="20" value={firstSelected ? (firstSelected.blur ?? 0) : 0}
+                    onChange={(e) => updateBulkFilter('blur', parseInt(e.target.value))} disabled={selection.length === 0}
+                  />
+                </div>
+                <div className="slider-item">
+                  <div className="slider-label"><span>Exposición</span><span>{firstSelected ? (firstSelected.exposure ?? 100) : 100}%</span></div>
+                  <input type="range" min="0" max="200" value={firstSelected ? (firstSelected.exposure ?? 100) : 100}
+                    onChange={(e) => updateBulkFilter('exposure', parseInt(e.target.value))} disabled={selection.length === 0}
+                  />
+                </div>
+              </div>
+
+              {/* Layer Effects Group */}
+              <div style={{ background: 'rgba(0,0,0,0.2)', padding: '12px', borderRadius: '8px', marginTop: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                <span style={{ fontSize: '0.65rem', fontWeight: 'bold', color: 'var(--text-muted)', textTransform: 'uppercase' }}>Contorno y Capas</span>
+                
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '8px', alignItems: 'center' }}>
+                  <div className="slider-item" style={{ marginBottom: 0 }}>
+                    <div className="slider-label"><span>Contorno (p)</span><span>{firstSelected?.outlineWidth || 0}px</span></div>
+                    <input type="range" min="0" max="10" value={firstSelected?.outlineWidth || 0}
+                      onChange={(e) => updateBulkFilter('outlineWidth', parseInt(e.target.value))} disabled={selection.length === 0}
+                    />
+                  </div>
+                  <input type="color" value={firstSelected?.outlineColor || '#ffffff'} 
+                    onChange={(e) => updateBulkFilter('outlineColor', e.target.value)} disabled={selection.length === 0}
+                    style={{ width: '24px', height: '24px', padding: 0, border: 'none', background: 'none', cursor: 'pointer' }}
+                  />
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '8px', alignItems: 'center' }}>
+                  <div className="slider-item" style={{ marginBottom: 0 }}>
+                    <div className="slider-label"><span>Resplandor</span><span>{firstSelected?.glowIntensity || 0}px</span></div>
+                    <input type="range" min="0" max="50" value={firstSelected?.glowIntensity || 0}
+                      onChange={(e) => updateBulkFilter('glowIntensity', parseInt(e.target.value))} disabled={selection.length === 0}
+                    />
+                  </div>
+                  <input type="color" value={firstSelected?.glowColor || '#6b66ff'} 
+                    onChange={(e) => updateBulkFilter('glowColor', e.target.value)} disabled={selection.length === 0}
+                    style={{ width: '24px', height: '24px', padding: 0, border: 'none', background: 'none', cursor: 'pointer' }}
+                  />
+                </div>
+
+                <div className="slider-item" style={{ marginBottom: 0 }}>
+                  <div className="slider-label"><span>Sombra (X, Y, Blur)</span></div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr auto', gap: '4px' }}>
+                    <input type="number" value={firstSelected?.shadowX || 0} onChange={(e) => updateBulkFilter('shadowX', parseInt(e.target.value))} style={{ width: '100%', background: '#1a1a1a', border: '1px solid #333', color: 'white', fontSize: '0.7rem' }} />
+                    <input type="number" value={firstSelected?.shadowY || 0} onChange={(e) => updateBulkFilter('shadowY', parseInt(e.target.value))} style={{ width: '100%', background: '#1a1a1a', border: '1px solid #333', color: 'white', fontSize: '0.7rem' }} />
+                    <input type="number" value={firstSelected?.shadowBlur || 0} onChange={(e) => updateBulkFilter('shadowBlur', parseInt(e.target.value))} style={{ width: '100%', background: '#1a1a1a', border: '1px solid #333', color: 'white', fontSize: '0.7rem' }} />
+                    <input type="color" value={firstSelected?.shadowColor || '#000000'} onChange={(e) => updateBulkFilter('shadowColor', e.target.value)} style={{ width: '16px', height: '16px', padding: 0, border: 'none' }} />
+                  </div>
+                </div>
+              </div>
+              <button className="btn btn-outline" style={{ marginTop: '8px', width: '100%', borderColor: referenceId ? '#ffcc00' : undefined, color: referenceId ? '#ffcc00' : undefined }} 
+                onClick={applyReferenceFilters} disabled={!referenceId || selection.length === 0}>
+                 <Droplets size={16} /> Igualar Efectos
+              </button>
+              <button className="btn btn-outline" style={{ marginTop: '8px', width: '100%', borderColor: referenceId ? '#ffcc00' : undefined, color: referenceId ? '#ffcc00' : undefined }} 
+                onClick={applyReferencePixelation} disabled={!referenceId || selection.length === 0}>
+                 <Grid size={16} /> Igualar Pixelación
+              </button>
             </div>
           </div>
 
@@ -1292,9 +1591,9 @@ const App: React.FC = () => {
           </div>
 
           <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <button className="btn btn-outline" onClick={() => setSelection(sprites.map(s => s.id))}><CheckSquare size={16} /> Todos</button>
+            <button className="btn btn-outline" onClick={() => setSelection(sprites.map((s: SpriteData) => s.id))}><CheckSquare size={16} /> Todos</button>
             <button className="btn btn-danger" onClick={() => { 
-              const next = sprites.filter(s => !selection.includes(s.id));
+              const next = sprites.filter((s: SpriteData) => !selection.includes(s.id));
               commitSprites(next);
               setSelection([]); 
             }}><Trash2 size={16} /> Eliminar</button>
@@ -1307,7 +1606,7 @@ const App: React.FC = () => {
           sprite={sprites.find(s => s.id === eraserTargetId)!} 
           onClose={() => setEraserTargetId(null)}
           onSave={(id: string, newImg: HTMLImageElement) => {
-            const next = sprites.map(s => s.id === id ? { ...s, img: newImg } : s);
+            const next = sprites.map((s: SpriteData) => s.id === id ? { ...s, img: newImg } : s);
             commitSprites(next);
             setEraserTargetId(null);
           }}
@@ -1318,7 +1617,7 @@ const App: React.FC = () => {
           sprite={sprites.find(s => s.id === transformTargetId)!} 
           onClose={() => setTransformTargetId(null)}
           onSave={(id: string, updates: Partial<SpriteData>) => {
-            const next = sprites.map(s => s.id === id ? { ...s, ...updates } : s);
+            const next = sprites.map((s: SpriteData) => s.id === id ? { ...s, ...updates } : s);
             commitSprites(next);
             setTransformTargetId(null);
           }}

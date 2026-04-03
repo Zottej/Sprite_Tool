@@ -80,6 +80,89 @@ body {
   background-size: 40px 40px;
 }
 
+.grid-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  pointer-events: none;
+  z-index: 50;
+  background-image: 
+    linear-gradient(rgba(255, 255, 255, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.08) 1px, transparent 1px);
+  background-size: 50px 50px;
+  background-attachment: local;
+}
+
+.left-ruler {
+  width: 32px;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--border);
+  position: relative;
+  cursor: crosshair;
+  overflow: hidden;
+  flex-shrink: 0;
+  height: 100%;
+}
+
+.ruler-tick {
+  position: absolute;
+  left: 0;
+  width: 100%;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.2);
+  display: flex;
+  align-items: center;
+}
+
+.ruler-tick span {
+  font-size: 0.5rem;
+  color: var(--text-muted);
+  margin-left: 4px;
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
+.active-guide-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent-glow);
+  z-index: 100;
+  cursor: ns-resize;
+}
+
+/* Larger hitbox for dragging */
+.active-guide-line::before {
+  content: "";
+  position: absolute;
+  top: -5px;
+  bottom: -5px;
+  left: 0;
+  right: 0;
+}
+
+.active-guide-line:after {
+  content: "Doble clic para quitar guía";
+  position: absolute;
+  right: 10px;
+  top: -18px;
+  background: var(--accent);
+  color: white;
+  font-size: 0.6rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.active-guide-line:hover:after {
+  opacity: 1;
+}
+
 .sprite-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
