@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { 
   Trash2, Plus, Archive, CheckSquare, Square, 
-  Target, FolderSync, Save, AlertTriangle, Eraser, RotateCcw, Search, MapPin, Pencil, MoreHorizontal, FlipHorizontal, FlipVertical, Droplets, Grid
+  Target, FolderSync, Save, AlertTriangle, Eraser, RotateCcw, Search, MapPin, Pencil, MoreHorizontal, FlipHorizontal, FlipVertical, Droplets, Grid, Circle, Maximize, Layers
 } from 'lucide-react';
 import JSZip from 'jszip';
 
@@ -54,9 +54,13 @@ interface SpriteData {
   shadowColor?: string;
   glowIntensity?: number;
   glowColor?: string;
+  highlights?: number;
+  stretchX?: number;
+  stretchY?: number;
+  posterize?: number;
 }
 
-const getSpriteFilter = (sprite: SpriteData) => {
+const getSpriteFilter = (sprite: SpriteData, isExport = false) => {
   const b = sprite.brightness ?? 100;
   const c = sprite.contrast ?? 100;
   const s = sprite.saturation ?? 100;
@@ -67,8 +71,13 @@ const getSpriteFilter = (sprite: SpriteData) => {
   const inv = sprite.invert ?? 0;
   const bl = sprite.blur ?? 0;
   const exp = sprite.exposure ?? 100;
+  const hl = sprite.highlights ?? 100;
 
-  let filter = `brightness(${b * (exp / 100)}%) contrast(${c}%) saturate(${s}%) hue-rotate(${hRotate}deg) opacity(${o}%) grayscale(${gs}%) sepia(${sp}%) invert(${inv}%) blur(${bl}px)`;
+  // Highlights approximation: apply a contrast boost, then brightness, then invert the contrast
+  // A highlights boost (hl > 100) will stretch the upper range of luminosity.
+  const highlightsFilter = hl !== 100 ? `contrast(${100 + (hl - 100) * 0.5}%) brightness(${100 + (hl - 100) * 0.2}%) contrast(${100 / (1 + (hl - 100) * 0.005)}%)` : '';
+
+  let filter = `brightness(${b * (exp / 100)}%) contrast(${c}%) saturate(${s}%) hue-rotate(${hRotate}deg) opacity(${o}%) grayscale(${gs}%) sepia(${sp}%) invert(${inv}%) blur(${bl}px) ${highlightsFilter}`;
   
   if (sprite.shadowColor && (sprite.shadowX || sprite.shadowY || sprite.shadowBlur)) {
     filter += ` drop-shadow(${sprite.shadowX || 0}px ${sprite.shadowY || 0}px ${sprite.shadowBlur || 0}px ${sprite.shadowColor})`;
@@ -83,12 +92,24 @@ const getSpriteFilter = (sprite: SpriteData) => {
     const oc = sprite.outlineColor;
     filter += ` drop-shadow(${w}px 0 0 ${oc}) drop-shadow(-${w}px 0 0 ${oc}) drop-shadow(0 ${w}px 0 ${oc}) drop-shadow(0 -${w}px 0 ${oc})`;
   }
+
+  if (!isExport && sprite.posterize && sprite.posterize >= 2) {
+    const steps = sprite.posterize;
+    const table = [];
+    for(let i = 0; i < steps; i++){ table.push(i / (steps - 1)); }
+    const tableStr = table.join(' ');
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg"><filter id="p"><feComponentTransfer><feFuncR type="discrete" tableValues="${tableStr}"/><feFuncG type="discrete" tableValues="${tableStr}"/><feFuncB type="discrete" tableValues="${tableStr}"/></feComponentTransfer></filter></svg>`;
+    const b64 = btoa(svg);
+    filter += ` url('data:image/svg+xml;base64,${b64}#p')`;
+  }
+  
   return filter;
 };
 
 const generateId = () => {
   try { return crypto.randomUUID(); } catch (e) { return Math.random().toString(36).substring(2, 15) + Date.now().toString(36); }
 };
+
 
 // --- Sprite Module Component ---
 interface SpriteModuleProps {
@@ -102,11 +123,14 @@ interface SpriteModuleProps {
   onOpenTransform: (id: string) => void;
   onOpenTagging: (id: string) => void;
   onOpenPaint: (id: string) => void;
+  onOpenStretch: (id: string) => void;
+  onOpenComposite: (id: string, size?: number) => void;
   onUpdateSprite: (id: string, updates: Partial<SpriteData>) => void;
   isReference?: boolean;
+  isWhiteBg?: boolean;
 }
 
-const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggleSelect, onRemove, onSetAnchor, onSetReference, onOpenEraser, onOpenTransform, onOpenTagging, onOpenPaint, onUpdateSprite, isReference }) => {
+const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggleSelect, onRemove, onSetAnchor, onSetReference, onOpenEraser, onOpenTransform, onOpenTagging, onOpenPaint, onOpenStretch, onOpenComposite, onUpdateSprite, isReference, isWhiteBg }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
@@ -118,9 +142,10 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
     ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
     ctx.imageSmoothingEnabled = false;
     
-    const sc = sprite.scale || 1;
-    const sw = img.width * sc;
-    const sh = img.height * sc;
+    const scX = (sprite.scale || 1) * (sprite.stretchX || 1);
+    const scY = (sprite.scale || 1) * (sprite.stretchY || 1);
+    const sw = img.width * scX;
+    const sh = img.height * scY;
     const w = sw + padding.left + padding.right;
     const h = sh + padding.top + padding.bottom;
 
@@ -194,8 +219,8 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
       const internalX = clickX * (canvas.width / rect.width) / window.devicePixelRatio;
       const internalY = clickY * (canvas.height / rect.height) / window.devicePixelRatio;
 
-      const imgX = Math.round(internalX - sprite.padding.left);
-      const imgY = Math.round(internalY - sprite.padding.top);
+      const imgX = Math.round((internalX - sprite.padding.left) / (sprite.stretchX || 1));
+      const imgY = Math.round((internalY - sprite.padding.top) / (sprite.stretchY || 1));
 
       onSetAnchor(sprite.id, imgX, imgY);
     };
@@ -246,6 +271,19 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
               <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenEraser(sprite.id); setShowTools(false); }}>
                 <Eraser size={12} /> Goma (Borrador)
               </button>
+              <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenStretch(sprite.id); setShowTools(false); }}>
+                <Maximize size={12} /> Estirar (Resize)
+              </button>
+              <button className="dropdown-item" onClick={(e) => { 
+                e.stopPropagation(); 
+                const sizeStr = prompt('¿Tamaño del lienzo de trabajo (en píxeles)?', Math.max(8192, sprite.img.width, sprite.img.height).toString());
+                if (sizeStr && !isNaN(parseInt(sizeStr))) {
+                    onOpenComposite(sprite.id, parseInt(sizeStr)); 
+                }
+                setShowTools(false);
+              }}>
+                <Layers size={12} /> Componer (Collage)
+              </button>
               <div style={{ height: '1px', background: 'var(--border)', margin: '4px 0' }} />
               <button className="dropdown-item" onClick={(e) => { 
                 e.stopPropagation(); 
@@ -275,13 +313,13 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
         </div>
       </div>
       
-      <div className="module-canvas-area checker-mini">
+      <div className={`module-canvas-area checker-mini ${isWhiteBg ? 'white-bg' : ''}`}>
         <canvas ref={canvasRef} />
         {sprite.anchor && (
           <div className="anchor-crosshair" 
             style={{ 
-              left: `${(((sprite.anchor.x * (sprite.scale || 1)) + sprite.padding.left) / ((sprite.img.width * (sprite.scale || 1)) + sprite.padding.left + sprite.padding.right)) * 100}%`,
-              top: `${(((sprite.anchor.y * (sprite.scale || 1)) + sprite.padding.top) / ((sprite.img.height * (sprite.scale || 1)) + sprite.padding.top + sprite.padding.bottom)) * 100}%`,
+              left: `${(((sprite.anchor.x * (sprite.scale || 1) * (sprite.stretchX || 1)) + sprite.padding.left) / ((sprite.img.width * (sprite.scale || 1) * (sprite.stretchX || 1)) + sprite.padding.left + sprite.padding.right)) * 100}%`,
+              top: `${(((sprite.anchor.y * (sprite.scale || 1) * (sprite.stretchY || 1)) + sprite.padding.top) / ((sprite.img.height * (sprite.scale || 1) * (sprite.stretchY || 1)) + sprite.padding.top + sprite.padding.bottom)) * 100}%`,
               cursor: 'move',
               pointerEvents: 'auto'
             }} 
@@ -292,9 +330,9 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
       </div>
 
       <div className="module-footer">
-        <span className="badge">Res: {(sprite.img.width * (sprite.scale || 1)).toFixed(0)}×{(sprite.img.height * (sprite.scale || 1)).toFixed(0)}</span>
+        <span className="badge">Res: {(sprite.img.width * (sprite.scale || 1) * (sprite.stretchX || 1)).toFixed(0)}×{(sprite.img.height * (sprite.scale || 1) * (sprite.stretchY || 1)).toFixed(0)}</span>
         <span className="badge badge-accent">
-          Full: {(sprite.img.width * (sprite.scale || 1) + sprite.padding.left + sprite.padding.right).toFixed(0)}×{(sprite.img.height * (sprite.scale || 1) + sprite.padding.top + sprite.padding.bottom).toFixed(0)}
+          Full: {(sprite.img.width * (sprite.scale || 1) * (sprite.stretchX || 1) + sprite.padding.left + sprite.padding.right).toFixed(0)}×{(sprite.img.height * (sprite.scale || 1) * (sprite.stretchY || 1) + sprite.padding.top + sprite.padding.bottom).toFixed(0)}
         </span>
       </div>
     </div>
@@ -306,11 +344,13 @@ interface EraserModalProps {
   sprite: SpriteData;
   onSave: (id: string, newImg: HTMLImageElement) => void;
   onClose: () => void;
+  isWhiteBg?: boolean;
 }
 
-const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose }) => {
+const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWhiteBg }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [brushSize, setBrushSize] = useState(20);
+  const [brushShape, setBrushShape] = useState<'circle' | 'square'>('circle');
   const [zoom, setZoom] = useState(1);
   const [isDrawing, setIsDrawing] = useState(false);
   const [mousePos, setMousePos] = useState<{ x: number, y: number } | null>(null);
@@ -341,9 +381,13 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose }) =>
     const scaleY = canvas.height / (rect.height / zoom);
     
     ctx.globalCompositeOperation = 'destination-out';
-    ctx.beginPath();
-    ctx.arc(x * scaleX, y * scaleY, brushSize, 0, Math.PI * 2);
-    ctx.fill();
+    if (brushShape === 'circle') {
+      ctx.beginPath();
+      ctx.arc(x * scaleX, y * scaleY, brushSize, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.fillRect(x * scaleX - brushSize, y * scaleY - brushSize, brushSize * 2, brushSize * 2);
+    }
   };
 
   const handleSave = () => {
@@ -375,7 +419,7 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose }) =>
           </div>
           <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
         </div>
-        <div className="eraser-workspace checker-mini" style={{ overflow: 'auto' }}>
+        <div className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`} style={{ overflow: 'auto' }}>
            <div style={{ 
              position: 'relative', 
              cursor: 'none', 
@@ -408,6 +452,7 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose }) =>
                  top: mousePos.y,
                  width: brushSize * (canvasRef.current.offsetWidth / canvasRef.current.width) * 2,
                  height: brushSize * (canvasRef.current.offsetWidth / canvasRef.current.width) * 2,
+                 borderRadius: brushShape === 'circle' ? '50%' : '0'
                }} />
              )}
            </div>
@@ -420,6 +465,17 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose }) =>
           <div className="slider-item" style={{ flex: 1, marginBottom: 0 }}>
             <div className="slider-label"><span>Tamaño de Goma</span><span>{brushSize}px</span></div>
             <input type="range" min="1" max="100" value={brushSize} onChange={(e) => setBrushSize(parseInt(e.target.value))} />
+          </div>
+          <div className="slider-item" style={{ width: 'auto', marginBottom: 0 }}>
+            <div className="slider-label"><span>Forma</span></div>
+            <div style={{ display: 'flex', gap: '4px' }}>
+              <button className={`btn-ghost ${brushShape === 'circle' ? 'active' : ''}`} onClick={() => setBrushShape('circle')} title="Círculo">
+                <Circle size={16} fill={brushShape === 'circle' ? 'currentColor' : 'none'} />
+              </button>
+              <button className={`btn-ghost ${brushShape === 'square' ? 'active' : ''}`} onClick={() => setBrushShape('square')} title="Cuadrado">
+                <Square size={16} fill={brushShape === 'square' ? 'currentColor' : 'none'} />
+              </button>
+            </div>
           </div>
           <div style={{ display: 'flex', gap: '12px' }}>
             <button className="btn btn-outline" onClick={handleReset}>Reiniciar</button>
@@ -436,9 +492,10 @@ interface TransformModalProps {
   sprite: SpriteData;
   onSave: (id: string, updates: Partial<SpriteData>) => void;
   onClose: () => void;
+  isWhiteBg?: boolean;
 }
 
-const TransformModal: React.FC<TransformModalProps> = ({ sprite, onSave, onClose }) => {
+const TransformModal: React.FC<TransformModalProps> = ({ sprite, onSave, onClose, isWhiteBg }) => {
   const [rotation, setRotation] = useState(sprite.rotation || 0);
   const [offsetX, setOffsetX] = useState(sprite.offsetX || 0);
   const [offsetY, setOffsetY] = useState(sprite.offsetY || 0);
@@ -452,9 +509,10 @@ const TransformModal: React.FC<TransformModalProps> = ({ sprite, onSave, onClose
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d')!;
-    const sc = (sprite.scale || 1) * 0.8 * zoom; // Small scale preview to fit 800px, adjusted by zoom
-    const sw = sprite.img.width * sc;
-    const sh = sprite.img.height * sc;
+    const scX = (sprite.scale || 1) * (sprite.stretchX || 1) * 0.8 * zoom;
+    const scY = (sprite.scale || 1) * (sprite.stretchY || 1) * 0.8 * zoom;
+    const sw = sprite.img.width * scX;
+    const sh = sprite.img.height * scY;
     
     canvas.width = 800;
     canvas.height = 800;
@@ -489,7 +547,7 @@ const TransformModal: React.FC<TransformModalProps> = ({ sprite, onSave, onClose
           </div>
           <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
         </div>
-        <div className="eraser-workspace checker-mini" 
+        <div className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`} 
           onMouseDown={handleMouseDown}
           onMouseMove={handleMouseMove}
           onMouseUp={() => setIsDragging(false)}
@@ -520,14 +578,87 @@ const TransformModal: React.FC<TransformModalProps> = ({ sprite, onSave, onClose
   );
 };
 
+// --- Stretch Modal Component ---
+interface StretchModalProps {
+  sprite: SpriteData;
+  onSave: (id: string, updates: Partial<SpriteData>) => void;
+  onClose: () => void;
+  isWhiteBg?: boolean;
+}
+
+const StretchModal: React.FC<StretchModalProps> = ({ sprite, onSave, onClose, isWhiteBg }) => {
+  const [stretchX, setStretchX] = useState(sprite.stretchX || 1);
+  const [stretchY, setStretchY] = useState(sprite.stretchY || 1);
+  const [zoom, setZoom] = useState(1);
+  
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d')!;
+    
+    // Scale preview to fit 800x800 area
+    const baseSc = (sprite.scale || 1) * 0.8 * zoom;
+    const sw = sprite.img.width * baseSc * stretchX;
+    const sh = sprite.img.height * baseSc * stretchY;
+    
+    canvas.width = 800;
+    canvas.height = 800;
+    ctx.clearRect(0, 0, 800, 800);
+    ctx.imageSmoothingEnabled = false;
+
+    ctx.save();
+    ctx.translate(400, 400);
+    ctx.drawImage(sprite.img, -sw/2, -sh/2, sw, sh);
+    ctx.restore();
+  }, [sprite, stretchX, stretchY, zoom]);
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <Maximize size={18} color="var(--accent)" />
+            <h3 style={{ fontSize: '1rem' }}>Estirar: {sprite.name}</h3>
+          </div>
+          <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
+        </div>
+        <div className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`} style={{ overflow: 'auto' }}>
+           <canvas ref={canvasRef} />
+        </div>
+        <div className="modal-footer" style={{ padding: '20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '24px' }}>
+          <div className="slider-item" style={{ flex: 1, marginBottom: 0 }}>
+            <div className="slider-label"><span>Ancho (X)</span><span>{stretchX.toFixed(2)}x</span></div>
+            <input type="range" min="0.1" max="4" step="0.05" value={stretchX} onChange={(e) => setStretchX(parseFloat(e.target.value))} />
+          </div>
+          <div className="slider-item" style={{ flex: 1, marginBottom: 0 }}>
+            <div className="slider-label"><span>Alto (Y)</span><span>{stretchY.toFixed(2)}x</span></div>
+            <input type="range" min="0.1" max="4" step="0.05" value={stretchY} onChange={(e) => setStretchY(parseFloat(e.target.value))} />
+          </div>
+          <div className="slider-item" style={{ width: '120px', marginBottom: 0 }}>
+            <div className="slider-label"><span>Zoom</span><span>{zoom.toFixed(1)}x</span></div>
+            <input type="range" min="0.5" max="8" step="0.1" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
+          </div>
+          <div style={{ display: 'flex', gap: '12px' }}>
+            <button className="btn btn-outline" onClick={() => { setStretchX(1); setStretchY(1); }}>Reset</button>
+            <button className="btn btn-primary" style={{ paddingLeft: '24px', paddingRight: '24px' }} onClick={() => onSave(sprite.id, { stretchX, stretchY })}>Guardar Cambios</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // --- Tagging Modal Component ---
 interface TaggingModalProps {
   sprite: SpriteData;
   onSave: (id: string, regions: Region[]) => void;
   onClose: () => void;
+  isWhiteBg?: boolean;
 }
 
-const TaggingModal: React.FC<TaggingModalProps> = ({ sprite, onSave, onClose }) => {
+const TaggingModal: React.FC<TaggingModalProps> = ({ sprite, onSave, onClose, isWhiteBg }) => {
   const [regions, setRegions] = useState<Region[]>(sprite.regions || []);
   const [zoom, setZoom] = useState(1);
   const [isDrawing, setIsDrawing] = useState(false);
@@ -628,7 +759,7 @@ const TaggingModal: React.FC<TaggingModalProps> = ({ sprite, onSave, onClose }) 
         </div>
         
         <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-          <div className="eraser-workspace checker-mini" ref={workspaceRef} style={{ flex: 1, overflow: 'auto' }}>
+          <div className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`} ref={workspaceRef} style={{ flex: 1, overflow: 'auto' }}>
             <div style={{ 
               position: 'relative', 
               cursor: 'crosshair',
@@ -697,9 +828,10 @@ interface PaintModalProps {
   sprite: SpriteData;
   onSave: (id: string, newImg: HTMLImageElement) => void;
   onClose: () => void;
+  isWhiteBg?: boolean;
 }
 
-const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose }) => {
+const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhiteBg }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [brushSize, setBrushSize] = useState(10);
   const [paintColor, setPaintColor] = useState('#ff0000');
@@ -758,7 +890,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose }) => {
           </div>
           <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
         </div>
-        <div className="eraser-workspace checker-mini" style={{ overflow: 'auto' }}>
+        <div className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`} style={{ overflow: 'auto' }}>
            <div style={{ 
              position: 'relative', 
              cursor: 'none', 
@@ -828,6 +960,257 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose }) => {
   );
 };
 
+// --- Composite Modal Component ---
+interface CompositePiece {
+  id: string;
+  img: HTMLImageElement;
+  x: number;
+  y: number;
+}
+
+interface CompositeModalProps {
+  sprite: SpriteData;
+  onSave: (id: string, newImg: HTMLImageElement) => void;
+  onClose: () => void;
+  isWhiteBg?: boolean;
+  canvasSize?: number;
+}
+
+const CompositeModal: React.FC<CompositeModalProps> = ({ sprite, onSave, onClose, isWhiteBg, canvasSize = 8192 }) => {
+  const [pieces, setPieces] = useState<CompositePiece[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+  const [pan] = useState({ x: Math.floor(canvasSize / 2), y: Math.floor(canvasSize / 2) }); 
+  const [zoom, setZoom] = useState(1);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const workspaceRef = useRef<HTMLDivElement>(null);
+
+  // Auto-fit zoom on mount
+  useEffect(() => {
+    if (workspaceRef.current) {
+      const w = workspaceRef.current;
+      const fitZoom = Math.min((w.clientWidth - 80) / canvasSize, (w.clientHeight - 80) / canvasSize);
+      // Clamp between our slider min (0.1) and a max of 1 (don't over-zoom small canvases initially)
+      const initialZoom = Math.max(0.1, Math.min(Number(fitZoom.toFixed(2)), 1));
+      setZoom(initialZoom);
+    }
+  }, [canvasSize]);
+
+  useEffect(() => {
+    setPieces([{ id: 'base', img: sprite.img, x: -Math.floor(sprite.img.width/2), y: -Math.floor(sprite.img.height/2) }]);
+    setSelectedId('base');
+  }, [sprite]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d')!;
+    
+    canvas.width = canvasSize;
+    canvas.height = canvasSize;
+    ctx.clearRect(0, 0, canvasSize, canvasSize);
+    ctx.imageSmoothingEnabled = false;
+
+    pieces.forEach(p => {
+       ctx.drawImage(p.img, pan.x + p.x, pan.y + p.y);
+       
+       ctx.save();
+       if (selectedId === p.id) {
+         ctx.strokeStyle = '#6b66ff';
+         ctx.lineWidth = 1;
+         ctx.setLineDash([4, 2]);
+       } else {
+         ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+         ctx.lineWidth = 1;
+         ctx.setLineDash([2, 4]);
+       }
+       ctx.strokeRect(pan.x + p.x - 1, pan.y + p.y - 1, p.img.width + 2, p.img.height + 2);
+       ctx.restore();
+    });
+  }, [pieces, selectedId, pan]);
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    const rect = canvasRef.current!.getBoundingClientRect();
+    const scaleX = canvasRef.current!.width / rect.width;
+    const scaleY = canvasRef.current!.height / rect.height;
+    
+    const cx = (e.clientX - rect.left) * scaleX - pan.x;
+    const cy = (e.clientY - rect.top) * scaleY - pan.y;
+
+    const tCanvas = document.createElement('canvas');
+    tCanvas.width = 1; tCanvas.height = 1;
+    const tCtx = tCanvas.getContext('2d', { willReadFrequently: true })!;
+
+    let clickedId = null;
+    for (let i = pieces.length - 1; i >= 0; i--) {
+      const p = pieces[i];
+      if (cx >= p.x && cx <= p.x + p.img.width && cy >= p.y && cy <= p.y + p.img.height) {
+        tCtx.clearRect(0, 0, 1, 1);
+        tCtx.drawImage(p.img, -(cx - p.x), -(cy - p.y));
+        if (tCtx.getImageData(0, 0, 1, 1).data[3] > 0) {
+          clickedId = p.id;
+          break;
+        }
+      }
+    }
+    
+    if (clickedId) {
+      setSelectedId(clickedId);
+      setIsDragging(true);
+      const piece = pieces.find(p => p.id === clickedId)!;
+      setDragStart({ x: (e.clientX - rect.left) * scaleX - piece.x, y: (e.clientY - rect.top) * scaleY - piece.y });
+    } else {
+      setSelectedId(null);
+    }
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!isDragging || !selectedId) return;
+    const rect = canvasRef.current!.getBoundingClientRect();
+    const scaleX = canvasRef.current!.width / rect.width;
+    const scaleY = canvasRef.current!.height / rect.height;
+
+    const currentCx = (e.clientX - rect.left) * scaleX;
+    const currentCy = (e.clientY - rect.top) * scaleY;
+    
+    const newX = Math.round(currentCx - dragStart.x);
+    const newY = Math.round(currentCy - dragStart.y);
+    setPieces(prev => prev.map(p => p.id === selectedId ? { ...p, x: newX, y: newY } : p));
+  };
+
+  const handleMouseUp = () => {
+    setIsDragging(false);
+  };
+
+  const handleAddFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files) return;
+    for (let i = 0; i < e.target.files.length; i++) {
+      const file = e.target.files[i];
+      if (!file.type.startsWith('image/')) continue;
+      
+      const img = await new Promise<HTMLImageElement>((res) => {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          const image = new Image();
+          image.onload = () => res(image);
+          image.src = ev.target?.result as string;
+        };
+        reader.readAsDataURL(file);
+      });
+
+      const newId = generateId();
+      setPieces(prev => [...prev, { id: newId, img: img, x: -Math.floor(img.width/2), y: -Math.floor(img.height/2) }]);
+      setSelectedId(newId);
+    }
+    e.target.value = '';
+  };
+
+  const alignSelected = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const corner = e.target.value;
+    if (!selectedId || !corner) return;
+    
+    setPieces(prev => prev.map(p => {
+      if (p.id !== selectedId) return p;
+      let newX = p.x;
+      let newY = p.y;
+      if (corner.includes('left')) newX = -pan.x;
+      if (corner.includes('right')) newX = canvasSize - pan.x - p.img.width;
+      if (corner.includes('top')) newY = -pan.y;
+      if (corner.includes('bottom')) newY = canvasSize - pan.y - p.img.height;
+      return { ...p, x: newX, y: newY };
+    }));
+    e.target.value = ""; // Reset to placeholder
+  };
+
+  const compileSave = () => {
+    if (pieces.length === 0) return;
+    
+    const canvas = document.createElement('canvas');
+    canvas.width = canvasSize;
+    canvas.height = canvasSize;
+    const ctx = canvas.getContext('2d')!;
+    ctx.imageSmoothingEnabled = false;
+
+    pieces.forEach(p => {
+      ctx.drawImage(p.img, pan.x + p.x, pan.y + p.y);
+    });
+
+    const newImg = new Image();
+    newImg.onload = () => {
+      onSave(sprite.id, newImg);
+    };
+    newImg.src = canvas.toDataURL('image/png');
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content" onClick={e => e.stopPropagation()} style={{ width: '100vw', maxWidth: '100vw', height: '100vh', maxHeight: '100vh', display: 'flex', flexDirection: 'column', borderRadius: 0, border: 'none', margin: 0 }}>
+        <div className="modal-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <Layers size={18} color="var(--accent)" />
+            <h3 style={{ fontSize: '1rem' }}>Compositor: {sprite.name}</h3>
+          </div>
+          <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
+        </div>
+        
+        <div className="module-footer" style={{ borderBottom: '1px solid var(--border)', background: 'var(--bg-panel)', gap: '12px', justifyContent: 'flex-start', padding: '12px', pointerEvents: 'auto' }}>
+             <label className="btn btn-outline" style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.7rem', padding: '6px 12px', margin: 0 }}>
+               <Plus size={14} /> Añadir Pieza
+               <input type="file" hidden multiple accept="image/*" onChange={handleAddFile} />
+             </label>
+             {selectedId && (
+               <>
+                 <select 
+                    className="select-input" 
+                    style={{ fontSize: '0.7rem', padding: '4px 8px', margin: 0, width: 'auto' }} 
+                    onChange={alignSelected}
+                    value=""
+                 >
+                   <option value="" disabled>Alinear a...</option>
+                   <option value="top-left">Esquina Superior Izquierda</option>
+                   <option value="top-right">Esquina Superior Derecha</option>
+                   <option value="bottom-left">Esquina Inferior Izquierda</option>
+                   <option value="bottom-right">Esquina Inferior Derecha</option>
+                 </select>
+                 <button className="btn-ghost" style={{ padding: '6px' }} onClick={() => setPieces(p => p.filter(x => x.id !== selectedId))}><Trash2 size={14} /></button>
+               </>
+             )}
+        </div>
+
+        <div className={`eraser-workspace ${isWhiteBg ? 'white-bg' : ''}`} ref={workspaceRef} style={{ overflow: 'auto', position: 'relative', flex: 1, backgroundColor: 'var(--bg-window, #151515)' }}>
+           <div className="checker-mini" style={{ position: 'relative', width: `${canvasSize * zoom}px`, height: `${canvasSize * zoom}px`, minWidth: `${canvasSize * zoom}px`, minHeight: `${canvasSize * zoom}px`, flexShrink: 0, margin: '20px auto', boxShadow: '0 0 40px rgba(0,0,0,0.8)', border: '1px solid rgba(255,255,255,0.1)' }}>
+             <canvas 
+               ref={canvasRef}
+               style={{ width: '100%', height: '100%', cursor: isDragging ? 'grabbing' : 'grab', outline: 'none', display: 'block' }}
+               onMouseDown={handleMouseDown}
+               onMouseMove={handleMouseMove}
+               onMouseUp={handleMouseUp}
+               onMouseLeave={handleMouseUp}
+             />
+           </div>
+           
+           <div style={{ position: 'sticky', bottom: '20px', left: '50%', transform: 'translateX(-50%)', background: 'rgba(0,0,0,0.7)', padding: '8px 16px', borderRadius: '20px', fontSize: '0.7rem', color: 'white', pointerEvents: 'none', display: 'flex', gap: '16px', zIndex: 10, width: 'max-content', margin: 'auto' }}>
+             <span>Click y arrastra cualquier pieza ({pieces.length} capas)</span>
+           </div>
+        </div>
+        
+        <div className="modal-footer" style={{ padding: '20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', display: 'flex', gap: '24px', alignItems: 'center' }}>
+            <div className="slider-item" style={{ width: '200px', marginBottom: 0 }}>
+              <div className="slider-label"><span><Search size={14} /> Zoom</span><span>{zoom.toFixed(2)}x</span></div>
+              <input type="range" min="0.1" max="8" step="0.05" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
+            </div>
+            <div style={{ flex: 1 }} />
+            <div style={{ display: 'flex', gap: '12px' }}>
+              <button className="btn btn-outline" onClick={onClose}>Cancelar</button>
+              <button className="btn btn-primary" style={{ paddingLeft: '24px', paddingRight: '24px' }} onClick={compileSave}>Acoplar y Guardar</button>
+            </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // --- Main App Component ---
 const App: React.FC = () => {
   const [sprites, setSprites] = useState<SpriteData[]>([]);
@@ -838,6 +1221,8 @@ const App: React.FC = () => {
   const [transformTargetId, setTransformTargetId] = useState<string | null>(null);
   const [taggingTargetId, setTaggingTargetId] = useState<string | null>(null);
   const [paintTargetId, setPaintTargetId] = useState<string | null>(null);
+  const [stretchTargetId, setStretchTargetId] = useState<string | null>(null);
+  const [compositeTarget, setCompositeTarget] = useState<{ id: string, size: number } | null>(null);
 
   // --- UNDO SYSTEM ---
   const [history, setHistory] = useState<SpriteData[][]>([]);
@@ -883,6 +1268,7 @@ const App: React.FC = () => {
   const [dirHandle, setDirHandle] = useState<FileSystemDirectoryHandle | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [showGridlines, setShowGridlines] = useState(false);
+  const [isWhiteBg, setIsWhiteBg] = useState(false);
   const [highlightedYs, setHighlightedYs] = useState<number[]>([]);
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
 
@@ -960,15 +1346,16 @@ const App: React.FC = () => {
     try {
       for (const s of sprites) {
         const canvas = document.createElement('canvas');
-        const sc = s.scale || 1;
-        const sw = s.img.width * sc;
-        const sh = s.img.height * sc;
+        const scX = (s.scale || 1) * (s.stretchX || 1);
+        const scY = (s.scale || 1) * (s.stretchY || 1);
+        const sw = s.img.width * scX;
+        const sh = s.img.height * scY;
         canvas.width = sw + s.padding.left + s.padding.right;
         canvas.height = sh + s.padding.top + s.padding.bottom;
         const ctx = canvas.getContext('2d')!;
         ctx.imageSmoothingEnabled = false;
         
-        ctx.filter = `brightness(${s.brightness ?? 100}%) contrast(${s.contrast ?? 100}%) saturate(${s.saturation ?? 100}%) opacity(${s.opacity ?? 100}%) hue-rotate(${s.hue ?? 0}deg)`;
+        ctx.filter = getSpriteFilter(s, true);
 
         const rot = (s.rotation || 0) * Math.PI / 180;
         const ox = s.offsetX || 0;
@@ -1003,6 +1390,20 @@ const App: React.FC = () => {
           ctx.restore();
         }
         ctx.filter = 'none';
+
+        if (s.posterize && s.posterize >= 2) {
+          const idata = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const d = idata.data;
+          const steps = s.posterize;
+          const factor = 255 / (steps - 1);
+          for (let i = 0; i < d.length; i += 4) {
+            if (d[i+3] === 0) continue;
+            d[i] = Math.round((d[i] / 255) * (steps - 1)) * factor;
+            d[i+1] = Math.round((d[i+1] / 255) * (steps - 1)) * factor;
+            d[i+2] = Math.round((d[i+2] / 255) * (steps - 1)) * factor;
+          }
+          ctx.putImageData(idata, 0, 0);
+        }
         
         const blob = await new Promise<Blob>(res => canvas.toBlob(res as any, 'image/png'));
         const fileHandle = await dirHandle.getFileHandle(s.name, { create: true });
@@ -1042,6 +1443,16 @@ const App: React.FC = () => {
     commitSprites(next);
   };
 
+  const updateBulkStretchX = (val: number) => {
+    const next = sprites.map((s: SpriteData) => selection.includes(s.id) ? { ...s, stretchX: val } : s);
+    commitSprites(next);
+  };
+
+  const updateBulkStretchY = (val: number) => {
+    const next = sprites.map((s: SpriteData) => selection.includes(s.id) ? { ...s, stretchY: val } : s);
+    commitSprites(next);
+  };
+
   const applyReferenceScale = () => {
     const ref = sprites.find((s: SpriteData) => s.id === referenceId);
     if (!ref) return;
@@ -1076,35 +1487,25 @@ const App: React.FC = () => {
     if (!ref || !ref.anchor) return;
 
     const refSc = ref.scale || 1;
-    const refW = ref.img.width * refSc + ref.padding.left + ref.padding.right;
-    const refH = ref.img.height * refSc + ref.padding.top + ref.padding.bottom;
-    
-    // Proportional anchor position in the reference frame
-    const rLeft = Math.max(0.001, Math.min(0.999, (ref.padding.left + ref.anchor.x * refSc) / refW));
-    const rTop = Math.max(0.001, Math.min(0.999, (ref.padding.top + ref.anchor.y * refSc) / refH));
-    const rRight = 1 - rLeft;
-    const rBottom = 1 - rTop;
+    const refDLeft = ref.padding.left + ref.anchor.x * refSc * (ref.stretchX || 1);
+    const refDTop = ref.padding.top + ref.anchor.y * refSc * (ref.stretchY || 1);
+    const refDRight = ref.padding.right + (ref.img.width * refSc * (ref.stretchX || 1) - ref.anchor.x * refSc * (ref.stretchX || 1));
+    const refDBottom = ref.padding.bottom + (ref.img.height * refSc * (ref.stretchY || 1) - ref.anchor.y * refSc * (ref.stretchY || 1));
 
     const next = sprites.map((s: SpriteData) => {
       if (!selection.includes(s.id) || s.id === referenceId || !s.anchor) return s;
       
       const sc = s.scale || 1;
-      const w = s.img.width * sc;
-      const h = s.img.height * sc;
-      const ax = s.anchor.x * sc;
-      const ay = s.anchor.y * sc;
-
-      // Find minimum container size that fits the image and respects ratios
-      const targetW = Math.max(ax / rLeft, (w - ax) / rRight);
-      const targetH = Math.max(ay / rTop, (h - ay) / rBottom);
+      const sSX = s.stretchX || 1;
+      const sSY = s.stretchY || 1;
 
       return {
         ...s,
         padding: {
-          top: targetH * rTop - ay,
-          bottom: targetH * rBottom - (h - ay),
-          left: targetW * rLeft - ax,
-          right: targetW * rRight - (w - ax)
+          left: refDLeft - s.anchor.x * sc * sSX,
+          top: refDTop - s.anchor.y * sc * sSY,
+          right: refDRight - (s.img.width * sc * sSX - s.anchor.x * sc * sSX),
+          bottom: refDBottom - (s.img.height * sc * sSY - s.anchor.y * sc * sSY)
         }
       };
     });
@@ -1121,7 +1522,7 @@ const App: React.FC = () => {
     commitSprites(next);
   };
 
-  const updateBulkFilter = (prop: keyof SpriteData, val: number | string) => {
+  const updateBulkFilter = (prop: keyof SpriteData, val: number | string | undefined) => {
     const next = sprites.map((s: SpriteData) => selection.includes(s.id) ? { ...s, [prop]: val } : s);
     commitSprites(next);
   };
@@ -1143,6 +1544,8 @@ const App: React.FC = () => {
         invert: ref.invert ?? 0,
         blur: ref.blur ?? 0,
         exposure: ref.exposure ?? 100,
+        highlights: ref.highlights ?? 100,
+        posterize: ref.posterize,
         outlineColor: ref.outlineColor,
         outlineWidth: ref.outlineWidth,
         shadowX: ref.shadowX,
@@ -1216,14 +1619,15 @@ const App: React.FC = () => {
     const zip = new JSZip();
     for (const s of sprites) {
       const canvas = document.createElement('canvas');
-      const sc = s.scale || 1;
-      const sw = s.img.width * sc;
-      const sh = s.img.height * sc;
+      const scX = (s.scale || 1) * (s.stretchX || 1);
+      const scY = (s.scale || 1) * (s.stretchY || 1);
+      const sw = s.img.width * scX;
+      const sh = s.img.height * scY;
       canvas.width = sw + s.padding.left + s.padding.right;
       canvas.height = sh + s.padding.top + s.padding.bottom;
       const ctx = canvas.getContext('2d')!;
       ctx.imageSmoothingEnabled = false;
-      ctx.filter = getSpriteFilter(s);
+      ctx.filter = getSpriteFilter(s, true);
 
       const rot = (s.rotation || 0) * Math.PI / 180;
       const ox = s.offsetX || 0;
@@ -1258,6 +1662,21 @@ const App: React.FC = () => {
           ctx.restore();
       }
       ctx.filter = 'none';
+
+      if (s.posterize && s.posterize >= 2) {
+        const idata = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const d = idata.data;
+        const steps = s.posterize;
+        const factor = 255 / (steps - 1);
+        for (let i = 0; i < d.length; i += 4) {
+          if (d[i+3] === 0) continue;
+          d[i] = Math.round((d[i] / 255) * (steps - 1)) * factor;
+          d[i+1] = Math.round((d[i+1] / 255) * (steps - 1)) * factor;
+          d[i+2] = Math.round((d[i+2] / 255) * (steps - 1)) * factor;
+        }
+        ctx.putImageData(idata, 0, 0);
+      }
+      
       const blob = await new Promise<Blob>(res => canvas.toBlob(res as any, 'image/png'));
       zip.file(s.name, blob);
     }
@@ -1280,6 +1699,10 @@ const App: React.FC = () => {
             <label style={{ marginLeft: '16px', fontSize: '0.7rem', display: 'inline-flex', alignItems: 'center', cursor: 'pointer', fontWeight: 'normal', color: 'var(--text-muted)', userSelect: 'none' }}>
               <input type="checkbox" checked={showGridlines} onChange={(e) => setShowGridlines(e.target.checked)} style={{ marginRight: '6px', cursor: 'pointer' }} />
               Guías
+            </label>
+            <label style={{ marginLeft: '12px', fontSize: '0.7rem', display: 'inline-flex', alignItems: 'center', cursor: 'pointer', fontWeight: 'normal', color: 'var(--text-muted)', userSelect: 'none' }}>
+              <input type="checkbox" checked={isWhiteBg} onChange={(e) => setIsWhiteBg(e.target.checked)} style={{ marginRight: '6px', cursor: 'pointer' }} />
+              Fondo Blanco
             </label>
           </h1>
         </div>
@@ -1365,6 +1788,9 @@ const App: React.FC = () => {
                   onOpenTransform={(id) => setTransformTargetId(id)}
                   onOpenTagging={(id) => setTaggingTargetId(id)}
                   onOpenPaint={(id) => setPaintTargetId(id)}
+                  onOpenStretch={(id) => setStretchTargetId(id)}
+                  onOpenComposite={(id, size) => setCompositeTarget({ id, size: size || 8192 })}
+                  isWhiteBg={isWhiteBg}
                   onUpdateSprite={(id, updates) => {
                     const next = sprites.map((s: SpriteData) => s.id === id ? { ...s, ...updates } : s);
                     commitSprites(next);
@@ -1445,8 +1871,23 @@ const App: React.FC = () => {
                 <div className="slider-item" style={{ marginBottom: 0 }}>
                   <div className="slider-label"><span>Alto (px)</span></div>
                   <input type="number" step="1" style={{ width: '100%', background: '#1a1a1a', border: '1px solid #333', color: 'white', padding: '4px', borderRadius: '4px' }}
-                    value={firstSelected ? Math.round(firstSelected.img.height * (firstSelected.scale || 1)) : 0}
+                    value={firstSelected ? Math.round(firstSelected.img.height * (firstSelected.scale || 1) * (firstSelected.stretchY || 1)) : 0}
                     onChange={(e) => updateBulkHeight(parseInt(e.target.value) || 0)} disabled={selection.length === 0}
+                  />
+                </div>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                <div className="slider-item">
+                  <div className="slider-label"><span>Estirar H</span><span>{firstSelected ? (firstSelected.stretchX || 1).toFixed(2) : '1.00'}x</span></div>
+                  <input type="range" min="0.1" max="4" step="0.05" value={firstSelected ? (firstSelected.stretchX || 1) : 1}
+                    onChange={(e) => updateBulkStretchX(parseFloat(e.target.value))} disabled={selection.length === 0}
+                  />
+                </div>
+                <div className="slider-item">
+                  <div className="slider-label"><span>Estirar V</span><span>{firstSelected ? (firstSelected.stretchY || 1).toFixed(2) : '1.00'}x</span></div>
+                  <input type="range" min="0.1" max="4" step="0.05" value={firstSelected ? (firstSelected.stretchY || 1) : 1}
+                    onChange={(e) => updateBulkStretchY(parseFloat(e.target.value))} disabled={selection.length === 0}
                   />
                 </div>
               </div>
@@ -1468,6 +1909,15 @@ const App: React.FC = () => {
                 <div className="slider-label"><span>Pixelación</span><span>{firstSelected ? (firstSelected.pixelation || 1) : 1}px</span></div>
                 <input type="range" min="1" max="100" value={firstSelected ? (firstSelected.pixelation || 1) : 1}
                   onChange={(e) => updateBulkPixelation(parseInt(e.target.value))} disabled={selection.length === 0}
+                />
+              </div>
+              <div className="slider-item">
+                <div className="slider-label"><span>Profundidad (Bits)</span><span>{firstSelected && firstSelected.posterize && firstSelected.posterize > 0 ? `${firstSelected.posterize} niveles` : 'Off'}</span></div>
+                <input type="range" min="0" max="64" value={firstSelected ? (firstSelected.posterize || 0) : 0}
+                  onChange={(e) => {
+                    const val = parseInt(e.target.value);
+                    updateBulkFilter('posterize', val === 0 ? undefined : val);
+                  }} disabled={selection.length === 0}
                 />
               </div>
               <div className="slider-item">
@@ -1530,6 +1980,12 @@ const App: React.FC = () => {
                   <div className="slider-label"><span>Exposición</span><span>{firstSelected ? (firstSelected.exposure ?? 100) : 100}%</span></div>
                   <input type="range" min="0" max="200" value={firstSelected ? (firstSelected.exposure ?? 100) : 100}
                     onChange={(e) => updateBulkFilter('exposure', parseInt(e.target.value))} disabled={selection.length === 0}
+                  />
+                </div>
+                <div className="slider-item">
+                  <div className="slider-label"><span>Luces</span><span>{firstSelected ? (firstSelected.highlights ?? 100) : 100}%</span></div>
+                  <input type="range" min="0" max="200" value={firstSelected ? (firstSelected.highlights ?? 100) : 100}
+                    onChange={(e) => updateBulkFilter('highlights', parseInt(e.target.value))} disabled={selection.length === 0}
                   />
                 </div>
               </div>
@@ -1605,6 +2061,7 @@ const App: React.FC = () => {
         <EraserModal 
           sprite={sprites.find(s => s.id === eraserTargetId)!} 
           onClose={() => setEraserTargetId(null)}
+          isWhiteBg={isWhiteBg}
           onSave={(id: string, newImg: HTMLImageElement) => {
             const next = sprites.map((s: SpriteData) => s.id === id ? { ...s, img: newImg } : s);
             commitSprites(next);
@@ -1616,6 +2073,7 @@ const App: React.FC = () => {
         <TransformModal 
           sprite={sprites.find(s => s.id === transformTargetId)!} 
           onClose={() => setTransformTargetId(null)}
+          isWhiteBg={isWhiteBg}
           onSave={(id: string, updates: Partial<SpriteData>) => {
             const next = sprites.map((s: SpriteData) => s.id === id ? { ...s, ...updates } : s);
             commitSprites(next);
@@ -1627,6 +2085,7 @@ const App: React.FC = () => {
         <TaggingModal 
           sprite={sprites.find(s => s.id === taggingTargetId)!} 
           onClose={() => setTaggingTargetId(null)}
+          isWhiteBg={isWhiteBg}
           onSave={(id: string, regions: Region[]) => {
             const next = sprites.map(s => s.id === id ? { ...s, regions } : s);
             commitSprites(next);
@@ -1638,10 +2097,36 @@ const App: React.FC = () => {
         <PaintModal 
           sprite={sprites.find(s => s.id === paintTargetId)!} 
           onClose={() => setPaintTargetId(null)}
+          isWhiteBg={isWhiteBg}
           onSave={(id: string, newImg: HTMLImageElement) => {
             const next = sprites.map(s => s.id === id ? { ...s, img: newImg } : s);
             commitSprites(next);
             setPaintTargetId(null);
+          }}
+        />
+      )}
+      {stretchTargetId && (
+        <StretchModal 
+          sprite={sprites.find(s => s.id === stretchTargetId)!} 
+          onClose={() => setStretchTargetId(null)}
+          isWhiteBg={isWhiteBg}
+          onSave={(id: string, updates: Partial<SpriteData>) => {
+            const next = sprites.map(s => s.id === id ? { ...s, ...updates } : s);
+            commitSprites(next);
+            setStretchTargetId(null);
+          }}
+        />
+      )}
+      {compositeTarget && (
+        <CompositeModal 
+          sprite={sprites.find(s => s.id === compositeTarget.id)!} 
+          onClose={() => setCompositeTarget(null)}
+          isWhiteBg={isWhiteBg}
+          canvasSize={compositeTarget.size}
+          onSave={(id: string, newImg: HTMLImageElement) => {
+            const next = sprites.map(s => s.id === id ? { ...s, img: newImg, anchor: { x: Math.floor(newImg.width/2), y: Math.floor(newImg.height/2) } } : s);
+            commitSprites(next);
+            setCompositeTarget(null);
           }}
         />
       )}
