@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { 
   Trash2, Plus, Archive, CheckSquare, Square, 
-  Target, FolderSync, Save, AlertTriangle, Eraser, RotateCcw, Search, MapPin, Pencil, MoreHorizontal, FlipHorizontal, FlipVertical, Droplets, Grid, Circle, Maximize, Layers
+  Target, FolderSync, Save, AlertTriangle, Eraser, RotateCcw, Search, MapPin, Pencil, MoreHorizontal, FlipHorizontal, FlipVertical, Droplets, Grid, Circle, Maximize, Layers, Play, Pause, Film
 } from 'lucide-react';
 import JSZip from 'jszip';
 
@@ -58,6 +58,8 @@ interface SpriteData {
   stretchX?: number;
   stretchY?: number;
   posterize?: number;
+  tintColor?: string;
+  tintOpacity?: number;
 }
 
 const getSpriteFilter = (sprite: SpriteData, isExport = false) => {
@@ -189,6 +191,15 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
       ctx.restore();
     }
     ctx.filter = 'none';
+
+    if (sprite.tintOpacity && sprite.tintOpacity > 0) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'source-atop';
+      ctx.fillStyle = sprite.tintColor || '#000000';
+      ctx.globalAlpha = sprite.tintOpacity / 100;
+      ctx.fillRect(0, 0, w, h);
+      ctx.restore();
+    }
   }, [sprite]);
 
 
@@ -1211,6 +1222,300 @@ const CompositeModal: React.FC<CompositeModalProps> = ({ sprite, onSave, onClose
   );
 };
 
+// --- Animation Modal Component ---
+interface AnimFrame {
+  id: string;
+  img: HTMLImageElement;
+  fileName: string;
+  durationMs: number;
+  scale?: number;
+}
+
+interface AnimationModalProps {
+  onClose: () => void;
+}
+
+const AnimationModal: React.FC<AnimationModalProps> = ({ onClose }) => {
+  const [frames, setFrames] = useState<AnimFrame[]>([]);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentFrameIdx, setCurrentFrameIdx] = useState(0);
+  const [zoom, setZoom] = useState(1);
+  const [bgColor, setBgColor] = useState<'checker' | 'white' | 'black'>('checker');
+  const [exportW, setExportW] = useState(0);
+  const [exportH, setExportH] = useState(0);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  const requestRef = useRef<number>(0);
+  const lastTimeRef = useRef<number>(0);
+  const accumulatedMsRef = useRef<number>(0);
+  
+  const idxRef = useRef(currentFrameIdx);
+  useEffect(() => { idxRef.current = currentFrameIdx; }, [currentFrameIdx]);
+  const framesRef = useRef(frames);
+  useEffect(() => { framesRef.current = frames; }, [frames]);
+
+  useEffect(() => {
+    if (!isPlaying || frames.length <= 1) {
+      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+      return;
+    }
+
+    accumulatedMsRef.current = 0;
+    lastTimeRef.current = performance.now();
+
+    const loop = (time: number) => {
+      const dt = time - lastTimeRef.current;
+      lastTimeRef.current = time;
+      accumulatedMsRef.current += dt;
+      
+      const currentList = framesRef.current;
+      if (currentList.length > 0) {
+        const dur = currentList[idxRef.current]?.durationMs || 100;
+        if (accumulatedMsRef.current >= dur) {
+          accumulatedMsRef.current -= dur;
+          setCurrentFrameIdx(prev => (prev + 1) % currentList.length);
+        }
+      }
+      requestRef.current = requestAnimationFrame(loop);
+    };
+
+    requestRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(requestRef.current);
+  }, [isPlaying, frames.length]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d')!;
+    
+    let maxWidth = 200;
+    let maxHeight = 200;
+    frames.forEach(f => {
+      const sc = f.scale || 1.0;
+      maxWidth = Math.max(maxWidth, f.img.width * sc);
+      maxHeight = Math.max(maxHeight, f.img.height * sc);
+    });
+
+    canvas.width = maxWidth;
+    canvas.height = maxHeight;
+    ctx.clearRect(0, 0, maxWidth, maxHeight);
+    ctx.imageSmoothingEnabled = false;
+
+    if (frames.length > 0 && frames[currentFrameIdx]) {
+      const f = frames[currentFrameIdx];
+      const sc = f.scale || 1.0;
+      const fw = f.img.width * sc;
+      const fh = f.img.height * sc;
+      const dx = Math.floor((maxWidth - fw) / 2);
+      const dy = Math.floor((maxHeight - fh) / 2);
+      ctx.drawImage(f.img, dx, dy, fw, fh);
+    }
+  }, [frames, currentFrameIdx]);
+
+  const handleAddFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files) return;
+    const newFrames: AnimFrame[] = [];
+    for (let i = 0; i < e.target.files.length; i++) {
+      const file = e.target.files[i];
+      if (!file.type.startsWith('image/')) continue;
+      const img = await new Promise<HTMLImageElement>((res) => {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          const image = new Image();
+          image.onload = () => res(image);
+          image.src = ev.target?.result as string;
+        };
+        reader.readAsDataURL(file);
+      });
+      newFrames.push({
+        id: generateId(),
+        img,
+        fileName: file.name,
+        durationMs: 100,
+        scale: 1.0
+      });
+    }
+    setFrames(prev => [...prev, ...newFrames]);
+    e.target.value = '';
+  };
+
+  const updateDuration = (id: string, val: number) => {
+    setFrames(prev => prev.map(f => f.id === id ? { ...f, durationMs: Math.max(10, val) } : f));
+  };
+
+  const updateScale = (id: string, val: number) => {
+    setFrames(prev => prev.map(f => f.id === id ? { ...f, scale: Math.max(0.1, val) } : f));
+  };
+
+  const handleExportSpritesheet = async () => {
+    if (frames.length === 0) return;
+    
+    let autoWidth = 0;
+    let autoHeight = 0;
+    frames.forEach(f => {
+      const sc = f.scale || 1.0;
+      autoWidth = Math.max(autoWidth, Math.ceil(f.img.width * sc));
+      autoHeight = Math.max(autoHeight, Math.ceil(f.img.height * sc));
+    });
+
+    const finalWidth = exportW > 0 ? exportW : autoWidth;
+    const finalHeight = exportH > 0 ? exportH : autoHeight;
+
+    const cols = Math.ceil(frames.length / 2);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = finalWidth * cols;
+    canvas.height = finalHeight * 2;
+    const ctx = canvas.getContext('2d')!;
+    ctx.imageSmoothingEnabled = false;
+
+    frames.forEach((f, idx) => {
+      const col = idx % cols;
+      const row = Math.floor(idx / cols);
+
+      const sc = f.scale || 1.0;
+      const fw = Math.ceil(f.img.width * sc);
+      const fh = Math.ceil(f.img.height * sc);
+      const cx = (finalWidth * col) + Math.floor((finalWidth - fw) / 2);
+      const cy = (finalHeight * row) + Math.floor((finalHeight - fh) / 2);
+      ctx.drawImage(f.img, cx, cy, fw, fh);
+    });
+
+    const blob = await new Promise<Blob>((res) => canvas.toBlob(res as any, 'image/png'));
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = `joa_anim_spritesheet_${Date.now()}.png`;
+    link.click();
+  };
+
+  const removeFrame = (id: string) => {
+    setFrames(prev => {
+      const next = prev.filter(f => f.id !== id);
+      if (currentFrameIdx >= next.length) setCurrentFrameIdx(Math.max(0, next.length - 1));
+      if (next.length <= 1) setIsPlaying(false);
+      return next;
+    });
+  };
+
+  let bgClass = 'checker-mini';
+  if (bgColor === 'white') bgClass = 'white-bg';
+  if (bgColor === 'black') bgClass = 'black-bg';
+
+  return (
+    <div className="modal-overlay" onClick={onClose} style={{ zIndex: 9999 }}>
+      <div className="modal-content tagging-modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <Film size={18} color="var(--accent)" />
+            <h3 style={{ fontSize: '1rem' }}>Previsualizador de Animación</h3>
+          </div>
+          <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
+        </div>
+
+        <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+          {/* VISOR PRINCIPAL */}
+          <div className="eraser-workspace" style={{ flex: 1, overflow: 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: 'var(--bg-window, #151515)', position: 'relative' }}>
+             
+             {frames.length === 0 ? (
+                <div className="empty-msg" style={{ opacity: 0.5 }}>Añade frames en la barra lateral para ver la animación</div>
+             ) : (
+                <div className={bgClass} style={{ 
+                                position: 'relative', 
+                                boxShadow: '0 0 40px rgba(0,0,0,0.8)', 
+                                border: '1px solid rgba(255,255,255,0.1)',
+                                transform: `scale(${zoom})`,
+                                transformOrigin: 'center center',
+                                margin: 'auto'
+                              }}>
+                  <canvas ref={canvasRef} style={{ display: 'block' }} />
+                </div>
+             )}
+
+             <div style={{ position: 'absolute', bottom: '20px', left: '50%', transform: 'translateX(-50%)', display: 'flex', gap: '16px', background: 'rgba(0,0,0,0.8)', padding: '12px 24px', borderRadius: '30px' }}>
+                <button className={`btn ${isPlaying ? 'btn-danger' : 'btn-primary'}`} 
+                        disabled={frames.length <= 1}
+                        onClick={() => setIsPlaying(!isPlaying)}
+                        style={{ borderRadius: '20px', padding: '8px 24px' }}>
+                  {isPlaying ? <><Pause size={18} /> Pausar</> : <><Play size={18} style={{ marginLeft: '2px' }} /> Reproducir</>}
+                </button>
+                <div style={{ width: '1px', background: 'var(--border)' }} />
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>Fondo:</span>
+                  <button className={`btn-ghost ${bgColor === 'checker' ? 'active' : ''}`} onClick={() => setBgColor('checker')} style={{ padding: '4px', background: 'url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAYAAACNMs+9AAAAOklEQVQYV2NkYGAwYkAD////ZwSxmBggnFzMwMDAGJvK///vPzMwMDCA5NgUkgxioEswE8Vl2PwkAQD9fQ0wR3kY/wAAAABJRU5ErkJggg==")' }} />
+                  <button className={`btn-ghost ${bgColor === 'black' ? 'active' : ''}`} onClick={() => setBgColor('black')} style={{ padding: '4px', background: '#000' }} />
+                  <button className={`btn-ghost ${bgColor === 'white' ? 'active' : ''}`} onClick={() => setBgColor('white')} style={{ padding: '4px', background: '#fff' }} />
+                </div>
+             </div>
+          </div>
+
+          {/* TIMELINE LATERAL */}
+          <div className="tagging-sidebar" style={{ minWidth: '320px', display: 'flex', flexDirection: 'column' }}>
+            <div className="sidebar-section" style={{ borderBottom: '1px solid var(--border)', paddingBottom: '16px' }}>
+               <label className="btn btn-outline" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', cursor: 'pointer', margin: 0 }}>
+                 <Plus size={16} /> Añadir Frames (Archivos)
+                 <input type="file" hidden multiple accept="image/*" onChange={handleAddFiles} />
+               </label>
+               {frames.length > 0 && (
+                 <button className="btn btn-danger" style={{ marginTop: '8px', width: '100%' }} onClick={() => { if(confirm('¿Borrar todos los frames?')) { setFrames([]); setIsPlaying(false); } }}>
+                   Limpiar Secuencia
+                 </button>
+               )}
+            </div>
+
+            <div className="sidebar-section" style={{ flex: 1, overflowY: 'auto' }}>
+              <span className="section-title">Secuencia de Animación ({frames.length})</span>
+              <div className="region-list">
+                {frames.map((f, i) => (
+                  <div key={f.id} className="region-item" style={{ background: currentFrameIdx === i ? 'rgba(107, 102, 255, 0.15)' : undefined, border: currentFrameIdx === i ? '1px solid var(--accent)' : '1px solid var(--border)' }}>
+                    <div style={{ width: '40px', height: '40px', background: 'rgba(0,0,0,0.3)', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '4px', overflow: 'hidden' }} className="checker-mini">
+                      <img src={f.img.src} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', imageRendering: 'pixelated' }} />
+                    </div>
+                    <div className="region-info" style={{ flex: 1 }}>
+                      <span className="region-label" style={{ fontSize: '0.7rem', wordBreak: 'break-all' }}>{i+1}. {f.fileName}</span>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '4px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', justifyContent: 'space-between' }}>
+                          <span style={{ fontSize: '0.65rem', color: 'var(--text-muted)' }}>Tiempo (ms):</span>
+                          <input type="number" className="input-small" value={f.durationMs} onChange={(e) => updateDuration(f.id, parseInt(e.target.value) || 100)} style={{ width: '60px' }} />
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', justifyContent: 'space-between' }}>
+                          <span style={{ fontSize: '0.65rem', color: 'var(--text-muted)' }}>Scale (x):</span>
+                          <input type="number" step="0.1" className="input-small" value={f.scale || 1.0} onChange={(e) => updateScale(f.id, parseFloat(e.target.value) || 1.0)} style={{ width: '60px' }} />
+                        </div>
+                      </div>
+                    </div>
+                    <button className="btn-ghost btn-danger" onClick={() => removeFrame(f.id)}><Trash2 size={12} /></button>
+                  </div>
+                ))}
+                {frames.length === 0 && <div className="empty-msg">No hay frames cargados. Sube imágenes para crear la animación.</div>}
+              </div>
+            </div>
+            
+            <div className="sidebar-section" style={{ borderTop: '1px solid var(--border)', paddingTop: '16px' }}>
+              <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+                <div style={{ flex: 1 }}>
+                  <label style={{ fontSize: '0.65rem', color: 'var(--text-muted)' }}>Ancho final (0=Auto)</label>
+                  <input type="number" className="input-small" style={{ width: '100%' }} value={exportW} onChange={e => setExportW(parseInt(e.target.value) || 0)} />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <label style={{ fontSize: '0.65rem', color: 'var(--text-muted)' }}>Alto final (0=Auto)</label>
+                  <input type="number" className="input-small" style={{ width: '100%' }} value={exportH} onChange={e => setExportH(parseInt(e.target.value) || 0)} />
+                </div>
+              </div>
+              <button className="btn btn-primary" onClick={handleExportSpritesheet} disabled={frames.length === 0} style={{ width: '100%', marginBottom: '16px', justifyContent: 'center' }}>
+                <Save size={16} style={{ marginRight: '6px' }} /> Exportar Spritesheet
+              </button>
+              <div className="slider-item" style={{ marginBottom: 0 }}>
+                <div className="slider-label"><span><Search size={14} /> Zoom del Visor</span><span>{zoom.toFixed(1)}x</span></div>
+                <input type="range" min="0.5" max="8" step="0.1" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // --- Main App Component ---
 const App: React.FC = () => {
   const [sprites, setSprites] = useState<SpriteData[]>([]);
@@ -1223,6 +1528,7 @@ const App: React.FC = () => {
   const [paintTargetId, setPaintTargetId] = useState<string | null>(null);
   const [stretchTargetId, setStretchTargetId] = useState<string | null>(null);
   const [compositeTarget, setCompositeTarget] = useState<{ id: string, size: number } | null>(null);
+  const [showAnimationModal, setShowAnimationModal] = useState(false);
 
   // --- UNDO SYSTEM ---
   const [history, setHistory] = useState<SpriteData[][]>([]);
@@ -1309,7 +1615,9 @@ const App: React.FC = () => {
         contrast: 100,
         saturation: 100,
         hue: 0,
-        opacity: 100
+        opacity: 100,
+        tintColor: '#000000',
+        tintOpacity: 0
       });
     }
     if (newSprites.length > 0) {
@@ -1405,6 +1713,15 @@ const App: React.FC = () => {
           ctx.putImageData(idata, 0, 0);
         }
         
+        if (s.tintOpacity && s.tintOpacity > 0) {
+          ctx.save();
+          ctx.globalCompositeOperation = 'source-atop';
+          ctx.fillStyle = s.tintColor || '#000000';
+          ctx.globalAlpha = s.tintOpacity / 100;
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.restore();
+        }
+
         const blob = await new Promise<Blob>(res => canvas.toBlob(res as any, 'image/png'));
         const fileHandle = await dirHandle.getFileHandle(s.name, { create: true });
         const writable = await fileHandle.createWritable();
@@ -1553,7 +1870,9 @@ const App: React.FC = () => {
         shadowBlur: ref.shadowBlur,
         shadowColor: ref.shadowColor,
         glowIntensity: ref.glowIntensity,
-        glowColor: ref.glowColor
+        glowColor: ref.glowColor,
+        tintColor: ref.tintColor,
+        tintOpacity: ref.tintOpacity
       };
     });
     commitSprites(next);
@@ -1677,6 +1996,15 @@ const App: React.FC = () => {
         ctx.putImageData(idata, 0, 0);
       }
       
+      if (s.tintOpacity && s.tintOpacity > 0) {
+        ctx.save();
+        ctx.globalCompositeOperation = 'source-atop';
+        ctx.fillStyle = s.tintColor || '#000000';
+        ctx.globalAlpha = s.tintOpacity / 100;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.restore();
+      }
+
       const blob = await new Promise<Blob>(res => canvas.toBlob(res as any, 'image/png'));
       zip.file(s.name, blob);
     }
@@ -1707,6 +2035,10 @@ const App: React.FC = () => {
           </h1>
         </div>
         <div className="top-actions">
+           <button className="btn btn-outline" onClick={() => setShowAnimationModal(true)}>
+             <Film size={16} /> Probar Animación
+           </button>
+           <div style={{ height: '24px', width: '1px', background: 'var(--border)', margin: '0 8px' }} />
            <button className="btn btn-primary" onClick={() => document.getElementById('grid-up')?.click()}>
              <Plus size={16} /> Importar Lote
            </button>
@@ -1990,6 +2322,24 @@ const App: React.FC = () => {
                 </div>
               </div>
 
+              {/* Tinte Group */}
+              <div style={{ background: 'rgba(0,0,0,0.2)', padding: '12px', borderRadius: '8px', marginTop: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                <span style={{ fontSize: '0.65rem', fontWeight: 'bold', color: 'var(--text-muted)', textTransform: 'uppercase' }}>Tinte / Base Color</span>
+                
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '8px', alignItems: 'center' }}>
+                  <div className="slider-item" style={{ marginBottom: 0 }}>
+                    <div className="slider-label"><span>Intensidad (%)</span><span>{firstSelected?.tintOpacity || 0}%</span></div>
+                    <input type="range" min="0" max="100" value={firstSelected?.tintOpacity || 0}
+                      onChange={(e) => updateBulkFilter('tintOpacity', parseInt(e.target.value))} disabled={selection.length === 0}
+                    />
+                  </div>
+                  <input type="color" value={firstSelected?.tintColor || '#000000'} 
+                    onChange={(e) => updateBulkFilter('tintColor', e.target.value)} disabled={selection.length === 0}
+                    style={{ width: '24px', height: '24px', padding: 0, border: 'none', background: 'none', cursor: 'pointer' }}
+                  />
+                </div>
+              </div>
+
               {/* Layer Effects Group */}
               <div style={{ background: 'rgba(0,0,0,0.2)', padding: '12px', borderRadius: '8px', marginTop: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
                 <span style={{ fontSize: '0.65rem', fontWeight: 'bold', color: 'var(--text-muted)', textTransform: 'uppercase' }}>Contorno y Capas</span>
@@ -2129,6 +2479,9 @@ const App: React.FC = () => {
             setCompositeTarget(null);
           }}
         />
+      )}
+      {showAnimationModal && (
+        <AnimationModal onClose={() => setShowAnimationModal(false)} />
       )}
     </div>
   );
