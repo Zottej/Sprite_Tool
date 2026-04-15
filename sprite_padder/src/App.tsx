@@ -431,18 +431,22 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
           <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
         </div>
         <div className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`} style={{ overflow: 'auto' }}>
-           <div style={{ 
-             position: 'relative', 
-             cursor: 'none', 
-             display: 'flex', 
-             alignItems: 'center', 
-             justifyContent: 'center',
-             width: 'fit-content',
-             height: 'fit-content',
+           <div style={{
+             width: sprite.img.width * zoom,
+             height: sprite.img.height * zoom,
              margin: 'auto',
-             transform: `scale(${zoom})`,
-             transformOrigin: 'center center'
+             position: 'relative'
            }}>
+             <div style={{ 
+               position: 'absolute',
+               left: 0,
+               top: 0,
+               cursor: 'none', 
+               width: sprite.img.width,
+               height: sprite.img.height,
+               transform: `scale(${zoom})`,
+               transformOrigin: 'top left'
+             }}>
              <canvas 
               ref={canvasRef}
               onMouseDown={() => setIsDrawing(true)}
@@ -466,6 +470,7 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
                  borderRadius: brushShape === 'circle' ? '50%' : '0'
                }} />
              )}
+             </div>
            </div>
         </div>
         <div className="modal-footer" style={{ padding: '20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '24px' }}>
@@ -902,18 +907,22 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
           <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
         </div>
         <div className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`} style={{ overflow: 'auto' }}>
-           <div style={{ 
-             position: 'relative', 
-             cursor: 'none', 
-             display: 'flex', 
-             alignItems: 'center', 
-             justifyContent: 'center',
-             width: 'fit-content',
-             height: 'fit-content',
+           <div style={{
+             width: sprite.img.width * zoom,
+             height: sprite.img.height * zoom,
              margin: 'auto',
-             transform: `scale(${zoom})`,
-             transformOrigin: 'center center'
+             position: 'relative'
            }}>
+             <div style={{ 
+               position: 'absolute',
+               left: 0,
+               top: 0,
+               cursor: 'none', 
+               width: sprite.img.width,
+               height: sprite.img.height,
+               transform: `scale(${zoom})`,
+               transformOrigin: 'top left'
+             }}>
              <canvas 
               ref={canvasRef}
               onMouseDown={() => setIsDrawing(true)}
@@ -937,6 +946,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
                  borderColor: paintColor
                }} />
              )}
+             </div>
            </div>
         </div>
         <div className="modal-footer" style={{ padding: '20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '24px' }}>
