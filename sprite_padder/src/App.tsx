@@ -1,9 +1,513 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
 import { 
   Trash2, Plus, Archive, CheckSquare, Square, 
-  Target, FolderSync, Save, AlertTriangle, Eraser, RotateCcw, Search, MapPin, Pencil, MoreHorizontal, FlipHorizontal, FlipVertical, Droplets, Grid, Circle, Maximize, Layers, Play, Pause, Film
+  Target, FolderSync, Save, AlertTriangle, Eraser, RotateCcw, Search, MapPin, Pencil, MoreHorizontal, FlipHorizontal, FlipVertical, Droplets, Grid, Circle, Maximize, Layers, Play, Pause, Film, PaintBucket, Scissors, Type, Crop, Brush, ChevronLeft, ChevronRight,
+  ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Pipette, Stamp
 } from 'lucide-react';
 import JSZip from 'jszip';
+import { canvasToBc7Dds, spriteNameToDds } from './ddsExport';
+import {
+  arrayBufferFromBlob,
+  filesFromDesktopOpen,
+  getDesktop,
+  type DesktopFolder,
+} from './desktopBridge';
+
+// Chrome/Edge recuerdan la última carpeta asociada a este mismo ID.
+// Importar archivos usa otro ID: compartir el de carpetas hace fallar
+// showOpenFilePicker de forma intermitente.
+const WORKING_PICKER_ID = 'joa-working-folder';
+const OPEN_FILES_PICKER_ID = 'joa-open-images';
+const SAVE_FILE_PICKER_ID = 'joa-save-file';
+
+const isProbablyImageFile = (file: File) => {
+  if (file.type && file.type.startsWith('image/')) return true;
+  return /\.(png|jpe?g|webp|gif|bmp|ico|svg|avif)$/i.test(file.name);
+};
+
+/** Abre el selector de imágenes. null = usar fallback <input>; [] = canceló. */
+const pickImageFiles = async (
+  multiple: boolean,
+  startIn?: FileSystemHandle | null
+): Promise<File[] | null> => {
+  if (!('showOpenFilePicker' in window)) return null;
+  const base = {
+    id: OPEN_FILES_PICKER_ID,
+    multiple,
+    types: [{
+      description: 'Imágenes',
+      accept: { 'image/*': ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.ico', '.svg'] },
+    }],
+  };
+  const readHandles = async (options: Record<string, unknown>) => {
+    const handles = await (window as any).showOpenFilePicker(options);
+    return Promise.all(handles.map((handle: FileSystemFileHandle) => handle.getFile()));
+  };
+  try {
+    if (startIn) {
+      try {
+        return await readHandles({ ...base, startIn });
+      } catch (err: any) {
+        if (err?.name === 'AbortError') return [];
+      }
+    }
+    return await readHandles(base);
+  } catch (err: any) {
+    if (err?.name === 'AbortError') return [];
+    console.warn('showOpenFilePicker falló, se usa el selector clásico:', err);
+    return null;
+  }
+};
+
+// --- Persistencia del handle de carpeta de trabajo (IndexedDB) ---
+const IDB_NAME = 'joa-sprite-tool';
+const IDB_STORE = 'handles';
+const IDB_KEY = 'working-dir';
+
+const openHandleDb = (): Promise<IDBDatabase> =>
+  new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore(IDB_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+
+const saveWorkingDirHandle = async (handle: FileSystemDirectoryHandle | null) => {
+  try {
+    const db = await openHandleDb();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_STORE);
+      if (handle) store.put(handle, IDB_KEY);
+      else store.delete(IDB_KEY);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+  } catch (err) {
+    console.warn('No se pudo persistir la carpeta de trabajo:', err);
+  }
+};
+
+const loadWorkingDirHandle = async (): Promise<FileSystemDirectoryHandle | null> => {
+  try {
+    const db = await openHandleDb();
+    const handle = await new Promise<FileSystemDirectoryHandle | null>((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get(IDB_KEY);
+      req.onsuccess = () => resolve((req.result as FileSystemDirectoryHandle) || null);
+      req.onerror = () => reject(req.error);
+    });
+    db.close();
+    return handle;
+  } catch (err) {
+    console.warn('No se pudo restaurar la carpeta de trabajo:', err);
+    return null;
+  }
+};
+
+/** Verifica (y opcionalmente solicita) permiso de lectura/escritura sobre un handle. */
+const ensureHandlePermission = async (
+  handle: any,
+  mode: 'read' | 'readwrite' = 'readwrite'
+): Promise<boolean> => {
+  if (!handle) return false;
+  try {
+    if ((await handle.queryPermission?.({ mode })) === 'granted') return true;
+    if ((await handle.requestPermission?.({ mode })) === 'granted') return true;
+  } catch (err) {
+    console.warn('No se pudo verificar el permiso de la carpeta:', err);
+  }
+  return false;
+};
+
+const loadPref = <T,>(key: string, fallback: T): T => {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw == null) return fallback;
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+};
+
+const savePref = (key: string, value: unknown) => {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* ignore quota / private mode */
+  }
+};
+
+const clampNum = (value: unknown, min: number, max: number, fallback: number) => {
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+};
+
+const LAST_COLOR_KEY = 'joa-last-color';
+
+const normalizeHexColor = (value: unknown, fallback = ''): string => {
+  if (typeof value !== 'string') return fallback;
+  const s = value.trim().toLowerCase();
+  const hex8 = s.match(/^#([0-9a-f]{6})([0-9a-f]{2})?$/);
+  if (hex8) return `#${hex8[1]}`;
+  const hex3 = s.match(/^#([0-9a-f]{3})$/);
+  if (hex3) return `#${hex3[1].split('').map((c) => c + c).join('')}`;
+  const rgb = s.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+  if (rgb) {
+    const to = (n: string) => Math.max(0, Math.min(255, parseInt(n, 10))).toString(16).padStart(2, '0');
+    return `#${to(rgb[1])}${to(rgb[2])}${to(rgb[3])}`;
+  }
+  return fallback;
+};
+
+const rememberLastColor = (hex: string) => {
+  const normalized = normalizeHexColor(hex);
+  if (normalized) savePref(LAST_COLOR_KEY, normalized);
+  return normalized;
+};
+
+const loadLastColor = (fallback: string) =>
+  normalizeHexColor(loadPref<string>(LAST_COLOR_KEY, fallback), fallback);
+
+/** Recuerda left/top del scroll de un workspace por nombre de sprite. */
+const useRememberedScroll = (storageKey: string, restoreKey: string, extraDeps: unknown[] = []) => {
+  const workspaceRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = workspaceRef.current;
+    if (!el) return;
+    const all = loadPref<Record<string, { left: number; top: number }>>(storageKey, {});
+    const saved = all[restoreKey] || all.__last;
+    if (!saved) return;
+    const apply = () => {
+      el.scrollLeft = saved.left;
+      el.scrollTop = saved.top;
+    };
+    apply();
+    const frame = requestAnimationFrame(apply);
+    const timer = window.setTimeout(apply, 40);
+    return () => {
+      cancelAnimationFrame(frame);
+      clearTimeout(timer);
+    };
+  }, [storageKey, restoreKey, ...extraDeps]);
+
+  const onWorkspaceScroll = () => {
+    const el = workspaceRef.current;
+    if (!el) return;
+    const all = loadPref<Record<string, { left: number; top: number }>>(storageKey, {});
+    const pos = { left: el.scrollLeft, top: el.scrollTop };
+    savePref(storageKey, { ...all, [restoreKey]: pos, __last: pos });
+  };
+
+  return { workspaceRef, onWorkspaceScroll };
+};
+
+/** Shift+rueda = zoom hacia el cursor; Alt+rueda = tamaño de pincel (si hay). */
+const useModalWheelControls = (opts: {
+  zoom: number;
+  setZoom: (value: number) => void;
+  zoomMin?: number;
+  zoomMax?: number;
+  zoomStep?: number;
+  brushSize?: number;
+  setBrushSize?: (value: number) => void;
+  brushMin?: number;
+  brushMax?: number;
+  enabled?: boolean;
+  /** Contenedor con overflow:auto cuyo contenido escala con zoom. */
+  workspaceRef?: React.RefObject<HTMLElement | null>;
+  /** Elemento que cambia de tamaño con el zoom; por defecto el primer hijo del workspace. */
+  contentRef?: React.RefObject<HTMLElement | null>;
+}) => {
+  const {
+    zoom, setZoom,
+    zoomMin = 0.5, zoomMax = 8, zoomStep = 0.1,
+    brushSize, setBrushSize,
+    brushMin = 1, brushMax = 100,
+    enabled = true,
+    workspaceRef,
+    contentRef,
+  } = opts;
+
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  const brushRef = useRef(brushSize);
+  brushRef.current = brushSize;
+  const pendingAnchorRef = useRef<{
+    clientX: number;
+    clientY: number;
+    relX: number;
+    relY: number;
+  } | null>(null);
+
+  const resolveContent = (workspace: HTMLElement) => {
+    const fromRef = contentRef?.current;
+    if (fromRef) return fromRef;
+    const first = workspace.firstElementChild;
+    return first instanceof HTMLElement ? first : null;
+  };
+
+  useEffect(() => {
+    if (!enabled) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.shiftKey && !e.altKey) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const dir = e.deltaY > 0 ? -1 : 1;
+
+      if (e.altKey && setBrushSize) {
+        const cur = brushRef.current ?? brushMin;
+        setBrushSize(Math.min(brushMax, Math.max(brushMin, cur + dir)));
+        return;
+      }
+
+      if (!e.shiftKey) return;
+      const oldZoom = zoomRef.current;
+      const next = Number((oldZoom + dir * zoomStep).toFixed(2));
+      const clamped = Math.min(zoomMax, Math.max(zoomMin, next));
+      if (clamped === oldZoom) return;
+
+      const workspace = workspaceRef?.current;
+      if (workspace) {
+        const content = resolveContent(workspace);
+        if (content) {
+          const cRect = content.getBoundingClientRect();
+          if (cRect.width > 1 && cRect.height > 1) {
+            // Fracción del contenido bajo el cursor (soporta margin:auto / centrado).
+            pendingAnchorRef.current = {
+              clientX: e.clientX,
+              clientY: e.clientY,
+              relX: (e.clientX - cRect.left) / cRect.width,
+              relY: (e.clientY - cRect.top) / cRect.height,
+            };
+          }
+        }
+      }
+
+      setZoom(clamped);
+    };
+    window.addEventListener('wheel', onWheel, { passive: false, capture: true });
+    return () => window.removeEventListener('wheel', onWheel, { capture: true });
+  }, [
+    enabled, setZoom, zoomMin, zoomMax, zoomStep,
+    setBrushSize, brushMin, brushMax, workspaceRef, contentRef,
+  ]);
+
+  useLayoutEffect(() => {
+    const anchor = pendingAnchorRef.current;
+    const workspace = workspaceRef?.current;
+    if (!anchor || !workspace) return;
+    pendingAnchorRef.current = null;
+
+    const content = resolveContent(workspace);
+    if (!content) return;
+
+    const cRect = content.getBoundingClientRect();
+    const targetX = anchor.relX * cRect.width;
+    const targetY = anchor.relY * cRect.height;
+    // Mover el scroll para que el mismo punto del contenido quede bajo el cursor.
+    workspace.scrollLeft -= (anchor.clientX - targetX) - cRect.left;
+    workspace.scrollTop -= (anchor.clientY - targetY) - cRect.top;
+  }, [zoom, workspaceRef, contentRef]);
+};
+
+const mimeForSaveExt = (ext: string) => {
+  const e = ext.replace(/^\./, '').toLowerCase();
+  if (e === 'png') return 'image/png';
+  if (e === 'ico') return 'image/x-icon';
+  if (e === 'jpg' || e === 'jpeg') return 'image/jpeg';
+  if (e === 'webp') return 'image/webp';
+  if (e === 'zip') return 'application/zip';
+  return 'application/octet-stream';
+};
+
+const pickerTypesForSave = (
+  suggestedName: string,
+  filters?: { name: string; extensions: string[] }[]
+) => {
+  if (filters && filters.length > 0) {
+    return filters.map((f) => ({
+      description: f.name,
+      accept: {
+        [mimeForSaveExt(f.extensions[0] || '')]: f.extensions.map(
+          (ext) => `.${String(ext).replace(/^\./, '')}`
+        ),
+      },
+    }));
+  }
+  const ext = suggestedName.includes('.') ? '.' + suggestedName.split('.').pop()! : '';
+  return [{
+    description: suggestedName,
+    accept: { [mimeForSaveExt(ext)]: ext ? [ext] : [] },
+  }];
+};
+
+/** Nombre de archivo seguro para guardar/descargar. */
+const sanitizeExportFileName = (rawName: string, extWithDot: string) => {
+  const ext = extWithDot.startsWith('.') ? extWithDot : `.${extWithDot}`;
+  let base = String(rawName || 'sprite')
+    .replace(/\.[^/.]+$/, '')
+    .replace(/[<>:"/\\|?*\u0000-\u001f]+/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!base) base = 'sprite';
+  // Evitar nombres tipo "." / ".."
+  if (base === '.' || base === '..') base = 'sprite';
+  return `${base}${ext}`;
+};
+
+/** Descarga forzada: último recurso que casi nunca falla en navegador. */
+const forceDownloadBlob = (blob: Blob, suggestedName: string): boolean => {
+  try {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = suggestedName;
+    a.rel = 'noopener';
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // No revocar al instante: algunos navegadores cancelan la descarga.
+    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    return true;
+  } catch (err) {
+    console.error('forceDownloadBlob failed:', err);
+    return false;
+  }
+};
+
+/** PNG desde canvas con fallback a dataURL si toBlob falla. */
+const canvasToPngBlob = async (canvas: HTMLCanvasElement): Promise<Blob> => {
+  const fromToBlob = await new Promise<Blob | null>((resolve) => {
+    try {
+      if (typeof canvas.toBlob !== 'function') {
+        resolve(null);
+        return;
+      }
+      canvas.toBlob((b) => resolve(b), 'image/png');
+    } catch {
+      resolve(null);
+    }
+  });
+  if (fromToBlob && fromToBlob.size > 0) return fromToBlob;
+
+  let dataUrl: string;
+  try {
+    dataUrl = canvas.toDataURL('image/png');
+  } catch {
+    throw new Error('No se pudo generar el PNG (canvas demasiado grande o bloqueado por el navegador).');
+  }
+  if (!dataUrl || !dataUrl.startsWith('data:image/png')) {
+    throw new Error('No se pudo generar el PNG.');
+  }
+  const res = await fetch(dataUrl);
+  const blob = await res.blob();
+  if (!blob || blob.size === 0) {
+    throw new Error('El PNG generado quedó vacío.');
+  }
+  return blob;
+};
+
+type SaveDestination = {
+  kind: 'desktop' | 'picker' | 'download';
+  write: (blob: Blob) => Promise<boolean>;
+};
+
+const downloadDestination = (suggestedName: string): SaveDestination => ({
+  kind: 'download',
+  write: async (blob) => forceDownloadBlob(blob, suggestedName),
+});
+
+/**
+ * Abre el diálogo de guardar YA (hace falta el gesto del click).
+ * Si el picker falla por cualquier motivo (salvo cancelar), cae a descarga.
+ * Nunca lanza: cancela → null; error → destino de descarga.
+ */
+const openSaveDestination = async (
+  suggestedName: string,
+  filters?: { name: string; extensions: string[] }[]
+): Promise<SaveDestination | null> => {
+  const desktop = getDesktop();
+  if (desktop) {
+    try {
+      const filePath = await desktop.pickSaveFile({
+        suggestedName,
+        filters: filters || [{ name: 'Archivo', extensions: ['*'] }],
+      });
+      if (!filePath) return null;
+      return {
+        kind: 'desktop',
+        write: async (blob) => {
+          await desktop.writeFile(filePath, await arrayBufferFromBlob(blob));
+          return true;
+        },
+      };
+    } catch (err) {
+      console.error('pickSaveFile (desktop) falló, se usa descarga:', err);
+      return downloadDestination(suggestedName);
+    }
+  }
+
+  if ('showSaveFilePicker' in window) {
+    try {
+      const handle = await (window as any).showSaveFilePicker({
+        id: SAVE_FILE_PICKER_ID,
+        suggestedName,
+        types: pickerTypesForSave(suggestedName, filters),
+      });
+      return {
+        kind: 'picker',
+        write: async (blob) => {
+          const writable = await handle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+          return true;
+        },
+      };
+    } catch (err: any) {
+      if (err?.name === 'AbortError') return null;
+      console.error('showSaveFilePicker falló, se usa descarga:', err);
+    }
+  }
+
+  return downloadDestination(suggestedName);
+};
+
+/** Escribe el blob; si falla el destino elegido, fuerza descarga. */
+const writeBlobWithFallback = async (
+  dest: SaveDestination,
+  blob: Blob,
+  suggestedName: string
+): Promise<'saved' | 'downloaded' | 'failed'> => {
+  try {
+    const ok = await dest.write(blob);
+    if (ok) return dest.kind === 'download' ? 'downloaded' : 'saved';
+  } catch (err) {
+    console.error('Escritura principal falló:', err);
+  }
+  if (dest.kind !== 'download') {
+    if (forceDownloadBlob(blob, suggestedName)) return 'downloaded';
+  }
+  return 'failed';
+};
+
+/** Guarda un blob: en desktop usa diálogo nativo; en web File System Access / download. */
+const saveBlobToDisk = async (
+  blob: Blob,
+  suggestedName: string,
+  filters?: { name: string; extensions: string[] }[]
+): Promise<boolean> => {
+  const dest = await openSaveDestination(suggestedName, filters);
+  if (!dest) return false;
+  const result = await writeBlobWithFallback(dest, blob, suggestedName);
+  return result !== 'failed';
+};
 
 interface Padding {
   top: number;
@@ -33,6 +537,8 @@ interface SpriteData {
   saturation?: number;
   hue?: number;
   opacity?: number;
+  /** absolute = uniforme (default); radial = mayor en el centro de la imagen, menor hacia los bordes */
+  opacityMode?: 'absolute' | 'radial';
   originalImg?: HTMLImageElement; // Store original for reset
   scale?: number;
   rotation?: number;
@@ -48,6 +554,8 @@ interface SpriteData {
   exposure?: number;
   outlineColor?: string;
   outlineWidth?: number;
+  /** smooth = drop-shadow limpio (default); pixel = contorno en grilla de pixelación */
+  outlineStyle?: 'smooth' | 'pixel';
   shadowX?: number;
   shadowY?: number;
   shadowBlur?: number;
@@ -60,13 +568,28 @@ interface SpriteData {
   posterize?: number;
   tintColor?: string;
   tintOpacity?: number;
+  greenHueShift?: number;
+  greenSaturation?: number;
+  greenOpacity?: number;
+  blackHueShift?: number;
+  blackSaturation?: number;
+  blackOpacity?: number;
+  whiteHueShift?: number;
+  whiteSaturation?: number;
+  whiteOpacity?: number;
+  effectMasks?: Region[];
+  effectMaskMode?: 'rect' | 'brush';
+  effectMaskBrush?: string | null;
+  handDrawn?: number;
+  pencilDrawn?: number;
 }
 
 const getSpriteFilter = (sprite: SpriteData, isExport = false) => {
   const b = sprite.brightness ?? 100;
   const c = sprite.contrast ?? 100;
   const s = sprite.saturation ?? 100;
-  const o = sprite.opacity ?? 100;
+  const useRadialOpacity = sprite.opacityMode === 'radial' && hasActiveEffectMask(sprite);
+  const o = useRadialOpacity ? 100 : (sprite.opacity ?? 100);
   const hRotate = sprite.hue ?? 0;
   const gs = sprite.grayscale ?? 0;
   const sp = sprite.sepia ?? 0;
@@ -89,10 +612,10 @@ const getSpriteFilter = (sprite: SpriteData, isExport = false) => {
     filter += ` drop-shadow(0 0 ${sprite.glowIntensity}px ${sprite.glowColor})`;
   }
   
-  if (sprite.outlineColor && sprite.outlineWidth) {
+  if (sprite.outlineColor && sprite.outlineWidth && sprite.outlineStyle !== 'pixel') {
     const w = sprite.outlineWidth;
     const oc = sprite.outlineColor;
-    filter += ` drop-shadow(${w}px 0 0 ${oc}) drop-shadow(-${w}px 0 0 ${oc}) drop-shadow(0 ${w}px 0 ${oc}) drop-shadow(0 -${w}px 0 ${oc})`;
+    filter += ` drop-shadow(${w}px 0 0 ${oc}) drop-shadow(-${w}px 0 0 ${oc}) drop-shadow(0 ${w}px 0 ${oc}) drop-shadow(0 -${w}px 0 ${oc}) drop-shadow(${w}px ${w}px 0 ${oc}) drop-shadow(-${w}px -${w}px 0 ${oc}) drop-shadow(${w}px -${w}px 0 ${oc}) drop-shadow(-${w}px ${w}px 0 ${oc})`;
   }
 
   if (!isExport && sprite.posterize && sprite.posterize >= 2) {
@@ -106,6 +629,760 @@ const getSpriteFilter = (sprite: SpriteData, isExport = false) => {
   }
   
   return filter;
+};
+
+const rgbToHsl = (r: number, g: number, b: number): [number, number, number] => {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  let h = 0, s = 0, l = (max + min) / 2;
+  if (max !== min) {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    switch (max) {
+      case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+      case g: h = (b - r) / d + 2; break;
+      case b: h = (r - g) / d + 4; break;
+    }
+    h /= 6;
+  }
+  return [h * 360, s, l];
+};
+
+const hslToRgb = (h: number, s: number, l: number): [number, number, number] => {
+  h /= 360;
+  let r, g, b;
+  if (s === 0) {
+    r = g = b = l; // achromatic
+  } else {
+    const hue2rgb = (p: number, q: number, t: number) => {
+      if (t < 0) t += 1;
+      if (t > 1) t -= 1;
+      if (t < 1/6) return p + (q - p) * 6 * t;
+      if (t < 1/2) return q;
+      if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+      return p;
+    };
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+    const p = 2 * l - q;
+    r = hue2rgb(p, q, h + 1/3);
+    g = hue2rgb(p, q, h);
+    b = hue2rgb(p, q, h - 1/3);
+  }
+  return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+};
+
+const applyGreenFilters = (img: HTMLImageElement | HTMLCanvasElement, shiftDeg: number, satFilter: number, opFilter: number): HTMLCanvasElement | HTMLImageElement => {
+  if (shiftDeg === 0 && satFilter === 100 && opFilter === 100) return img;
+  const canvas = document.createElement('canvas');
+  canvas.width = img.width;
+  canvas.height = img.height;
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(img, 0, 0);
+
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imgData.data;
+
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i], g = data[i+1], b = data[i+2], a = data[i+3];
+    if (a === 0) continue;
+    
+    let [h, s, l] = rgbToHsl(r, g, b);
+    
+    // Rango verde ~60 a ~160 en HSL
+    let isGreen = h >= 60 && h <= 160 && s > 0.1 && l > 0.1 && l < 0.9;
+    
+    if (isGreen) {
+      let newH = h + shiftDeg;
+      if (newH < 0) newH += 360;
+      if (newH >= 360) newH -= 360;
+      
+      let newS = s * (satFilter / 100);
+      if (newS > 1) newS = 1;
+      if (newS < 0) newS = 0;
+      
+      const [nR, nG, nB] = hslToRgb(newH, newS, l);
+      data[i] = nR;
+      data[i+1] = nG;
+      data[i+2] = nB;
+      data[i+3] = data[i+3] * (opFilter / 100);
+    }
+  }
+  
+  ctx.putImageData(imgData, 0, 0);
+  return canvas;
+};
+
+const applyBlackFilters = (img: HTMLImageElement | HTMLCanvasElement, shiftDeg: number, satFilter: number, opFilter: number): HTMLCanvasElement | HTMLImageElement => {
+  if (shiftDeg === 0 && satFilter === 100 && opFilter === 100) return img;
+  const canvas = document.createElement('canvas');
+  canvas.width = img.width;
+  canvas.height = img.height;
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(img, 0, 0);
+
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imgData.data;
+
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i], g = data[i+1], b = data[i+2], a = data[i+3];
+    if (a === 0) continue;
+
+    let [h, s, l] = rgbToHsl(r, g, b);
+
+    // Negros: baja luminosidad (tonos oscuros y grises profundos)
+    let isBlack = l < 0.25 && l > 0.01;
+
+    if (isBlack) {
+      let newH = h + shiftDeg;
+      if (newH < 0) newH += 360;
+      if (newH >= 360) newH -= 360;
+
+      let newS = s * (satFilter / 100);
+      if (newS > 1) newS = 1;
+      if (newS < 0) newS = 0;
+
+      const [nR, nG, nB] = hslToRgb(newH, newS, l);
+      data[i] = nR;
+      data[i+1] = nG;
+      data[i+2] = nB;
+      data[i+3] = data[i+3] * (opFilter / 100);
+    }
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+  return canvas;
+};
+
+const applyWhiteFilters = (img: HTMLImageElement | HTMLCanvasElement, shiftDeg: number, satFilter: number, opFilter: number): HTMLCanvasElement | HTMLImageElement => {
+  if (shiftDeg === 0 && satFilter === 100 && opFilter === 100) return img;
+  const canvas = document.createElement('canvas');
+  canvas.width = img.width;
+  canvas.height = img.height;
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(img, 0, 0);
+
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imgData.data;
+
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i], g = data[i+1], b = data[i+2], a = data[i+3];
+    if (a === 0) continue;
+
+    let [h, s, l] = rgbToHsl(r, g, b);
+
+    // Blancos: alta luminosidad (tonos claros y grises pálidos)
+    let isWhite = l > 0.75 && l < 0.99;
+
+    if (isWhite) {
+      let newH = h + shiftDeg;
+      if (newH < 0) newH += 360;
+      if (newH >= 360) newH -= 360;
+
+      let newS = s * (satFilter / 100);
+      if (newS > 1) newS = 1;
+      if (newS < 0) newS = 0;
+
+      const [nR, nG, nB] = hslToRgb(newH, newS, l);
+      data[i] = nR;
+      data[i+1] = nG;
+      data[i+2] = nB;
+      data[i+3] = data[i+3] * (opFilter / 100);
+    }
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+  return canvas;
+};
+
+const pixelLuminance = (r: number, g: number, b: number) => 0.299 * r + 0.587 * g + 0.114 * b;
+
+const applyHandDrawnEffect = (img: HTMLImageElement | HTMLCanvasElement, amount: number): HTMLCanvasElement | HTMLImageElement => {
+  if (amount <= 0) return img;
+  const canvas = document.createElement('canvas');
+  canvas.width = img.width;
+  canvas.height = img.height;
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(img, 0, 0);
+
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imgData.data;
+  const orig = new Uint8ClampedArray(data);
+  const w = canvas.width;
+  const h = canvas.height;
+  const t = amount / 100;
+  const levels = Math.max(4, Math.round(24 - t * 20));
+  const factor = 255 / (levels - 1);
+  const edgeThreshold = 18 + t * 42;
+  const edges = new Float32Array(w * h);
+
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const idx = (y * w + x) * 4;
+      if (orig[idx + 3] === 0) continue;
+      let gx = 0;
+      let gy = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const ni = ((y + dy) * w + (x + dx)) * 4;
+          const l = pixelLuminance(orig[ni], orig[ni + 1], orig[ni + 2]);
+          gx += l * (dx === 0 ? 0 : dx);
+          gy += l * (dy === 0 ? 0 : dy);
+        }
+      }
+      const strength = Math.hypot(gx, gy);
+      edges[y * w + x] = strength > edgeThreshold ? Math.min(1, (strength - edgeThreshold) / (120 * t + 40)) : 0;
+    }
+  }
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const a = orig[i + 3];
+      if (a === 0) continue;
+
+      const r = orig[i];
+      const g = orig[i + 1];
+      const b = orig[i + 2];
+      const edge = edges[y * w + x] || 0;
+
+      let qr = Math.round((r / 255) * (levels - 1)) * factor;
+      let qg = Math.round((g / 255) * (levels - 1)) * factor;
+      let qb = Math.round((b / 255) * (levels - 1)) * factor;
+
+      const fillL = pixelLuminance(qr, qg, qb);
+      const desat = 0.35 * t;
+      qr = qr + (fillL - qr) * desat;
+      qg = qg + (fillL - qg) * desat;
+      qb = qb + (fillL - qb) * desat;
+
+      const paper = 248 - ((x * 7 + y * 13) % 5) * t * 2;
+      qr = qr + (paper - qr) * 0.12 * t;
+      qg = qg + (paper - qg) * 0.12 * t;
+      qb = qb + (paper - qb) * 0.12 * t;
+
+      const ink = Math.min(1, edge * (0.6 + t * 0.9));
+      const inkR = 28 + ((x + y) % 3) * 4;
+      const inkG = 22 + ((x * 2 + y) % 3) * 3;
+      const inkB = 18 + ((x + y * 2) % 3) * 3;
+      qr = qr * (1 - ink) + inkR * ink;
+      qg = qg * (1 - ink) + inkG * ink;
+      qb = qb * (1 - ink) + inkB * ink;
+
+      const wobble = (((x * 17 + y * 31) % 7) - 3) * t * 0.4;
+      qr = Math.max(0, Math.min(255, qr + wobble));
+      qg = Math.max(0, Math.min(255, qg - wobble * 0.5));
+      qb = Math.max(0, Math.min(255, qb + wobble * 0.3));
+
+      data[i] = Math.round(r + (qr - r) * t);
+      data[i + 1] = Math.round(g + (qg - g) * t);
+      data[i + 2] = Math.round(b + (qb - b) * t);
+    }
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+  return canvas;
+};
+
+const applyPencilDrawnEffect = (img: HTMLImageElement | HTMLCanvasElement, amount: number): HTMLCanvasElement | HTMLImageElement => {
+  if (amount <= 0) return img;
+  const canvas = document.createElement('canvas');
+  canvas.width = img.width;
+  canvas.height = img.height;
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(img, 0, 0);
+
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imgData.data;
+  const orig = new Uint8ClampedArray(data);
+  const w = canvas.width;
+  const h = canvas.height;
+  const t = amount / 100;
+  const edgeThreshold = 12 + t * 35;
+  const hatchSpacing = Math.max(3, Math.round(8 - t * 4));
+  const edges = new Float32Array(w * h);
+
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const idx = (y * w + x) * 4;
+      if (orig[idx + 3] === 0) continue;
+      let gx = 0;
+      let gy = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const ni = ((y + dy) * w + (x + dx)) * 4;
+          const l = pixelLuminance(orig[ni], orig[ni + 1], orig[ni + 2]);
+          gx += l * (dx === 0 ? 0 : dx);
+          gy += l * (dy === 0 ? 0 : dy);
+        }
+      }
+      const strength = Math.hypot(gx, gy);
+      edges[y * w + x] = strength > edgeThreshold ? Math.min(1, (strength - edgeThreshold) / (90 * t + 30)) : 0;
+    }
+  }
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const a = orig[i + 3];
+      if (a === 0) continue;
+
+      const r = orig[i];
+      const g = orig[i + 1];
+      const b = orig[i + 2];
+      const lum = pixelLuminance(r, g, b);
+      const edge = edges[y * w + x] || 0;
+
+      let graphite = lum;
+      graphite = graphite + (255 - graphite) * 0.06 * t;
+
+      const hatchA = ((x + y) % hatchSpacing) === 0;
+      const hatchB = ((x - y + hatchSpacing * 10) % hatchSpacing) === 0;
+      const darkFactor = 1 - lum / 255;
+      if (darkFactor > 0.25 * t) {
+        if (hatchA) graphite -= 22 * t * darkFactor;
+        if (hatchB && t > 0.35) graphite -= 14 * t * darkFactor;
+      }
+
+      const edgeGray = 55 + ((x * 3 + y * 5) % 7) * 3;
+      const stroke = Math.min(1, edge * (0.5 + t * 0.8));
+      graphite = graphite * (1 - stroke) + edgeGray * stroke;
+
+      const grain = (((x * 11 + y * 19) % 5) - 2) * t * 1.2;
+      graphite = Math.max(0, Math.min(255, graphite + grain));
+
+      const warm = 1 + t * 0.02;
+      let pr = graphite * warm;
+      let pg = graphite * (1 + t * 0.008);
+      let pb = graphite * (1 - t * 0.015);
+
+      const paper = 252 - ((x * 5 + y * 9) % 4);
+      pr = pr + (paper - pr) * 0.1 * t * (1 - darkFactor);
+      pg = pg + (paper - pg) * 0.1 * t * (1 - darkFactor);
+      pb = pb + (paper - pb) * 0.1 * t * (1 - darkFactor);
+
+      data[i] = Math.round(r + (pr - r) * t);
+      data[i + 1] = Math.round(g + (pg - g) * t);
+      data[i + 2] = Math.round(b + (pb - b) * t);
+    }
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+  return canvas;
+};
+
+const getSpriteImageSource = (sprite: SpriteData): HTMLImageElement | HTMLCanvasElement => {
+  let source: HTMLImageElement | HTMLCanvasElement = sprite.img;
+
+  const hShift = sprite.greenHueShift ?? 0;
+  const gSat = sprite.greenSaturation ?? 100;
+  const gOp = sprite.greenOpacity ?? 100;
+  if (hShift !== 0 || gSat !== 100 || gOp !== 100) {
+    source = applyGreenFilters(source, hShift, gSat, gOp);
+  }
+
+  const bShift = sprite.blackHueShift ?? 0;
+  const bSat = sprite.blackSaturation ?? 100;
+  const bOp = sprite.blackOpacity ?? 100;
+  if (bShift !== 0 || bSat !== 100 || bOp !== 100) {
+    source = applyBlackFilters(source, bShift, bSat, bOp);
+  }
+
+  const wShift = sprite.whiteHueShift ?? 0;
+  const wSat = sprite.whiteSaturation ?? 100;
+  const wOp = sprite.whiteOpacity ?? 100;
+  if (wShift !== 0 || wSat !== 100 || wOp !== 100) {
+    source = applyWhiteFilters(source, wShift, wSat, wOp);
+  }
+
+  const handDrawn = sprite.handDrawn ?? 0;
+  if (handDrawn > 0) {
+    source = applyHandDrawnEffect(source, handDrawn);
+  }
+
+  const pencilDrawn = sprite.pencilDrawn ?? 0;
+  if (pencilDrawn > 0) {
+    source = applyPencilDrawnEffect(source, pencilDrawn);
+  }
+
+  return source;
+};
+
+const NEUTRAL_EFFECTS: Partial<SpriteData> = {
+  brightness: 100, contrast: 100, saturation: 100, hue: 0, opacity: 100,
+  opacityMode: 'absolute' as const,
+  grayscale: 0, sepia: 0, invert: 0, blur: 0, exposure: 100, highlights: 100,
+  pixelation: 1, posterize: undefined, tintOpacity: 0,
+  greenHueShift: 0, greenSaturation: 100, greenOpacity: 100,
+  blackHueShift: 0, blackSaturation: 100, blackOpacity: 100,
+  whiteHueShift: 0, whiteSaturation: 100, whiteOpacity: 100,
+  handDrawn: 0,
+  pencilDrawn: 0,
+  outlineWidth: 0, outlineStyle: 'smooth' as const, glowIntensity: 0, shadowBlur: 0, shadowX: 0, shadowY: 0,
+};
+
+const getNeutralSprite = (sprite: SpriteData): SpriteData => ({
+  ...sprite,
+  ...NEUTRAL_EFFECTS,
+  scale: 1,
+});
+
+/** Contorno pixel-art: dilata la silueta en la grilla actual (Chebyshev) y pinta debajo del sprite. */
+const applyPixelOutlineToCanvas = (
+  source: HTMLCanvasElement,
+  color: string,
+  radiusPx: number
+): HTMLCanvasElement => {
+  const r = Math.max(1, Math.round(radiusPx));
+  const w = source.width;
+  const h = source.height;
+
+  const silhouette = document.createElement('canvas');
+  silhouette.width = w;
+  silhouette.height = h;
+  const sctx = silhouette.getContext('2d')!;
+  sctx.drawImage(source, 0, 0);
+  sctx.globalCompositeOperation = 'source-in';
+  sctx.fillStyle = color;
+  sctx.fillRect(0, 0, w, h);
+
+  const out = document.createElement('canvas');
+  out.width = w;
+  out.height = h;
+  const octx = out.getContext('2d')!;
+  octx.imageSmoothingEnabled = false;
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      if (dx === 0 && dy === 0) continue;
+      if (Math.max(Math.abs(dx), Math.abs(dy)) > r) continue;
+      octx.drawImage(silhouette, dx, dy);
+    }
+  }
+  octx.drawImage(source, 0, 0);
+  return out;
+};
+
+const drawSpriteImageLayer = (
+  ctx: CanvasRenderingContext2D,
+  sprite: SpriteData,
+  variant: 'neutral' | 'full',
+  isExport: boolean
+) => {
+  const effective = variant === 'neutral' ? getNeutralSprite(sprite) : sprite;
+  const imgSource = variant === 'neutral' ? sprite.img : getSpriteImageSource(sprite);
+  const scale = effective.scale || 1;
+  const stretchX = effective.stretchX || 1;
+  const stretchY = effective.stretchY || 1;
+  const sw = sprite.img.width * scale * stretchX;
+  const sh = sprite.img.height * scale * stretchY;
+
+  const usePixelOutline =
+    variant === 'full' &&
+    effective.outlineStyle === 'pixel' &&
+    !!effective.outlineWidth &&
+    effective.outlineWidth > 0 &&
+    !!effective.outlineColor;
+
+  ctx.filter = getSpriteFilter(effective, isExport);
+
+  const paintLayer = (layer: HTMLCanvasElement) => {
+    ctx.drawImage(layer, -sw / 2, -sh / 2, sw, sh);
+  };
+
+  if (effective.pixelation && effective.pixelation > 1) {
+    const p = effective.pixelation;
+    const tw = Math.max(1, Math.floor(sw / p));
+    const th = Math.max(1, Math.floor(sh / p));
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = tw;
+    tempCanvas.height = th;
+    const tctx = tempCanvas.getContext('2d')!;
+    tctx.imageSmoothingEnabled = false;
+    // Filtros de color se aplican al upscale; acá solo rasterizamos la fuente.
+    // Para contorno pixelado: primero dibujamos con filtro a un buffer a tamaño final,
+    // pero el contorno se calcula en la grilla de pixelación.
+    tctx.filter = 'none';
+    tctx.drawImage(imgSource, 0, 0, tw, th);
+
+    if (usePixelOutline) {
+      // Grosor en "bloques" de pixelación (misma unidad visual que el sprite pixelado)
+      const outlined = applyPixelOutlineToCanvas(
+        tempCanvas,
+        effective.outlineColor!,
+        effective.outlineWidth!
+      );
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(outlined, 0, 0, tw, th, -sw / 2, -sh / 2, sw, sh);
+    } else {
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(tempCanvas, 0, 0, tw, th, -sw / 2, -sh / 2, sw, sh);
+    }
+  } else if (usePixelOutline) {
+    const layer = document.createElement('canvas');
+    layer.width = Math.max(1, Math.ceil(sw));
+    layer.height = Math.max(1, Math.ceil(sh));
+    const lctx = layer.getContext('2d')!;
+    lctx.imageSmoothingEnabled = false;
+    lctx.filter = getSpriteFilter(effective, isExport);
+    lctx.drawImage(imgSource, 0, 0, layer.width, layer.height);
+    lctx.filter = 'none';
+    const outlined = applyPixelOutlineToCanvas(
+      layer,
+      effective.outlineColor!,
+      effective.outlineWidth!
+    );
+    ctx.filter = 'none';
+    paintLayer(outlined);
+  } else {
+    ctx.drawImage(imgSource, -sw / 2, -sh / 2, sw, sh);
+  }
+  ctx.filter = 'none';
+
+  if (variant === 'full' && effective.tintOpacity && effective.tintOpacity > 0) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'source-atop';
+    ctx.fillStyle = effective.tintColor || '#000000';
+    ctx.globalAlpha = effective.tintOpacity / 100;
+    ctx.fillRect(-sw / 2, -sh / 2, sw, sh);
+    ctx.restore();
+  }
+};
+
+const getEffectMasks = (sprite: SpriteData): Region[] =>
+  (sprite.effectMasks || []).filter(m => m.w > 0 && m.h > 0);
+
+const brushMaskCache = new Map<string, HTMLCanvasElement>();
+
+const getBrushMaskCanvas = (sprite: SpriteData): HTMLCanvasElement | null => {
+  if (!sprite.effectMaskBrush) return null;
+  const key = sprite.effectMaskBrush;
+  if (brushMaskCache.has(key)) return brushMaskCache.get(key)!;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = sprite.img.width;
+  canvas.height = sprite.img.height;
+  const ctx = canvas.getContext('2d')!;
+  const img = new Image();
+  img.onload = () => {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0);
+    brushMaskCache.set(key, canvas);
+    window.dispatchEvent(new CustomEvent('brushmask-loaded'));
+  };
+  img.src = key;
+  if (img.complete && img.naturalWidth > 0) {
+    ctx.drawImage(img, 0, 0);
+    brushMaskCache.set(key, canvas);
+    return canvas;
+  }
+  return brushMaskCache.get(key) ?? null;
+};
+
+const hasActiveEffectMask = (sprite: SpriteData): boolean => {
+  if (sprite.effectMaskMode === 'brush') return !!sprite.effectMaskBrush;
+  return getEffectMasks(sprite).length > 0;
+};
+
+const isPointInEffectMasks = (x: number, y: number, masks: Region[]) =>
+  masks.some(m => x >= m.x && x < m.x + m.w && y >= m.y && y < m.y + m.h);
+
+const isPointInBrushMask = (sprite: SpriteData, x: number, y: number): boolean => {
+  const canvas = getBrushMaskCanvas(sprite);
+  if (!canvas) return false;
+  const ix = Math.floor(x);
+  const iy = Math.floor(y);
+  if (ix < 0 || iy < 0 || ix >= canvas.width || iy >= canvas.height) return false;
+  const alpha = canvas.getContext('2d')!.getImageData(ix, iy, 1, 1).data[3];
+  return alpha > 0;
+};
+
+const isPointInEffectMask = (sprite: SpriteData, x: number, y: number): boolean => {
+  if (!hasActiveEffectMask(sprite)) return true;
+  if (sprite.effectMaskMode === 'brush') return isPointInBrushMask(sprite, x, y);
+  return isPointInEffectMasks(x, y, getEffectMasks(sprite));
+};
+
+/** Máscara = área seleccionada ∩ píxeles opacos del PNG original */
+const buildEffectCoverageMask = (sprite: SpriteData): HTMLCanvasElement | null => {
+  const w = sprite.img.width;
+  const h = sprite.img.height;
+  const coverage = document.createElement('canvas');
+  coverage.width = w;
+  coverage.height = h;
+  const cctx = coverage.getContext('2d')!;
+
+  if (sprite.effectMaskMode === 'brush' && sprite.effectMaskBrush) {
+    const brush = getBrushMaskCanvas(sprite);
+    if (!brush) return null;
+    cctx.drawImage(brush, 0, 0);
+  } else {
+    const masks = getEffectMasks(sprite);
+    if (masks.length === 0) return null;
+    cctx.fillStyle = '#ffffff';
+    for (const mask of masks) {
+      cctx.fillRect(mask.x, mask.y, mask.w, mask.h);
+    }
+  }
+
+  // Solo donde el PNG tiene dibujo
+  cctx.globalCompositeOperation = 'destination-in';
+  cctx.drawImage(sprite.img, 0, 0);
+  cctx.globalCompositeOperation = 'source-over';
+  return coverage;
+};
+
+/** Opacidad radial: mayor en el centro de la imagen, menor hacia los bordes */
+const applyRadialOpacityToLayer = (
+  layerCtx: CanvasRenderingContext2D,
+  layerW: number,
+  layerH: number,
+  opacityPercent: number
+) => {
+  const mask = document.createElement('canvas');
+  mask.width = layerW;
+  mask.height = layerH;
+  const mctx = mask.getContext('2d')!;
+  const cx = layerW / 2;
+  const cy = layerH / 2;
+  const maxR = Math.hypot(cx, cy) || 1;
+  const a = Math.max(0, Math.min(1, (opacityPercent ?? 100) / 100));
+  const grad = mctx.createRadialGradient(cx, cy, 0, cx, cy, maxR);
+  grad.addColorStop(0, `rgba(255,255,255,${a})`);
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  mctx.fillStyle = grad;
+  mctx.fillRect(0, 0, layerW, layerH);
+
+  layerCtx.save();
+  layerCtx.globalCompositeOperation = 'destination-in';
+  layerCtx.drawImage(mask, 0, 0);
+  layerCtx.restore();
+};
+
+/** Reemplaza (no mezcla) la zona afectada: opacidad/filtros aplican al sprite, no a la capa encima del original */
+const drawMaskedEffectsReplacing = (
+  ctx: CanvasRenderingContext2D,
+  sprite: SpriteData,
+  sw: number,
+  sh: number,
+  isExport: boolean
+) => {
+  const coverage = buildEffectCoverageMask(sprite);
+  if (!coverage) return;
+
+  const layerW = Math.max(1, Math.ceil(sw));
+  const layerH = Math.max(1, Math.ceil(sh));
+
+  const effectsLayer = document.createElement('canvas');
+  effectsLayer.width = layerW;
+  effectsLayer.height = layerH;
+  const lctx = effectsLayer.getContext('2d')!;
+  lctx.imageSmoothingEnabled = false;
+  lctx.save();
+  lctx.translate(layerW / 2, layerH / 2);
+  drawSpriteImageLayer(lctx, sprite, 'full', isExport);
+  lctx.restore();
+
+  lctx.globalCompositeOperation = 'destination-in';
+  lctx.drawImage(coverage, 0, 0, sprite.img.width, sprite.img.height, 0, 0, layerW, layerH);
+  lctx.globalCompositeOperation = 'source-over';
+
+  if (sprite.opacityMode === 'radial') {
+    applyRadialOpacityToLayer(lctx, layerW, layerH, sprite.opacity ?? 100);
+  }
+
+  // Quitar el sprite neutro solo en la zona afectada, para que la opacidad se vea contra el fondo
+  ctx.save();
+  ctx.globalCompositeOperation = 'destination-out';
+  ctx.drawImage(coverage, 0, 0, sprite.img.width, sprite.img.height, -sw / 2, -sh / 2, sw, sh);
+  ctx.restore();
+
+  ctx.drawImage(effectsLayer, -sw / 2, -sh / 2, sw, sh);
+};
+
+const renderSpriteToContext = (ctx: CanvasRenderingContext2D, sprite: SpriteData, isExport = false) => {
+  const { padding } = sprite;
+  const scale = sprite.scale || 1;
+  const stretchX = sprite.stretchX || 1;
+  const stretchY = sprite.stretchY || 1;
+  const sw = sprite.img.width * scale * stretchX;
+  const sh = sprite.img.height * scale * stretchY;
+  const ox = sprite.offsetX || 0;
+  const oy = sprite.offsetY || 0;
+  const rot = (sprite.rotation || 0) * Math.PI / 180;
+  const hSign = sprite.flipH ? -1 : 1;
+  const vSign = sprite.flipV ? -1 : 1;
+
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, Math.max(1, sw + padding.left + padding.right), Math.max(1, sh + padding.top + padding.bottom));
+
+  ctx.save();
+  ctx.translate(padding.left + sw / 2 + ox, padding.top + sh / 2 + oy);
+  ctx.rotate(rot);
+  ctx.scale(hSign, vSign);
+
+  if (!hasActiveEffectMask(sprite)) {
+    drawSpriteImageLayer(ctx, sprite, 'full', isExport);
+  } else {
+    drawSpriteImageLayer(ctx, sprite, 'neutral', isExport);
+    drawMaskedEffectsReplacing(ctx, sprite, sw, sh, isExport);
+  }
+
+  ctx.restore();
+};
+
+const applyPosterizeToCanvas = (canvas: HTMLCanvasElement, sprite: SpriteData) => {
+  if (!sprite.posterize || sprite.posterize < 2) return;
+  const ctx = canvas.getContext('2d')!;
+  const idata = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const d = idata.data;
+  const steps = sprite.posterize;
+  const factor = 255 / (steps - 1);
+
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i + 3] === 0) continue;
+    if (hasActiveEffectMask(sprite)) {
+      const px = (i / 4) % canvas.width;
+      const py = Math.floor(i / 4 / canvas.width);
+      const scX = (sprite.scale || 1) * (sprite.stretchX || 1);
+      const scY = (sprite.scale || 1) * (sprite.stretchY || 1);
+      const imgX = (px - sprite.padding.left) / scX;
+      const imgY = (py - sprite.padding.top) / scY;
+      if (!isPointInEffectMask(sprite, imgX, imgY)) continue;
+    }
+    d[i] = Math.round((d[i] / 255) * (steps - 1)) * factor;
+    d[i + 1] = Math.round((d[i + 1] / 255) * (steps - 1)) * factor;
+    d[i + 2] = Math.round((d[i + 2] / 255) * (steps - 1)) * factor;
+  }
+  ctx.putImageData(idata, 0, 0);
+};
+
+const renderSpriteToCanvas = (sprite: SpriteData, isExport = true): HTMLCanvasElement => {
+  const scX = (sprite.scale || 1) * (sprite.stretchX || 1);
+  const scY = (sprite.scale || 1) * (sprite.stretchY || 1);
+  const sw = sprite.img.width * scX;
+  const sh = sprite.img.height * scY;
+  const totalW = Math.max(1, sw + sprite.padding.left + sprite.padding.right);
+  const totalH = Math.max(1, sh + sprite.padding.top + sprite.padding.bottom);
+  const canvas = document.createElement('canvas');
+  canvas.width = totalW;
+  canvas.height = totalH;
+  const ctx = canvas.getContext('2d')!;
+  renderSpriteToContext(ctx, sprite, isExport);
+  applyPosterizeToCanvas(canvas, sprite);
+  return canvas;
+};
+
+
+const getEffectMaskOverlayPercents = (sprite: SpriteData, mask: Region) => {
+  const scX = (sprite.scale || 1) * (sprite.stretchX || 1);
+  const scY = (sprite.scale || 1) * (sprite.stretchY || 1);
+  const totalW = sprite.img.width * scX + sprite.padding.left + sprite.padding.right;
+  const totalH = sprite.img.height * scY + sprite.padding.top + sprite.padding.bottom;
+  return {
+    left: ((sprite.padding.left + mask.x * (sprite.stretchX || 1) * (sprite.scale || 1)) / totalW) * 100,
+    top: ((sprite.padding.top + mask.y * (sprite.stretchY || 1) * (sprite.scale || 1)) / totalH) * 100,
+    width: (mask.w * (sprite.stretchX || 1) * (sprite.scale || 1) / totalW) * 100,
+    height: (mask.h * (sprite.stretchY || 1) * (sprite.scale || 1) / totalH) * 100,
+  };
 };
 
 const generateId = () => {
@@ -122,17 +1399,22 @@ interface SpriteModuleProps {
   onSetAnchor: (id: string, x: number, y: number) => void;
   onSetReference: (id: string) => void;
   onOpenEraser: (id: string) => void;
+  onOpenReplace: (id: string) => void;
+  onOpenCopyRect: (id: string) => void;
+  onOpenPixelEditor: (id: string) => void;
   onOpenTransform: (id: string) => void;
   onOpenTagging: (id: string) => void;
   onOpenPaint: (id: string) => void;
+  onOpenBucket: (id: string) => void;
   onOpenStretch: (id: string) => void;
   onOpenComposite: (id: string, size?: number) => void;
+  onExport: (id: string, format?: 'png' | 'ico' | 'dds') => void;
   onUpdateSprite: (id: string, updates: Partial<SpriteData>) => void;
   isReference?: boolean;
   isWhiteBg?: boolean;
 }
 
-const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggleSelect, onRemove, onSetAnchor, onSetReference, onOpenEraser, onOpenTransform, onOpenTagging, onOpenPaint, onOpenStretch, onOpenComposite, onUpdateSprite, isReference, isWhiteBg }) => {
+const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggleSelect, onRemove, onSetAnchor, onSetReference, onOpenEraser, onOpenReplace, onOpenCopyRect, onOpenPixelEditor, onOpenTransform, onOpenTagging, onOpenPaint, onOpenBucket, onOpenStretch, onOpenComposite, onExport, onUpdateSprite, isReference, isWhiteBg }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
@@ -140,16 +1422,13 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d')!;
-    const { img, padding } = sprite;
-    ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
-    ctx.imageSmoothingEnabled = false;
-    
+    const { padding } = sprite;
     const scX = (sprite.scale || 1) * (sprite.stretchX || 1);
     const scY = (sprite.scale || 1) * (sprite.stretchY || 1);
-    const sw = img.width * scX;
-    const sh = img.height * scY;
-    const w = sw + padding.left + padding.right;
-    const h = sh + padding.top + padding.bottom;
+    const sw = sprite.img.width * scX;
+    const sh = sprite.img.height * scY;
+    const w = Math.max(1, sw + padding.left + padding.right);
+    const h = Math.max(1, sh + padding.top + padding.bottom);
 
     canvas.width = w * window.devicePixelRatio;
     canvas.height = h * window.devicePixelRatio;
@@ -158,48 +1437,22 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
     canvas.style.objectFit = 'contain';
     canvas.style.imageRendering = 'pixelated';
 
-    ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+    ctx.setTransform(window.devicePixelRatio, 0, 0, window.devicePixelRatio, 0, 0);
     ctx.imageSmoothingEnabled = false;
-    ctx.clearRect(0, 0, w, h);
-    
-    ctx.filter = getSpriteFilter(sprite);
+    renderSpriteToContext(ctx, sprite, false);
+  }, [sprite]);
 
-    if (sprite.pixelation && sprite.pixelation > 1) {
-      const p = sprite.pixelation;
-      const tw = Math.max(1, Math.floor(sw / p));
-      const th = Math.max(1, Math.floor(sh / p));
-      const tempCanvas = document.createElement('canvas');
-      tempCanvas.width = tw;
-      tempCanvas.height = th;
-      const tctx = tempCanvas.getContext('2d')!;
-      tctx.imageSmoothingEnabled = false;
-      tctx.drawImage(img, 0, 0, tw, th);
-      ctx.drawImage(tempCanvas, 0, 0, tw, th, padding.left, padding.top, sw, sh);
-    } else {
-      ctx.save();
-      const ox = sprite.offsetX || 0;
-      const oy = sprite.offsetY || 0;
-      const rot = (sprite.rotation || 0) * Math.PI / 180;
-      
-      const hSign = sprite.flipH ? -1 : 1;
-      const vSign = sprite.flipV ? -1 : 1;
-      
-      ctx.translate(padding.left + sw/2 + ox, padding.top + sh/2 + oy);
-      ctx.rotate(rot);
-      ctx.scale(hSign, vSign);
-      ctx.drawImage(img, -sw/2, -sh/2, sw, sh);
-      ctx.restore();
-    }
-    ctx.filter = 'none';
-
-    if (sprite.tintOpacity && sprite.tintOpacity > 0) {
-      ctx.save();
-      ctx.globalCompositeOperation = 'source-atop';
-      ctx.fillStyle = sprite.tintColor || '#000000';
-      ctx.globalAlpha = sprite.tintOpacity / 100;
-      ctx.fillRect(0, 0, w, h);
-      ctx.restore();
-    }
+  useEffect(() => {
+    const redraw = () => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d')!;
+      ctx.setTransform(window.devicePixelRatio, 0, 0, window.devicePixelRatio, 0, 0);
+      ctx.imageSmoothingEnabled = false;
+      renderSpriteToContext(ctx, sprite, false);
+    };
+    window.addEventListener('brushmask-loaded', redraw);
+    return () => window.removeEventListener('brushmask-loaded', redraw);
   }, [sprite]);
 
 
@@ -245,9 +1498,44 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
       window.removeEventListener('mouseup', handleMouseUp);
     };
   }, [isDragging, sprite.id, sprite.padding, onSetAnchor]);
+  const handleAddText = async () => {
+    const text = prompt('Escribe el texto a añadir a la imagen:');
+    if (!text) return;
+    const sizeStr = prompt('Elige el tamaño del texto (en píxeles):', '16');
+    if (!sizeStr) return;
+    const size = parseInt(sizeStr, 10);
+    if (isNaN(size) || size <= 0) return;
+
+    const tmpCanvas = document.createElement('canvas');
+    tmpCanvas.width = sprite.img.width;
+    tmpCanvas.height = sprite.img.height;
+    const ctx = tmpCanvas.getContext('2d')!;
+    
+    ctx.drawImage(sprite.img, 0, 0);
+
+    ctx.font = `${size}px sans-serif`;
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'top';
+    
+    ctx.lineWidth = Math.max(1, Math.floor(size / 8));
+    ctx.strokeStyle = 'black';
+    ctx.strokeText(text, tmpCanvas.width - 2, 2);
+    
+    ctx.fillStyle = 'white';
+    ctx.fillText(text, tmpCanvas.width - 2, 2);
+
+    const newImg = await new Promise<HTMLImageElement>((res, rej) => {
+      const image = new Image();
+      image.onload = () => res(image);
+      image.onerror = rej;
+      image.src = tmpCanvas.toDataURL('image/png');
+    });
+
+    onUpdateSprite(sprite.id, { img: newImg, originalImg: newImg });
+  };
 
   return (
-    <div className={`sprite-module ${isSelected ? 'selected' : ''} ${isReference ? 'reference' : ''}`} 
+    <div className={`sprite-module ${isSelected ? 'selected' : ''} ${isReference ? 'reference' : ''} ${showTools ? 'tools-open' : ''}`} 
          onClick={(e) => {
            if (e.shiftKey || e.ctrlKey || e.metaKey) {
              onToggleSelect(sprite.id, true);
@@ -269,7 +1557,20 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
           </button>
           
           {showTools && (
-            <div className="tools-dropdown" ref={dropdownRef} onClick={e => e.stopPropagation()}>
+            <div
+              className="tools-dropdown"
+              ref={dropdownRef}
+              onClick={e => e.stopPropagation()}
+              onWheel={e => e.stopPropagation()}
+            >
+              <button type="button" className="dropdown-item" onClick={(e) => { 
+                e.preventDefault();
+                e.stopPropagation(); 
+                onExport(sprite.id, 'png');
+                setShowTools(false);
+              }}>
+                <Save size={12} /> Exportar Sprite
+              </button>
               <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenPaint(sprite.id); setShowTools(false); }}>
                 <Pencil size={12} /> Pintar
               </button>
@@ -281,6 +1582,21 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
               </button>
               <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenEraser(sprite.id); setShowTools(false); }}>
                 <Eraser size={12} /> Goma (Borrador)
+              </button>
+              <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenReplace(sprite.id); setShowTools(false); }}>
+                <Stamp size={12} /> Reemplazar de...
+              </button>
+              <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenCopyRect(sprite.id); setShowTools(false); }}>
+                <Crop size={12} /> Copiar recorte
+              </button>
+              <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenPixelEditor(sprite.id); setShowTools(false); }}>
+                <Grid size={12} /> Editor Pixel Art
+              </button>
+              <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); handleAddText(); setShowTools(false); }}>
+                <Type size={12} /> Añadir Texto
+              </button>
+              <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenBucket(sprite.id); setShowTools(false); }}>
+                <PaintBucket size={12} /> Color Swap (Balde)
               </button>
               <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenStretch(sprite.id); setShowTools(false); }}>
                 <Maximize size={12} /> Estirar (Resize)
@@ -294,6 +1610,22 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
                 setShowTools(false);
               }}>
                 <Layers size={12} /> Componer (Collage)
+              </button>
+              <button type="button" className="dropdown-item" onClick={(e) => { 
+                e.preventDefault();
+                e.stopPropagation(); 
+                onExport(sprite.id, 'ico');
+                setShowTools(false);
+              }}>
+                <Save size={12} /> Exportar como .ICO
+              </button>
+              <button type="button" className="dropdown-item" onClick={(e) => { 
+                e.preventDefault();
+                e.stopPropagation(); 
+                onExport(sprite.id, 'dds');
+                setShowTools(false);
+              }}>
+                <Layers size={12} /> Exportar como .DDS
               </button>
               <div style={{ height: '1px', background: 'var(--border)', margin: '4px 0' }} />
               <button className="dropdown-item" onClick={(e) => { 
@@ -324,8 +1656,27 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
         </div>
       </div>
       
-      <div className={`module-canvas-area checker-mini ${isWhiteBg ? 'white-bg' : ''}`}>
+      <div className={`module-canvas-area checker-mini ${isWhiteBg ? 'white-bg' : ''}`} style={{ position: 'relative' }}>
         <canvas ref={canvasRef} />
+        {sprite.effectMaskMode !== 'brush' && getEffectMasks(sprite).map((mask) => {
+          const overlay = getEffectMaskOverlayPercents(sprite, mask);
+          return (
+            <div
+              key={mask.id}
+              style={{
+                position: 'absolute',
+                left: `${overlay.left}%`,
+                top: `${overlay.top}%`,
+                width: `${overlay.width}%`,
+                height: `${overlay.height}%`,
+                border: '2px solid #6b66ff',
+                background: 'rgba(107, 102, 255, 0.15)',
+                pointerEvents: 'none',
+                boxSizing: 'border-box',
+              }}
+            />
+          );
+        })}
         {sprite.anchor && (
           <div className="anchor-crosshair" 
             style={{ 
@@ -338,6 +1689,16 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
           />
         )}
         {isReference && <div className="reference-badge">REF</div>}
+        {(() => {
+          if (!hasActiveEffectMask(sprite)) return null;
+          const isBrush = sprite.effectMaskMode === 'brush';
+          const count = isBrush ? 1 : getEffectMasks(sprite).length;
+          return (
+            <div className="reference-badge" style={{ background: '#6b66ff', right: 'auto', left: '8px' }}>
+              {isBrush ? 'PINCEL' : `ÁREA${count > 1 ? ` ×${count}` : ''}`}
+            </div>
+          );
+        })()}
       </div>
 
       <div className="module-footer">
@@ -345,6 +1706,418 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
         <span className="badge badge-accent">
           Full: {(sprite.img.width * (sprite.scale || 1) * (sprite.stretchX || 1) + sprite.padding.left + sprite.padding.right).toFixed(0)}×{(sprite.img.height * (sprite.scale || 1) * (sprite.stretchY || 1) + sprite.padding.top + sprite.padding.bottom).toFixed(0)}
         </span>
+      </div>
+    </div>
+  );
+};
+
+// --- Pixel Art Editor Modal ---
+interface PixelEditorModalProps {
+  sprite: SpriteData;
+  onSave: (id: string, newImg: HTMLImageElement) => void;
+  onClose: () => void;
+  isWhiteBg?: boolean;
+}
+
+type PEdTool = 'select' | 'pencil' | 'eraser' | 'fill' | 'eyedropper' | 'move';
+
+const PixelEditorModal: React.FC<PixelEditorModalProps> = ({ sprite, onSave, onClose, isWhiteBg }) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const overlayRef = useRef<HTMLCanvasElement>(null);
+
+  const [zoom, setZoom] = useState(() => {
+    const savedZoom = loadPref<number>('joa-pixel-editor-zoom', 0);
+    if (savedZoom >= 1 && savedZoom <= 32) return savedZoom;
+    const fit = Math.min(Math.floor(700 / sprite.img.width), Math.floor(600 / sprite.img.height));
+    return Math.max(1, Math.min(fit, 16));
+  });
+  const [tool, setTool] = useState<PEdTool>(() => {
+    const saved = loadPref<PEdTool>('joa-pixel-editor-tool', 'pencil');
+    return (['select', 'pencil', 'eraser', 'fill', 'eyedropper', 'move'] as PEdTool[]).includes(saved) ? saved : 'pencil';
+  });
+  const [color, setColor] = useState(() => {
+    const saved = loadPref<string>('joa-pixel-editor-color', '');
+    return normalizeHexColor(saved, loadLastColor('#ffffff')) || '#ffffff';
+  });
+  const [brushSize, setBrushSize] = useState(() => Math.round(clampNum(loadPref('joa-pixel-editor-brush', 1), 1, 32, 1)));
+  const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-pixel-editor-scroll', sprite.name, [zoom]);
+  useModalWheelControls({
+    zoom, setZoom, zoomMin: 0.1, zoomMax: 32, zoomStep: 0.1,
+    brushSize, setBrushSize, brushMin: 1, brushMax: 32,
+    workspaceRef,
+  });
+  const [history, setHistory] = useState<ImageData[]>([]);
+  const [clipboard, setClipboard] = useState<ImageData | null>(null);
+  const [sel, setSel] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+  const selRef = useRef<typeof sel>(null);
+  const [selDrag, setSelDrag] = useState<{ startX: number; startY: number } | null>(null);
+  const [moveOffset, setMoveOffset] = useState<{ dx: number; dy: number } | null>(null);
+  const isDrawing = useRef(false);
+  const lastPx = useRef<{ x: number; y: number } | null>(null);
+
+  // Init canvas with sprite image
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.width = sprite.img.width;
+    canvas.height = sprite.img.height;
+    const ctx = canvas.getContext('2d')!;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(sprite.img, 0, 0);
+  }, [sprite.img]);
+
+  useEffect(() => {
+    savePref('joa-pixel-editor-zoom', zoom);
+    savePref('joa-pixel-editor-tool', tool);
+    savePref('joa-pixel-editor-color', color);
+    savePref('joa-pixel-editor-brush', brushSize);
+    rememberLastColor(color);
+  }, [zoom, tool, color, brushSize]);
+
+  const saveHistory = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d')!;
+    const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    setHistory(h => [...h.slice(-30), data]);
+  };
+
+  const undo = () => {
+    if (history.length === 0) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d')!;
+    const prev = history[history.length - 1];
+    ctx.putImageData(prev, 0, 0);
+    setHistory(h => h.slice(0, -1));
+  };
+
+  const hexToRgba = (hex: string): [number, number, number, number] => {
+    const r = parseInt(hex.slice(1, 3), 16);
+    const g = parseInt(hex.slice(3, 5), 16);
+    const b = parseInt(hex.slice(5, 7), 16);
+    return [r, g, b, 255];
+  };
+
+  const rgbaToHex = (r: number, g: number, b: number) =>
+    '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
+
+  const getPixelCoords = (e: React.MouseEvent): { x: number; y: number } => {
+    const canvas = canvasRef.current!;
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: Math.floor((e.clientX - rect.left) / zoom),
+      y: Math.floor((e.clientY - rect.top) / zoom),
+    };
+  };
+
+  const drawPixelBlock = (ctx: CanvasRenderingContext2D, px: number, py: number) => {
+    const half = Math.floor(brushSize / 2);
+    ctx.fillStyle = tool === 'eraser' ? 'rgba(0,0,0,0)' : color;
+    if (tool === 'eraser') {
+      ctx.clearRect(px - half, py - half, brushSize, brushSize);
+    } else {
+      ctx.fillRect(px - half, py - half, brushSize, brushSize);
+    }
+  };
+
+  const floodFill = (startX: number, startY: number) => {
+    const canvas = canvasRef.current!;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const d = imgData.data;
+    const w = canvas.width;
+    const h = canvas.height;
+    const idx = (startY * w + startX) * 4;
+    const tr = d[idx]; const tg = d[idx + 1]; const tb = d[idx + 2]; const ta = d[idx + 3];
+    const [fr, fg, fb, fa] = hexToRgba(color);
+    if (tr === fr && tg === fg && tb === fb && ta === fa) return;
+    const stack = [startX + startY * w];
+    while (stack.length) {
+      const pos = stack.pop()!;
+      const x = pos % w;
+      const y = Math.floor(pos / w);
+      const i = pos * 4;
+      if (x < 0 || x >= w || y < 0 || y >= h) continue;
+      if (d[i] !== tr || d[i+1] !== tg || d[i+2] !== tb || d[i+3] !== ta) continue;
+      d[i] = fr; d[i+1] = fg; d[i+2] = fb; d[i+3] = fa;
+      stack.push(pos - 1, pos + 1, pos - w, pos + w);
+    }
+    ctx.putImageData(imgData, 0, 0);
+  };
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    const { x, y } = getPixelCoords(e);
+    const canvas = canvasRef.current!;
+    if (x < 0 || x >= canvas.width || y < 0 || y >= canvas.height) return;
+
+    if (tool === 'eyedropper') {
+      const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+      const px = ctx.getImageData(x, y, 1, 1).data;
+      const hex = rememberLastColor(rgbaToHex(px[0], px[1], px[2]));
+      if (hex) setColor(hex);
+      setTool('pencil');
+      return;
+    }
+    if (tool === 'fill') {
+      saveHistory();
+      floodFill(x, y);
+      return;
+    }
+    if (tool === 'select') {
+      setSelDrag({ startX: x, startY: y });
+      setSel(null);
+      selRef.current = null;
+      return;
+    }
+    if (tool === 'move') {
+      if (!sel) return;
+      setMoveOffset({ dx: x - sel.x, dy: y - sel.y });
+      isDrawing.current = true;
+      return;
+    }
+    saveHistory();
+    isDrawing.current = true;
+    lastPx.current = { x, y };
+    const ctx = canvas.getContext('2d')!;
+    drawPixelBlock(ctx, x, y);
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    const { x, y } = getPixelCoords(e);
+    const canvas = canvasRef.current!;
+    const ov = overlayRef.current!;
+    const ovCtx = ov.getContext('2d')!;
+    ovCtx.clearRect(0, 0, ov.width, ov.height);
+
+    if (selDrag) {
+      const sx = Math.min(selDrag.startX, x);
+      const sy = Math.min(selDrag.startY, y);
+      const sw = Math.abs(x - selDrag.startX) + 1;
+      const sh = Math.abs(y - selDrag.startY) + 1;
+      ovCtx.strokeStyle = '#00d4ff';
+      ovCtx.lineWidth = 1 / zoom;
+      ovCtx.setLineDash([3 / zoom, 3 / zoom]);
+      ovCtx.strokeRect(sx, sy, sw, sh);
+      return;
+    }
+
+    if (sel) {
+      ovCtx.strokeStyle = '#00d4ff';
+      ovCtx.lineWidth = 1 / zoom;
+      ovCtx.setLineDash([3 / zoom, 3 / zoom]);
+      ovCtx.strokeRect(sel.x, sel.y, sel.w, sel.h);
+    }
+
+    if (tool === 'move' && isDrawing.current && sel && moveOffset) {
+      const nx = x - moveOffset.dx;
+      const ny = y - moveOffset.dy;
+      setSel(prev => prev ? { ...prev, x: nx, y: ny } : prev);
+      return;
+    }
+
+    if (!isDrawing.current) return;
+    const ctx = canvas.getContext('2d')!;
+    // Bresenham line from lastPx to current
+    const lp = lastPx.current || { x, y };
+    let { x: x0, y: y0 } = lp;
+    let { x: x1, y: y1 } = { x, y };
+    const dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0);
+    const sx2 = x0 < x1 ? 1 : -1, sy2 = y0 < y1 ? 1 : -1;
+    let err = dx - dy;
+    while (true) {
+      drawPixelBlock(ctx, x0, y0);
+      if (x0 === x1 && y0 === y1) break;
+      const e2 = 2 * err;
+      if (e2 > -dy) { err -= dy; x0 += sx2; }
+      if (e2 < dx) { err += dx; y0 += sy2; }
+    }
+    lastPx.current = { x, y };
+  };
+
+  const handleMouseUp = (e: React.MouseEvent) => {
+    isDrawing.current = false;
+    setMoveOffset(null);
+    if (selDrag) {
+      const { x, y } = getPixelCoords(e);
+      const sx = Math.min(selDrag.startX, x);
+      const sy = Math.min(selDrag.startY, y);
+      const sw = Math.abs(x - selDrag.startX) + 1;
+      const sh = Math.abs(y - selDrag.startY) + 1;
+      const newSel = { x: sx, y: sy, w: sw, h: sh };
+      setSel(newSel);
+      selRef.current = newSel;
+      setSelDrag(null);
+    }
+  };
+
+  const copySelection = () => {
+    if (!sel) return;
+    const ctx = canvasRef.current!.getContext('2d', { willReadFrequently: true })!;
+    const data = ctx.getImageData(sel.x, sel.y, sel.w, sel.h);
+    setClipboard(data);
+  };
+
+  const cutSelection = () => {
+    if (!sel) return;
+    saveHistory();
+    copySelection();
+    const ctx = canvasRef.current!.getContext('2d')!;
+    ctx.clearRect(sel.x, sel.y, sel.w, sel.h);
+  };
+
+  const pasteClipboard = () => {
+    if (!clipboard) return;
+    saveHistory();
+    const ctx = canvasRef.current!.getContext('2d')!;
+    const tmp = document.createElement('canvas');
+    tmp.width = clipboard.width; tmp.height = clipboard.height;
+    tmp.getContext('2d')!.putImageData(clipboard, 0, 0);
+    const px = sel ? sel.x : 0;
+    const py = sel ? sel.y : 0;
+    ctx.drawImage(tmp, px, py);
+  };
+
+  const deleteSelection = () => {
+    if (!sel) return;
+    saveHistory();
+    canvasRef.current!.getContext('2d')!.clearRect(sel.x, sel.y, sel.w, sel.h);
+  };
+
+  const selectAll = () => {
+    const c = canvasRef.current!;
+    const all = { x: 0, y: 0, w: c.width, h: c.height };
+    setSel(all);
+    selRef.current = all;
+  };
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const ctrl = e.ctrlKey || e.metaKey;
+      if (ctrl && e.key === 'z') { e.preventDefault(); undo(); }
+      if (ctrl && e.key === 'c') { e.preventDefault(); copySelection(); }
+      if (ctrl && e.key === 'x') { e.preventDefault(); cutSelection(); }
+      if (ctrl && e.key === 'v') { e.preventDefault(); pasteClipboard(); }
+      if (ctrl && e.key === 'a') { e.preventDefault(); selectAll(); }
+      if (e.key === 'Delete' || e.key === 'Backspace') deleteSelection();
+      if (e.key === 'p') setTool('pencil');
+      if (e.key === 'e') setTool('eraser');
+      if (e.key === 's') setTool('select');
+      if (e.key === 'f') setTool('fill');
+      if (e.key === 'i') setTool('eyedropper');
+      if (e.key === 'm') setTool('move');
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  });
+
+  const handleSave = () => {
+    const canvas = canvasRef.current!;
+    const newImg = new Image();
+    newImg.onload = () => onSave(sprite.id, newImg);
+    newImg.src = canvas.toDataURL('image/png');
+  };
+
+  const btnStyle = (active: boolean): React.CSSProperties => ({
+    background: active ? 'var(--accent)' : 'var(--surface-2)',
+    color: active ? '#fff' : 'var(--text)',
+    border: '1px solid var(--border)',
+    borderRadius: '6px',
+    padding: '6px 8px',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '4px',
+    fontSize: '11px',
+    fontWeight: 600,
+  });
+
+  const W = sprite.img.width * zoom;
+  const H = sprite.img.height * zoom;
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 9999,
+      background: 'rgba(0,0,0,0.88)',
+      display: 'flex', flexDirection: 'column',
+    }} onMouseLeave={() => { isDrawing.current = false; setSelDrag(null); }}>
+      {/* Header */}
+      <div style={{
+        padding: '8px 16px', borderBottom: '1px solid var(--border)',
+        background: 'var(--surface)', display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap'
+      }}>
+        <span style={{ fontWeight: 700, fontSize: '13px', color: 'var(--accent)' }}>Editor Pixel Art — {sprite.name}</span>
+        <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+          {(['select','pencil','eraser','fill','eyedropper','move'] as PEdTool[]).map(t => (
+            <button key={t} style={btnStyle(tool === t)} onClick={() => setTool(t)} title={`${t} (${({select:'s',pencil:'p',eraser:'e',fill:'f',eyedropper:'i',move:'m'}[t])})`}>
+              {t === 'select' && '⬜'}
+              {t === 'pencil' && '✏️'}
+              {t === 'eraser' && '🧹'}
+              {t === 'fill' && '🪣'}
+              {t === 'eyedropper' && '💉'}
+              {t === 'move' && '✋'}
+              {t.charAt(0).toUpperCase() + t.slice(1)}
+            </button>
+          ))}
+        </div>
+        <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+          <button style={btnStyle(false)} onClick={cutSelection} disabled={!sel} title="Ctrl+X">✂️ Cortar</button>
+          <button style={btnStyle(false)} onClick={copySelection} disabled={!sel} title="Ctrl+C">📋 Copiar</button>
+          <button style={btnStyle(false)} onClick={pasteClipboard} disabled={!clipboard} title="Ctrl+V">📌 Pegar</button>
+          <button style={btnStyle(false)} onClick={deleteSelection} disabled={!sel} title="Delete">🗑️ Borrar</button>
+          <button style={btnStyle(false)} onClick={selectAll} title="Ctrl+A">⬜ Todo</button>
+          <button style={btnStyle(false)} onClick={undo} title="Ctrl+Z">↩️ Deshacer</button>
+        </div>
+        <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+          <label style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Color:</label>
+          <input type="color" value={color} onChange={e => setColor(e.target.value)}
+            style={{ width: '28px', height: '28px', padding: 0, border: 'none', background: 'none', cursor: 'pointer' }} />
+          <label style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Pincel:</label>
+          <input type="range" min={1} max={32} value={brushSize} onChange={e => setBrushSize(Number(e.target.value))}
+            style={{ width: '80px' }} />
+          <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{brushSize}px</span>
+          <label style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Zoom:</label>
+          <input type="range" min={0.1} max={32} step={0.1} value={zoom} onChange={e => setZoom(Number(e.target.value))}
+            style={{ width: '80px' }} />
+          <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{zoom.toFixed(1)}x</span>
+        </div>
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: '6px' }}>
+          <button style={btnStyle(false)} onClick={handleSave}>💾 Guardar</button>
+          <button style={{ ...btnStyle(false), borderColor: '#ff4444', color: '#ff4444' }} onClick={onClose}>✕ Cerrar</button>
+        </div>
+      </div>
+
+      {/* Canvas area */}
+      <div
+        ref={workspaceRef}
+        onScroll={onWorkspaceScroll}
+        style={{
+        flex: 1, overflow: 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center',
+        background: isWhiteBg ? '#fff' : 'repeating-conic-gradient(#1a1a1a 0% 25%, #252525 0% 50%) 0 0 / 16px 16px',
+      }}>
+        <div style={{ position: 'relative', width: W, height: H, imageRendering: 'pixelated', flexShrink: 0 }}>
+          <canvas ref={canvasRef}
+            style={{ position: 'absolute', top: 0, left: 0, width: W, height: H, imageRendering: 'pixelated',
+              cursor: ({ select: 'crosshair', pencil: 'crosshair', eraser: 'cell', fill: 'copy', eyedropper: 'zoom-in', move: 'move' }[tool]) }}
+            onMouseDown={handleMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseUp={handleMouseUp}
+          />
+          <canvas ref={overlayRef}
+            width={sprite.img.width} height={sprite.img.height}
+            style={{ position: 'absolute', top: 0, left: 0, width: W, height: H,
+              imageRendering: 'pixelated', pointerEvents: 'none' }}
+          />
+        </div>
+      </div>
+
+      {/* Status bar */}
+      <div style={{ padding: '4px 16px', background: 'var(--surface)', borderTop: '1px solid var(--border)',
+        fontSize: '11px', color: 'var(--text-muted)', display: 'flex', gap: '16px' }}>
+        <span>Tamaño: {sprite.img.width} × {sprite.img.height} px</span>
+        {sel && <span>Selección: ({sel.x},{sel.y}) {sel.w}×{sel.h} px</span>}
+        <span>Atajos: S=Selección P=Lápiz E=Goma F=Relleno I=Cuentagotas M=Mover Ctrl+Z/C/X/V/A Del</span>
       </div>
     </div>
   );
@@ -358,13 +2131,33 @@ interface EraserModalProps {
   isWhiteBg?: boolean;
 }
 
+type EraserPrefs = {
+  zoom: number;
+  brushSize: number;
+  brushShape: 'circle' | 'square';
+};
+
+const ERASER_PREFS_KEY = 'joa-eraser-prefs';
+
+const loadEraserPrefs = (): EraserPrefs => {
+  const saved = loadPref<Partial<EraserPrefs>>(ERASER_PREFS_KEY, {});
+  return {
+    zoom: clampNum(saved.zoom, 0.5, 8, 1),
+    brushSize: Math.round(clampNum(saved.brushSize, 1, 100, 20)),
+    brushShape: saved.brushShape === 'square' ? 'square' : 'circle',
+  };
+};
+
 const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWhiteBg }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [brushSize, setBrushSize] = useState(20);
-  const [brushShape, setBrushShape] = useState<'circle' | 'square'>('circle');
-  const [zoom, setZoom] = useState(1);
+  const [brushSize, setBrushSize] = useState(() => loadEraserPrefs().brushSize);
+  const [brushShape, setBrushShape] = useState<'circle' | 'square'>(() => loadEraserPrefs().brushShape);
+  const [zoom, setZoom] = useState(() => loadEraserPrefs().zoom);
   const [isDrawing, setIsDrawing] = useState(false);
   const [mousePos, setMousePos] = useState<{ x: number, y: number } | null>(null);
+  const lastPos = useRef<{ x: number, y: number } | null>(null);
+  const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-eraser-scroll', sprite.name, [zoom]);
+  useModalWheelControls({ zoom, setZoom, brushSize, setBrushSize, workspaceRef });
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -375,7 +2168,11 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
     ctx.drawImage(sprite.img, 0, 0);
   }, [sprite]);
 
-  const erase = (e: React.MouseEvent) => {
+  useEffect(() => {
+    savePref(ERASER_PREFS_KEY, { zoom, brushSize, brushShape });
+  }, [zoom, brushSize, brushShape]);
+
+  const erase = (e: React.MouseEvent, forceFirstPoint = false) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     
@@ -386,19 +2183,48 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
 
     setMousePos({ x, y });
 
-    if (!isDrawing) return;
+    if (!isDrawing && !forceFirstPoint) {
+      lastPos.current = null;
+      return;
+    }
 
     const scaleX = canvas.width / (rect.width / zoom);
     const scaleY = canvas.height / (rect.height / zoom);
+    const currX = x * scaleX;
+    const currY = y * scaleY;
     
     ctx.globalCompositeOperation = 'destination-out';
-    if (brushShape === 'circle') {
-      ctx.beginPath();
-      ctx.arc(x * scaleX, y * scaleY, brushSize, 0, Math.PI * 2);
-      ctx.fill();
+    if (lastPos.current && !forceFirstPoint) {
+      if (brushShape === 'circle') {
+        ctx.beginPath();
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.lineWidth = brushSize * 2;
+        ctx.moveTo(lastPos.current.x, lastPos.current.y);
+        ctx.lineTo(currX, currY);
+        ctx.stroke();
+      } else {
+        const dx = currX - lastPos.current.x;
+        const dy = currY - lastPos.current.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        const steps = Math.max(1, Math.ceil(dist));
+        for (let i = 0; i <= steps; i++) {
+          const t = steps === 0 ? 0 : i / steps;
+          const x = lastPos.current.x + dx * t;
+          const y = lastPos.current.y + dy * t;
+          ctx.fillRect(x - brushSize, y - brushSize, brushSize * 2, brushSize * 2);
+        }
+      }
     } else {
-      ctx.fillRect(x * scaleX - brushSize, y * scaleY - brushSize, brushSize * 2, brushSize * 2);
+      if (brushShape === 'circle') {
+        ctx.beginPath();
+        ctx.arc(currX, currY, brushSize, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        ctx.fillRect(currX - brushSize, currY - brushSize, brushSize * 2, brushSize * 2);
+      }
     }
+    lastPos.current = { x: currX, y: currY };
   };
 
   const handleSave = () => {
@@ -430,7 +2256,12 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
           </div>
           <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
         </div>
-        <div className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`} style={{ overflow: 'auto' }}>
+        <div
+          ref={workspaceRef}
+          className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`}
+          style={{ overflow: 'auto' }}
+          onScroll={onWorkspaceScroll}
+        >
            <div style={{
              width: sprite.img.width * zoom,
              height: sprite.img.height * zoom,
@@ -449,15 +2280,16 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
              }}>
              <canvas 
               ref={canvasRef}
-              onMouseDown={() => setIsDrawing(true)}
-              onMouseUp={() => setIsDrawing(false)}
-              onMouseMove={erase}
+              onMouseDown={(e) => { setIsDrawing(true); erase(e, true); }}
+              onMouseUp={() => { setIsDrawing(false); lastPos.current = null; }}
+              onMouseMove={(e) => erase(e)}
               onMouseEnter={(e) => {
                 const rect = e.currentTarget.getBoundingClientRect();
                 setMousePos({ x: (e.clientX - rect.left) / zoom, y: (e.clientY - rect.top) / zoom });
               }}
               onMouseLeave={() => {
                 setIsDrawing(false);
+                lastPos.current = null;
                 setMousePos(null);
               }}
              />
@@ -475,11 +2307,53 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
         </div>
         <div className="modal-footer" style={{ padding: '20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '24px' }}>
           <div className="slider-item" style={{ flex: 1, marginBottom: 0 }}>
-            <div className="slider-label"><span><Search size={14} /> Zoom</span><span>{zoom.toFixed(1)}x</span></div>
+            <div className="slider-label">
+              <span><Search size={14} /> Zoom</span>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: '2px' }}>
+                <input
+                  type="number"
+                  min={0.5}
+                  max={8}
+                  step={0.1}
+                  value={Number(zoom.toFixed(1))}
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    if (!Number.isFinite(v)) return;
+                    setZoom(Math.min(8, Math.max(0.5, v)));
+                  }}
+                  style={{
+                    width: '48px', background: '#1a1a1a', border: '1px solid #333', color: 'white',
+                    padding: '2px 4px', borderRadius: '4px', textAlign: 'right', fontSize: '0.75rem',
+                  }}
+                />
+                x
+              </span>
+            </div>
             <input type="range" min="0.5" max="8" step="0.1" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
           </div>
           <div className="slider-item" style={{ flex: 1, marginBottom: 0 }}>
-            <div className="slider-label"><span>Tamaño de Goma</span><span>{brushSize}px</span></div>
+            <div className="slider-label">
+              <span>Tamaño de Goma</span>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: '2px' }}>
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  step={1}
+                  value={brushSize}
+                  onChange={(e) => {
+                    const v = parseInt(e.target.value, 10);
+                    if (!Number.isFinite(v)) return;
+                    setBrushSize(Math.min(100, Math.max(1, v)));
+                  }}
+                  style={{
+                    width: '48px', background: '#1a1a1a', border: '1px solid #333', color: 'white',
+                    padding: '2px 4px', borderRadius: '4px', textAlign: 'right', fontSize: '0.75rem',
+                  }}
+                />
+                px
+              </span>
+            </div>
             <input type="range" min="1" max="100" value={brushSize} onChange={(e) => setBrushSize(parseInt(e.target.value))} />
           </div>
           <div className="slider-item" style={{ width: 'auto', marginBottom: 0 }}>
@@ -503,6 +2377,1355 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
   );
 };
 
+// --- Replace-from-sprite brush (like eraser, but stamps the other image) ---
+interface ReplaceBrushModalProps {
+  sprite: SpriteData;
+  sprites: SpriteData[];
+  onSave: (id: string, newImg: HTMLImageElement) => void;
+  onClose: () => void;
+  isWhiteBg?: boolean;
+}
+
+type ReplacePrefs = {
+  zoom: number;
+  brushSize: number;
+  brushShape: 'circle' | 'square';
+  paintedOnly: boolean;
+  emptyOnly: boolean;
+  fillEmpty: boolean;
+};
+
+const REPLACE_PREFS_KEY = 'joa-replace-prefs';
+
+const loadReplacePrefs = (): ReplacePrefs => {
+  const saved = loadPref<Partial<ReplacePrefs>>(REPLACE_PREFS_KEY, {});
+  const fillEmpty = saved.fillEmpty === true;
+  const emptyOnly = !fillEmpty && saved.emptyOnly === true;
+  const paintedOnly = !fillEmpty && !emptyOnly && saved.paintedOnly === true;
+  return {
+    zoom: clampNum(saved.zoom, 0.5, 8, 1),
+    brushSize: Math.round(clampNum(saved.brushSize, 1, 100, 20)),
+    brushShape: saved.brushShape === 'square' ? 'square' : 'circle',
+    paintedOnly,
+    emptyOnly,
+    fillEmpty,
+  };
+};
+
+const ReplaceBrushModal: React.FC<ReplaceBrushModalProps> = ({ sprite, sprites, onSave, onClose, isWhiteBg }) => {
+  const others = sprites.filter((s) => s.id !== sprite.id);
+  const [sourceId, setSourceId] = useState<string | null>(() => {
+    if (others.length === 1) return others[0].id;
+    const lastName = loadPref<string>('joa-replace-last-source', '');
+    const remembered = others.find((s) => s.name === lastName);
+    return remembered?.id ?? null;
+  });
+  const source = others.find((s) => s.id === sourceId) || null;
+
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const sourceCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const originalCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [brushMode, setBrushMode] = useState<'replace' | 'invert' | 'erase'>('replace');
+  const [brushSize, setBrushSize] = useState(() => loadReplacePrefs().brushSize);
+  const [brushShape, setBrushShape] = useState<'circle' | 'square'>(() => loadReplacePrefs().brushShape);
+  const [paintedOnly, setPaintedOnly] = useState(() => loadReplacePrefs().paintedOnly);
+  const [emptyOnly, setEmptyOnly] = useState(() => loadReplacePrefs().emptyOnly);
+  const [fillEmpty, setFillEmpty] = useState(() => loadReplacePrefs().fillEmpty);
+  const [zoom, setZoom] = useState(() => loadReplacePrefs().zoom);
+  const [mousePos, setMousePos] = useState<{ x: number; y: number } | null>(null);
+  const [historyLen, setHistoryLen] = useState(0);
+  const lastPos = useRef<{ x: number; y: number } | null>(null);
+  const historyRef = useRef<ImageData[]>([]);
+  const strokeSavedRef = useRef(false);
+  const isDrawingRef = useRef(false);
+  const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-replace-scroll', sprite.name, [zoom]);
+  useModalWheelControls({ zoom, setZoom, brushSize, setBrushSize, workspaceRef });
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !sourceId) return;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    canvas.width = sprite.img.width;
+    canvas.height = sprite.img.height;
+    ctx.drawImage(sprite.img, 0, 0);
+    const original = document.createElement('canvas');
+    original.width = sprite.img.width;
+    original.height = sprite.img.height;
+    original.getContext('2d')!.drawImage(sprite.img, 0, 0);
+    originalCanvasRef.current = original;
+    historyRef.current = [];
+    setHistoryLen(0);
+  }, [sprite, sourceId]);
+
+  useEffect(() => {
+    if (!source) {
+      sourceCanvasRef.current = null;
+      return;
+    }
+    const c = document.createElement('canvas');
+    c.width = source.img.width;
+    c.height = source.img.height;
+    const sctx = c.getContext('2d')!;
+    sctx.drawImage(source.img, 0, 0);
+    sourceCanvasRef.current = c;
+    savePref('joa-replace-last-source', source.name);
+  }, [source]);
+
+  useEffect(() => {
+    savePref(REPLACE_PREFS_KEY, { zoom, brushSize, brushShape, paintedOnly, emptyOnly, fillEmpty });
+  }, [zoom, brushSize, brushShape, paintedOnly, emptyOnly, fillEmpty]);
+
+  const pushHistory = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    const snapshot = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const next = [...historyRef.current, snapshot];
+    if (next.length > 40) next.shift();
+    historyRef.current = next;
+    setHistoryLen(next.length);
+  };
+
+  const undo = () => {
+    if (historyRef.current.length === 0) return;
+    const snapshot = historyRef.current[historyRef.current.length - 1];
+    historyRef.current = historyRef.current.slice(0, -1);
+    setHistoryLen(historyRef.current.length);
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.putImageData(snapshot, 0, 0);
+  };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        undo();
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, []);
+
+  const stampSource = (ctx: CanvasRenderingContext2D, x: number, y: number, from: { x: number; y: number } | null) => {
+    const src = brushMode === 'invert' ? originalCanvasRef.current : sourceCanvasRef.current;
+    if (brushMode !== 'erase' && !src) return;
+    if (from && (from.x !== x || from.y !== y)) {
+      const dx = x - from.x;
+      const dy = y - from.y;
+      const dist = Math.hypot(dx, dy);
+      const steps = Math.max(1, Math.ceil(dist / Math.max(1, brushSize * 0.4)));
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        if (brushMode === 'erase') eraseDot(ctx, from.x + dx * t, from.y + dy * t);
+        else stampDot(ctx, src!, from.x + dx * t, from.y + dy * t);
+      }
+    } else if (brushMode === 'erase') {
+      eraseDot(ctx, x, y);
+    } else {
+      stampDot(ctx, src!, x, y);
+    }
+  };
+
+  /** ¿El píxel (px,py) cae dentro del pincel duro? (sin antialias de clip) */
+  const inBrush = (px: number, py: number, cx: number, cy: number) => {
+    const r = brushSize;
+    if (brushShape === 'circle') {
+      const dx = px + 0.5 - cx;
+      const dy = py + 0.5 - cy;
+      return dx * dx + dy * dy <= r * r;
+    }
+    return px >= cx - r && px < cx + r && py >= cy - r && py < cy + r;
+  };
+
+  /**
+   * Solo en pintado: píxel a píxel, borde duro del pincel.
+   * Evita el bug de clip() antialias + destination-in/out (halos en el margen).
+   */
+  const stampPaintedOnly = (ctx: CanvasRenderingContext2D, src: HTMLCanvasElement, x: number, y: number) => {
+    const canvas = ctx.canvas;
+    const w = canvas.width;
+    const h = canvas.height;
+    const r = brushSize;
+    const x0 = Math.max(0, Math.floor(x - r));
+    const y0 = Math.max(0, Math.floor(y - r));
+    const x1 = Math.min(w, Math.ceil(x + r));
+    const y1 = Math.min(h, Math.ceil(y + r));
+    const bw = x1 - x0;
+    const bh = y1 - y0;
+    if (bw <= 0 || bh <= 0) return;
+
+    const destImg = ctx.getImageData(x0, y0, bw, bh);
+    const dd = destImg.data;
+
+    const sw = src.width;
+    const sh = src.height;
+    const sx0 = Math.max(x0, 0);
+    const sy0 = Math.max(y0, 0);
+    const sx1 = Math.min(x1, sw);
+    const sy1 = Math.min(y1, sh);
+    let sd: Uint8ClampedArray | null = null;
+    let sBw = 0;
+    if (sx1 > sx0 && sy1 > sy0) {
+      const sctx = src.getContext('2d', { willReadFrequently: true });
+      if (sctx) {
+        const srcImg = sctx.getImageData(sx0, sy0, sx1 - sx0, sy1 - sy0);
+        sd = srcImg.data;
+        sBw = sx1 - sx0;
+      }
+    }
+
+    for (let py = y0; py < y1; py++) {
+      for (let px = x0; px < x1; px++) {
+        if (!inBrush(px, py, x, y)) continue;
+        const di = ((py - y0) * bw + (px - x0)) * 4;
+        // Ignorar huecos del archivo en modificación.
+        if (dd[di + 3] < 8) continue;
+
+        if (!sd || px < sx0 || py < sy0 || px >= sx1 || py >= sy1) {
+          dd[di] = 0;
+          dd[di + 1] = 0;
+          dd[di + 2] = 0;
+          dd[di + 3] = 0;
+        } else {
+          const si = ((py - sy0) * sBw + (px - sx0)) * 4;
+          dd[di] = sd[si];
+          dd[di + 1] = sd[si + 1];
+          dd[di + 2] = sd[si + 2];
+          dd[di + 3] = sd[si + 3];
+        }
+      }
+    }
+    ctx.putImageData(destImg, x0, y0);
+  };
+
+  /** Solo vacío: borrar píxeles del destino donde la fuente está vacía (borde duro). */
+  const stampEmptyOnly = (ctx: CanvasRenderingContext2D, src: HTMLCanvasElement, x: number, y: number) => {
+    const canvas = ctx.canvas;
+    const w = canvas.width;
+    const h = canvas.height;
+    const r = brushSize;
+    const x0 = Math.max(0, Math.floor(x - r));
+    const y0 = Math.max(0, Math.floor(y - r));
+    const x1 = Math.min(w, Math.ceil(x + r));
+    const y1 = Math.min(h, Math.ceil(y + r));
+    const bw = x1 - x0;
+    const bh = y1 - y0;
+    if (bw <= 0 || bh <= 0) return;
+
+    const destImg = ctx.getImageData(x0, y0, bw, bh);
+    const dd = destImg.data;
+
+    const sw = src.width;
+    const sh = src.height;
+    const sx0 = Math.max(x0, 0);
+    const sy0 = Math.max(y0, 0);
+    const sx1 = Math.min(x1, sw);
+    const sy1 = Math.min(y1, sh);
+    let sd: Uint8ClampedArray | null = null;
+    let sBw = 0;
+    if (sx1 > sx0 && sy1 > sy0) {
+      const sctx = src.getContext('2d', { willReadFrequently: true });
+      if (sctx) {
+        const srcImg = sctx.getImageData(sx0, sy0, sx1 - sx0, sy1 - sy0);
+        sd = srcImg.data;
+        sBw = sx1 - sx0;
+      }
+    }
+
+    for (let py = y0; py < y1; py++) {
+      for (let px = x0; px < x1; px++) {
+        if (!inBrush(px, py, x, y)) continue;
+        const di = ((py - y0) * bw + (px - x0)) * 4;
+        let srcEmpty = true;
+        if (sd && px >= sx0 && py >= sy0 && px < sx1 && py < sy1) {
+          const si = ((py - sy0) * sBw + (px - sx0)) * 4;
+          srcEmpty = sd[si + 3] < 8;
+        }
+        if (srcEmpty) {
+          dd[di] = 0;
+          dd[di + 1] = 0;
+          dd[di + 2] = 0;
+          dd[di + 3] = 0;
+        }
+      }
+    }
+    ctx.putImageData(destImg, x0, y0);
+  };
+
+  /** Solo sobre vacío: pegar fuente opaca solo donde el destino está vacío (borde duro). */
+  const stampFillEmpty = (ctx: CanvasRenderingContext2D, src: HTMLCanvasElement, x: number, y: number) => {
+    const canvas = ctx.canvas;
+    const w = canvas.width;
+    const h = canvas.height;
+    const r = brushSize;
+    const x0 = Math.max(0, Math.floor(x - r));
+    const y0 = Math.max(0, Math.floor(y - r));
+    const x1 = Math.min(w, Math.ceil(x + r));
+    const y1 = Math.min(h, Math.ceil(y + r));
+    const bw = x1 - x0;
+    const bh = y1 - y0;
+    if (bw <= 0 || bh <= 0) return;
+
+    const destImg = ctx.getImageData(x0, y0, bw, bh);
+    const dd = destImg.data;
+
+    const sw = src.width;
+    const sh = src.height;
+    const sx0 = Math.max(x0, 0);
+    const sy0 = Math.max(y0, 0);
+    const sx1 = Math.min(x1, sw);
+    const sy1 = Math.min(y1, sh);
+    let sd: Uint8ClampedArray | null = null;
+    let sBw = 0;
+    if (sx1 > sx0 && sy1 > sy0) {
+      const sctx = src.getContext('2d', { willReadFrequently: true });
+      if (sctx) {
+        const srcImg = sctx.getImageData(sx0, sy0, sx1 - sx0, sy1 - sy0);
+        sd = srcImg.data;
+        sBw = sx1 - sx0;
+      }
+    }
+    if (!sd) return;
+
+    for (let py = y0; py < y1; py++) {
+      for (let px = x0; px < x1; px++) {
+        if (!inBrush(px, py, x, y)) continue;
+        if (px < sx0 || py < sy0 || px >= sx1 || py >= sy1) continue;
+        const di = ((py - y0) * bw + (px - x0)) * 4;
+        if (dd[di + 3] >= 8) continue; // solo sobre vacío del destino
+        const si = ((py - sy0) * sBw + (px - sx0)) * 4;
+        if (sd[si + 3] < 8) continue; // no pegar vacío de la fuente
+        dd[di] = sd[si];
+        dd[di + 1] = sd[si + 1];
+        dd[di + 2] = sd[si + 2];
+        dd[di + 3] = sd[si + 3];
+      }
+    }
+    ctx.putImageData(destImg, x0, y0);
+  };
+
+  const stampDot = (ctx: CanvasRenderingContext2D, src: HTMLCanvasElement, x: number, y: number) => {
+    // Variantes con máscara: píxel a píxel (borde duro). No usar clip()+destination-*:
+    // el antialias del clip deja halos en el margen del pincel.
+    if (emptyOnly) {
+      stampEmptyOnly(ctx, src, x, y);
+      return;
+    }
+    if (fillEmpty) {
+      stampFillEmpty(ctx, src, x, y);
+      return;
+    }
+    if (paintedOnly) {
+      stampPaintedOnly(ctx, src, x, y);
+      return;
+    }
+
+    ctx.save();
+    ctx.beginPath();
+    if (brushShape === 'circle') {
+      ctx.arc(x, y, brushSize, 0, Math.PI * 2);
+    } else {
+      ctx.rect(x - brushSize, y - brushSize, brushSize * 2, brushSize * 2);
+    }
+    ctx.clip();
+    ctx.imageSmoothingEnabled = false;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(src, 0, 0);
+    ctx.restore();
+  };
+
+  const eraseDot = (ctx: CanvasRenderingContext2D, x: number, y: number) => {
+    ctx.save();
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    if (brushShape === 'circle') {
+      ctx.arc(x, y, brushSize, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.fillRect(x - brushSize, y - brushSize, brushSize * 2, brushSize * 2);
+    }
+    ctx.restore();
+  };
+
+  const paint = (e: React.MouseEvent, forceFirstPoint = false) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    const rect = canvas.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / zoom;
+    const y = (e.clientY - rect.top) / zoom;
+    setMousePos({ x, y });
+
+    if (!isDrawingRef.current && !forceFirstPoint) {
+      lastPos.current = null;
+      return;
+    }
+
+    const scaleX = canvas.width / (rect.width / zoom);
+    const scaleY = canvas.height / (rect.height / zoom);
+    const currX = x * scaleX;
+    const currY = y * scaleY;
+    stampSource(ctx, currX, currY, forceFirstPoint ? null : lastPos.current);
+    lastPos.current = { x: currX, y: currY };
+  };
+
+  const beginStroke = (e: React.MouseEvent) => {
+    if (!strokeSavedRef.current) {
+      pushHistory();
+      strokeSavedRef.current = true;
+    }
+    isDrawingRef.current = true;
+    paint(e, true);
+  };
+
+  const endStroke = () => {
+    isDrawingRef.current = false;
+    lastPos.current = null;
+    strokeSavedRef.current = false;
+  };
+
+  const handleReset = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    pushHistory();
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(sprite.img, 0, 0);
+  };
+
+  const handleSave = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const newImg = new Image();
+    newImg.onload = () => onSave(sprite.id, newImg);
+    newImg.src = canvas.toDataURL('image/png');
+  };
+
+  const picker = (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '1080px', height: 'auto', maxHeight: '92vh' }}>
+        <div className="modal-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <Stamp size={18} color="var(--accent)" />
+            <h3 style={{ fontSize: '1rem' }}>Reemplazar en: {sprite.name}</h3>
+          </div>
+          <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
+        </div>
+        <div style={{ padding: '16px 20px', overflow: 'auto' }}>
+          <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '14px', lineHeight: 1.45 }}>
+            Elegí el sprite fuente. Al pintar sobre <strong>{sprite.name}</strong>, esa zona se reemplaza con los píxeles de la misma coordenada del otro. <strong>Solo en pintado</strong> solo toca lo ya dibujado del destino; <strong>Solo vacío</strong> borra huecos de la fuente; <strong>Solo sobre vacío</strong> agrega lo dibujado solo en huecos del destino.
+          </p>
+          {others.length === 0 ? (
+            <div className="empty-msg">Cargá al menos otro sprite para usarlo como fuente.</div>
+          ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: '10px' }}>
+              {others.map((s) => (
+                <button
+                  key={s.id}
+                  type="button"
+                  className="btn btn-outline"
+                  onClick={() => setSourceId(s.id)}
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    gap: '8px',
+                    padding: '10px',
+                    height: 'auto',
+                    textAlign: 'center',
+                  }}
+                >
+                  <div className="checker-mini" style={{ width: '100%', height: '88px', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '4px', overflow: 'hidden' }}>
+                    <img src={s.img.src} alt="" style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', imageRendering: 'pixelated' }} />
+                  </div>
+                  <span style={{ fontSize: '0.7rem', wordBreak: 'break-all' }}>{s.name}</span>
+                  <span style={{ fontSize: '0.6rem', color: 'var(--text-muted)' }}>{s.img.width}×{s.img.height}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
+  if (!source) return picker;
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+            <Stamp size={18} color="var(--accent)" />
+            <h3 style={{ fontSize: '1rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              Reemplazar: {sprite.name}
+            </h3>
+            <span style={{
+              fontSize: '0.7rem',
+              color: brushMode === 'invert' ? '#ffcc00' : brushMode === 'erase' ? '#ff6b6b' : 'var(--text-muted)',
+              flexShrink: 0,
+            }}>
+              {brushMode === 'invert' ? 'restaurando original' : brushMode === 'erase' ? 'goma' : `← ${source.name}`}
+            </span>
+          </div>
+          <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
+        </div>
+        <div
+          ref={workspaceRef}
+          className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`}
+          style={{ overflow: 'auto' }}
+          onScroll={onWorkspaceScroll}
+        >
+          <div style={{
+            width: sprite.img.width * zoom,
+            height: sprite.img.height * zoom,
+            margin: 'auto',
+            position: 'relative',
+          }}>
+            <div style={{
+              position: 'absolute',
+              left: 0,
+              top: 0,
+              cursor: 'none',
+              width: sprite.img.width,
+              height: sprite.img.height,
+              transform: `scale(${zoom})`,
+              transformOrigin: 'top left',
+            }}>
+              <canvas
+                ref={canvasRef}
+                onMouseDown={beginStroke}
+                onMouseUp={endStroke}
+                onMouseMove={(e) => paint(e)}
+                onMouseEnter={(e) => {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  setMousePos({ x: (e.clientX - rect.left) / zoom, y: (e.clientY - rect.top) / zoom });
+                }}
+                onMouseLeave={() => {
+                  endStroke();
+                  setMousePos(null);
+                }}
+              />
+              {mousePos && canvasRef.current && (
+                <div className="brush-preview" style={{
+                  left: mousePos.x,
+                  top: mousePos.y,
+                  width: brushSize * (canvasRef.current.offsetWidth / canvasRef.current.width) * 2,
+                  height: brushSize * (canvasRef.current.offsetWidth / canvasRef.current.width) * 2,
+                  borderRadius: brushShape === 'circle' ? '50%' : '0',
+                  borderColor: brushMode === 'invert' ? '#ffcc00' : brushMode === 'erase' ? '#ff6b6b' : undefined,
+                }} />
+              )}
+            </div>
+          </div>
+        </div>
+        <div className="modal-footer" style={{ flexDirection: 'column', alignItems: 'stretch', gap: '10px' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '8px 12px' }}>
+            <button className="btn btn-outline" onClick={() => setSourceId(null)} title="Elegir otro sprite fuente">
+              Cambiar fuente
+            </button>
+            <button
+              type="button"
+              className={`btn ${brushMode === 'invert' ? 'btn-primary' : 'btn-outline'}`}
+              onClick={() => setBrushMode((m) => m === 'invert' ? 'replace' : 'invert')}
+              title="Al pintar, restaura la zona original del primer sprite (deshace el reemplazo)"
+              style={brushMode === 'invert' ? undefined : { borderColor: '#ffcc00', color: '#ffcc00' }}
+            >
+              <FlipHorizontal size={16} /> Invertir
+            </button>
+            <button
+              type="button"
+              className={`btn ${brushMode === 'erase' ? 'btn-primary' : 'btn-outline'}`}
+              onClick={() => setBrushMode((m) => m === 'erase' ? 'replace' : 'erase')}
+              title="Borra la zona pintada (como la goma)"
+              style={brushMode === 'erase' ? undefined : { borderColor: '#ff6b6b', color: '#ff6b6b' }}
+            >
+              <Eraser size={16} /> Goma
+            </button>
+            <div style={{ display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: '10px 14px' }}>
+              <label
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  fontSize: '0.75rem',
+                  color: paintedOnly ? 'var(--accent)' : 'var(--text-light)',
+                  cursor: 'pointer',
+                  userSelect: 'none',
+                  whiteSpace: 'nowrap',
+                }}
+                title="Solo reemplaza donde el destino ya está dibujado; ignora los huecos del archivo en modificación"
+              >
+                <input
+                  type="checkbox"
+                  checked={paintedOnly}
+                  onChange={(e) => {
+                    const on = e.target.checked;
+                    setPaintedOnly(on);
+                    if (on) {
+                      setEmptyOnly(false);
+                      setFillEmpty(false);
+                    }
+                  }}
+                  style={{ cursor: 'pointer' }}
+                />
+                Solo en pintado
+              </label>
+              <label
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  fontSize: '0.75rem',
+                  color: emptyOnly ? 'var(--accent)' : 'var(--text-light)',
+                  cursor: 'pointer',
+                  userSelect: 'none',
+                  whiteSpace: 'nowrap',
+                }}
+                title="Solo borra donde la fuente está vacía; no modifica lo dibujado"
+              >
+                <input
+                  type="checkbox"
+                  checked={emptyOnly}
+                  onChange={(e) => {
+                    const on = e.target.checked;
+                    setEmptyOnly(on);
+                    if (on) {
+                      setPaintedOnly(false);
+                      setFillEmpty(false);
+                    }
+                  }}
+                  style={{ cursor: 'pointer' }}
+                />
+                Solo vacío
+              </label>
+              <label
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  fontSize: '0.75rem',
+                  color: fillEmpty ? 'var(--accent)' : 'var(--text-light)',
+                  cursor: 'pointer',
+                  userSelect: 'none',
+                  whiteSpace: 'nowrap',
+                }}
+                title="Agrega lo dibujado de la fuente solo donde el destino está vacío"
+              >
+                <input
+                  type="checkbox"
+                  checked={fillEmpty}
+                  onChange={(e) => {
+                    const on = e.target.checked;
+                    setFillEmpty(on);
+                    if (on) {
+                      setPaintedOnly(false);
+                      setEmptyOnly(false);
+                    }
+                  }}
+                  style={{ cursor: 'pointer' }}
+                />
+                Solo sobre vacío
+              </label>
+            </div>
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '10px 12px' }}>
+            <div className="slider-item" style={{ flex: 1, marginBottom: 0, minWidth: '140px' }}>
+              <div className="slider-label">
+                <span><Search size={14} /> Zoom</span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: '2px' }}>
+                  <input
+                    type="number"
+                    min={0.5}
+                    max={8}
+                    step={0.1}
+                    value={Number(zoom.toFixed(1))}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      if (!Number.isFinite(v)) return;
+                      setZoom(Math.min(8, Math.max(0.5, v)));
+                    }}
+                    style={{
+                      width: '48px', background: '#1a1a1a', border: '1px solid #333', color: 'white',
+                      padding: '2px 4px', borderRadius: '4px', textAlign: 'right', fontSize: '0.75rem',
+                    }}
+                  />
+                  x
+                </span>
+              </div>
+              <input type="range" min="0.5" max="8" step="0.1" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
+            </div>
+            <div className="slider-item" style={{ flex: 1, marginBottom: 0, minWidth: '140px' }}>
+              <div className="slider-label">
+                <span>Tamaño</span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: '2px' }}>
+                  <input
+                    type="number"
+                    min={1}
+                    max={100}
+                    step={1}
+                    value={brushSize}
+                    onChange={(e) => {
+                      const v = parseInt(e.target.value, 10);
+                      if (!Number.isFinite(v)) return;
+                      setBrushSize(Math.min(100, Math.max(1, v)));
+                    }}
+                    style={{
+                      width: '48px', background: '#1a1a1a', border: '1px solid #333', color: 'white',
+                      padding: '2px 4px', borderRadius: '4px', textAlign: 'right', fontSize: '0.75rem',
+                    }}
+                  />
+                  px
+                </span>
+              </div>
+              <input type="range" min="1" max="100" value={brushSize} onChange={(e) => setBrushSize(parseInt(e.target.value))} />
+            </div>
+            <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+              <button className={`btn-ghost ${brushShape === 'circle' ? 'active' : ''}`} onClick={() => setBrushShape('circle')} title="Círculo">
+                <Circle size={16} fill={brushShape === 'circle' ? 'currentColor' : 'none'} />
+              </button>
+              <button className={`btn-ghost ${brushShape === 'square' ? 'active' : ''}`} onClick={() => setBrushShape('square')} title="Cuadrado">
+                <Square size={16} fill={brushShape === 'square' ? 'currentColor' : 'none'} />
+              </button>
+            </div>
+            <div style={{ display: 'flex', gap: '8px', marginLeft: 'auto', flexWrap: 'wrap' }}>
+              <button className="btn btn-outline" onClick={undo} disabled={historyLen === 0} title="Ctrl+Z">
+                <RotateCcw size={16} /> Deshacer
+              </button>
+              <button className="btn btn-outline" onClick={handleReset}>Reiniciar</button>
+              <button className="btn btn-primary" style={{ paddingLeft: '24px', paddingRight: '24px' }} onClick={handleSave}>Guardar Cambios</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- Copy a rectangle from another sprite and place it anywhere ---
+interface CopyRectModalProps {
+  sprite: SpriteData;
+  sprites: SpriteData[];
+  onSave: (id: string, newImg: HTMLImageElement) => void;
+  onClose: () => void;
+  isWhiteBg?: boolean;
+}
+
+const COPY_RECT_PREFS_KEY = 'joa-copy-rect-prefs';
+
+const CopyRectModal: React.FC<CopyRectModalProps> = ({ sprite, sprites, onSave, onClose, isWhiteBg }) => {
+  const others = sprites.filter((s) => s.id !== sprite.id);
+  const [sourceId, setSourceId] = useState<string | null>(() => {
+    if (others.length === 1) return others[0].id;
+    const lastName = loadPref<string>('joa-copy-rect-last-source', '');
+    const remembered = others.find((s) => s.name === lastName);
+    return remembered?.id ?? null;
+  });
+  const source = others.find((s) => s.id === sourceId) || null;
+
+  type CropRect = { x: number; y: number; w: number; h: number };
+  type CropHandle = 'n' | 's' | 'e' | 'w' | 'nw' | 'ne' | 'sw' | 'se' | 'move';
+
+  const [phase, setPhase] = useState<'select' | 'place'>('select');
+  const [zoom, setZoom] = useState(() => clampNum(loadPref(`${COPY_RECT_PREFS_KEY}-zoom`, 1), 0.5, 8, 1));
+  const [includeEmpty, setIncludeEmpty] = useState(() => loadPref<boolean>(`${COPY_RECT_PREFS_KEY}-empty`, false));
+  const [previewOpacity, setPreviewOpacity] = useState(() => Math.round(clampNum(loadPref(`${COPY_RECT_PREFS_KEY}-preview`, 70), 0, 100, 70)));
+  const [hidePreview, setHidePreview] = useState(false);
+  const [crop, setCrop] = useState<CropRect | null>(null);
+  const [draft, setDraft] = useState<CropRect | null>(null);
+  const [destPos, setDestPos] = useState({ x: 0, y: 0 });
+  const [historyLen, setHistoryLen] = useState(0);
+  const [adjusting, setAdjusting] = useState(false);
+
+  const sourceCanvasRef = useRef<HTMLCanvasElement>(null);
+  const destCanvasRef = useRef<HTMLCanvasElement>(null);
+  const cropCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [cropPreview, setCropPreview] = useState<string | null>(null);
+  const historyRef = useRef<ImageData[]>([]);
+  const placeDragRef = useRef<{ mx: number; my: number; ox: number; oy: number } | null>(null);
+  const adjustRef = useRef<{
+    mode: CropHandle | 'draw';
+    startPx: number;
+    startPy: number;
+    startRect: CropRect;
+  } | null>(null);
+
+  const { workspaceRef, onWorkspaceScroll } = useRememberedScroll(
+    phase === 'select' ? 'joa-copy-rect-src-scroll' : 'joa-copy-rect-dst-scroll',
+    (phase === 'select' ? source?.name : sprite.name) || sprite.name,
+    [zoom, phase]
+  );
+  useModalWheelControls({ zoom, setZoom, workspaceRef });
+
+  useEffect(() => {
+    savePref(`${COPY_RECT_PREFS_KEY}-zoom`, zoom);
+    savePref(`${COPY_RECT_PREFS_KEY}-empty`, includeEmpty);
+    savePref(`${COPY_RECT_PREFS_KEY}-preview`, previewOpacity);
+  }, [zoom, includeEmpty, previewOpacity]);
+
+  useEffect(() => {
+    if (source) savePref('joa-copy-rect-last-source', source.name);
+  }, [source]);
+
+  useEffect(() => {
+    const canvas = sourceCanvasRef.current;
+    if (!canvas || !source) return;
+    canvas.width = source.img.width;
+    canvas.height = source.img.height;
+    const ctx = canvas.getContext('2d')!;
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(source.img, 0, 0);
+  }, [source]);
+
+  useEffect(() => {
+    const canvas = destCanvasRef.current;
+    if (!canvas) return;
+    canvas.width = sprite.img.width;
+    canvas.height = sprite.img.height;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(sprite.img, 0, 0);
+    historyRef.current = [];
+    setHistoryLen(0);
+  }, [sprite, sourceId]);
+
+  const rebuildCrop = (rect: CropRect) => {
+    if (!source) return;
+    const c = document.createElement('canvas');
+    c.width = rect.w;
+    c.height = rect.h;
+    const ctx = c.getContext('2d')!;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(source.img, rect.x, rect.y, rect.w, rect.h, 0, 0, rect.w, rect.h);
+    cropCanvasRef.current = c;
+    setCropPreview(c.toDataURL('image/png'));
+  };
+
+  const sourceCoordsFromClient = (clientX: number, clientY: number) => {
+    const canvas = sourceCanvasRef.current;
+    if (!canvas || !source) return { x: 0, y: 0 };
+    const rect = canvas.getBoundingClientRect();
+    const x = Math.floor((clientX - rect.left) / zoom);
+    const y = Math.floor((clientY - rect.top) / zoom);
+    return {
+      x: Math.max(0, Math.min(source.img.width - 1, x)),
+      y: Math.max(0, Math.min(source.img.height - 1, y)),
+    };
+  };
+
+  const clampCrop = (r: CropRect, maxW: number, maxH: number): CropRect => {
+    let x1 = r.x;
+    let y1 = r.y;
+    let x2 = r.x + r.w - 1;
+    let y2 = r.y + r.h - 1;
+    if (x2 < x1) [x1, x2] = [x2, x1];
+    if (y2 < y1) [y1, y2] = [y2, y1];
+    x1 = Math.max(0, Math.min(maxW - 1, x1));
+    y1 = Math.max(0, Math.min(maxH - 1, y1));
+    x2 = Math.max(0, Math.min(maxW - 1, x2));
+    y2 = Math.max(0, Math.min(maxH - 1, y2));
+    return { x: x1, y: y1, w: Math.max(1, x2 - x1 + 1), h: Math.max(1, y2 - y1 + 1) };
+  };
+
+  const applyHandle = (start: CropRect, mode: CropHandle | 'draw', px: number, py: number, maxW: number, maxH: number): CropRect => {
+    if (mode === 'draw') {
+      return clampCrop({
+        x: Math.min(start.x, px),
+        y: Math.min(start.y, py),
+        w: Math.abs(px - start.x) + 1,
+        h: Math.abs(py - start.y) + 1,
+      }, maxW, maxH);
+    }
+    let x1 = start.x;
+    let y1 = start.y;
+    let x2 = start.x + start.w - 1;
+    let y2 = start.y + start.h - 1;
+    if (mode === 'move') {
+      const dx = px - adjustRef.current!.startPx;
+      const dy = py - adjustRef.current!.startPy;
+      const nx = Math.max(0, Math.min(maxW - start.w, start.x + dx));
+      const ny = Math.max(0, Math.min(maxH - start.h, start.y + dy));
+      return { x: nx, y: ny, w: start.w, h: start.h };
+    }
+    if (mode.includes('w')) x1 = px;
+    if (mode.includes('e')) x2 = px;
+    if (mode.includes('n')) y1 = py;
+    if (mode.includes('s')) y2 = py;
+    return clampCrop({ x: x1, y: y1, w: x2 - x1 + 1, h: y2 - y1 + 1 }, maxW, maxH);
+  };
+
+  const beginAdjust = (mode: CropHandle | 'draw', clientX: number, clientY: number, startRect: CropRect) => {
+    const p = sourceCoordsFromClient(clientX, clientY);
+    adjustRef.current = { mode, startPx: p.x, startPy: p.y, startRect };
+    setDraft(startRect);
+    setAdjusting(true);
+  };
+
+  const onSelectDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!source) return;
+    const p = sourceCoordsFromClient(e.clientX, e.clientY);
+    if (crop && p.x >= crop.x && p.x < crop.x + crop.w && p.y >= crop.y && p.y < crop.y + crop.h) {
+      beginAdjust('move', e.clientX, e.clientY, crop);
+      return;
+    }
+    beginAdjust('draw', e.clientX, e.clientY, { x: p.x, y: p.y, w: 1, h: 1 });
+  };
+
+  const onHandleDown = (mode: CropHandle, e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!crop) return;
+    beginAdjust(mode, e.clientX, e.clientY, crop);
+  };
+
+  useEffect(() => {
+    if (!adjusting || !source) return;
+    const onMove = (e: MouseEvent) => {
+      const adj = adjustRef.current;
+      if (!adj) return;
+      const p = sourceCoordsFromClient(e.clientX, e.clientY);
+      setDraft(applyHandle(adj.startRect, adj.mode, p.x, p.y, source.img.width, source.img.height));
+    };
+    const onUp = (e: MouseEvent) => {
+      const adj = adjustRef.current;
+      adjustRef.current = null;
+      setAdjusting(false);
+      if (!adj) {
+        setDraft(null);
+        return;
+      }
+      const p = sourceCoordsFromClient(e.clientX, e.clientY);
+      const next = applyHandle(adj.startRect, adj.mode, p.x, p.y, source.img.width, source.img.height);
+      setCrop(next);
+      rebuildCrop(next);
+      setDraft(null);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [adjusting, source, zoom]);
+
+  const goPlace = () => {
+    if (!crop) return;
+    setDestPos({
+      x: Math.max(0, Math.min(sprite.img.width - crop.w, crop.x)),
+      y: Math.max(0, Math.min(sprite.img.height - crop.h, crop.y)),
+    });
+    setPhase('place');
+  };
+
+  const onPlaceDown = (e: React.MouseEvent) => {
+    if (!crop) return;
+    const canvas = destCanvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const mx = (e.clientX - rect.left) / zoom;
+    const my = (e.clientY - rect.top) / zoom;
+    const inside =
+      mx >= destPos.x && mx < destPos.x + crop.w &&
+      my >= destPos.y && my < destPos.y + crop.h;
+    if (!inside) {
+      setDestPos({
+        x: Math.round(mx - crop.w / 2),
+        y: Math.round(my - crop.h / 2),
+      });
+      placeDragRef.current = { mx, my, ox: Math.round(mx - crop.w / 2), oy: Math.round(my - crop.h / 2) };
+      return;
+    }
+    placeDragRef.current = { mx, my, ox: destPos.x, oy: destPos.y };
+  };
+
+  const onPlaceMove = (e: React.MouseEvent) => {
+    if (!placeDragRef.current || !crop) return;
+    const canvas = destCanvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const mx = (e.clientX - rect.left) / zoom;
+    const my = (e.clientY - rect.top) / zoom;
+    setDestPos({
+      x: Math.round(placeDragRef.current.ox + (mx - placeDragRef.current.mx)),
+      y: Math.round(placeDragRef.current.oy + (my - placeDragRef.current.my)),
+    });
+  };
+
+  const onPlaceUp = () => {
+    placeDragRef.current = null;
+  };
+
+  const pushHistory = () => {
+    const canvas = destCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    const snapshot = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const next = [...historyRef.current, snapshot];
+    if (next.length > 40) next.shift();
+    historyRef.current = next;
+    setHistoryLen(next.length);
+  };
+
+  const undo = () => {
+    if (historyRef.current.length === 0) return;
+    const snapshot = historyRef.current[historyRef.current.length - 1];
+    historyRef.current = historyRef.current.slice(0, -1);
+    setHistoryLen(historyRef.current.length);
+    const canvas = destCanvasRef.current;
+    if (!canvas) return;
+    canvas.getContext('2d', { willReadFrequently: true })!.putImageData(snapshot, 0, 0);
+  };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        undo();
+        return;
+      }
+      if (phase !== 'place' || !crop) return;
+      const step = e.shiftKey ? 10 : 1;
+      if (e.key === 'ArrowLeft') { e.preventDefault(); setDestPos((p) => ({ ...p, x: p.x - step })); }
+      if (e.key === 'ArrowRight') { e.preventDefault(); setDestPos((p) => ({ ...p, x: p.x + step })); }
+      if (e.key === 'ArrowUp') { e.preventDefault(); setDestPos((p) => ({ ...p, y: p.y - step })); }
+      if (e.key === 'ArrowDown') { e.preventDefault(); setDestPos((p) => ({ ...p, y: p.y + step })); }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [phase, crop]);
+
+  const stampCrop = () => {
+    const canvas = destCanvasRef.current;
+    const cropCanvas = cropCanvasRef.current;
+    if (!canvas || !cropCanvas || !crop) return;
+    pushHistory();
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    ctx.imageSmoothingEnabled = false;
+    if (includeEmpty) {
+      ctx.clearRect(destPos.x, destPos.y, crop.w, crop.h);
+    }
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(cropCanvas, destPos.x, destPos.y);
+  };
+
+  const handleReset = () => {
+    const canvas = destCanvasRef.current;
+    if (!canvas) return;
+    pushHistory();
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(sprite.img, 0, 0);
+  };
+
+  const handleSave = () => {
+    const canvas = destCanvasRef.current;
+    if (!canvas) return;
+    const newImg = new Image();
+    newImg.onload = () => onSave(sprite.id, newImg);
+    newImg.src = canvas.toDataURL('image/png');
+  };
+
+  const shownRect = draft || crop;
+
+  const picker = (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '1080px', height: 'auto', maxHeight: '92vh' }}>
+        <div className="modal-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <Crop size={18} color="var(--accent)" />
+            <h3 style={{ fontSize: '1rem' }}>Copiar recorte en: {sprite.name}</h3>
+          </div>
+          <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
+        </div>
+        <div style={{ padding: '16px 20px', overflow: 'auto' }}>
+          <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '14px', lineHeight: 1.45 }}>
+            Elegí el sprite fuente. Después marcás un rectángulo exacto y lo colocás donde quieras sobre <strong>{sprite.name}</strong>.
+          </p>
+          {others.length === 0 ? (
+            <div className="empty-msg">Cargá al menos otro sprite para usarlo como fuente.</div>
+          ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: '10px' }}>
+              {others.map((s) => (
+                <button
+                  key={s.id}
+                  type="button"
+                  className="btn btn-outline"
+                  onClick={() => {
+                    setSourceId(s.id);
+                    setPhase('select');
+                    setCrop(null);
+                    setDraft(null);
+                    setCropPreview(null);
+                    cropCanvasRef.current = null;
+                  }}
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    gap: '8px',
+                    padding: '10px',
+                    height: 'auto',
+                    textAlign: 'center',
+                  }}
+                >
+                  <div className="checker-mini" style={{ width: '100%', height: '88px', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '4px', overflow: 'hidden' }}>
+                    <img src={s.img.src} alt="" style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', imageRendering: 'pixelated' }} />
+                  </div>
+                  <span style={{ fontSize: '0.7rem', wordBreak: 'break-all' }}>{s.name}</span>
+                  <span style={{ fontSize: '0.6rem', color: 'var(--text-muted)' }}>{s.img.width}×{s.img.height}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
+  if (!source) return picker;
+
+  const viewImg = phase === 'select' ? source.img : sprite.img;
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+            <Crop size={18} color="var(--accent)" />
+            <h3 style={{ fontSize: '1rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              Copiar recorte: {sprite.name}
+            </h3>
+            <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', flexShrink: 0 }}>
+              {phase === 'select' ? `← recortar ${source.name}` : `colocar en ${sprite.name}`}
+            </span>
+          </div>
+          <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
+        </div>
+        <div
+          ref={workspaceRef}
+          className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`}
+          style={{ overflow: 'auto' }}
+          onScroll={onWorkspaceScroll}
+        >
+          <div style={{
+            width: viewImg.width * zoom,
+            height: viewImg.height * zoom,
+            margin: 'auto',
+            position: 'relative',
+          }}>
+            <div style={{
+              position: 'absolute',
+              left: 0,
+              top: 0,
+              width: viewImg.width,
+              height: viewImg.height,
+              transform: `scale(${zoom})`,
+              transformOrigin: 'top left',
+              cursor: phase === 'select' ? 'crosshair' : 'grab',
+            }}>
+              <canvas
+                ref={sourceCanvasRef}
+                onMouseDown={onSelectDown}
+                style={{ display: phase === 'select' ? 'block' : 'none' }}
+              />
+              <canvas
+                ref={destCanvasRef}
+                onMouseDown={onPlaceDown}
+                onMouseMove={onPlaceMove}
+                onMouseUp={onPlaceUp}
+                onMouseLeave={onPlaceUp}
+                style={{ display: phase === 'place' ? 'block' : 'none' }}
+              />
+              {phase === 'select' && shownRect && (() => {
+                const hs = Math.max(2, 8 / zoom);
+                const edge = Math.max(2, 6 / zoom);
+                const handleStyle = (extra: React.CSSProperties): React.CSSProperties => ({
+                  position: 'absolute',
+                  background: '#6b66ff',
+                  boxShadow: '0 0 0 1px #fff',
+                  pointerEvents: 'auto',
+                  zIndex: 2,
+                  ...extra,
+                });
+                return (
+                  <div style={{
+                    position: 'absolute',
+                    left: shownRect.x,
+                    top: shownRect.y,
+                    width: shownRect.w,
+                    height: shownRect.h,
+                    border: '1px solid #6b66ff',
+                    boxShadow: '0 0 0 9999px rgba(0,0,0,0.35)',
+                    pointerEvents: 'none',
+                    imageRendering: 'pixelated',
+                  }}>
+                    <div onMouseDown={(e) => onHandleDown('n', e)} style={handleStyle({ left: hs, right: hs, top: -edge / 2, height: edge, cursor: 'ns-resize' })} />
+                    <div onMouseDown={(e) => onHandleDown('s', e)} style={handleStyle({ left: hs, right: hs, bottom: -edge / 2, height: edge, cursor: 'ns-resize' })} />
+                    <div onMouseDown={(e) => onHandleDown('w', e)} style={handleStyle({ top: hs, bottom: hs, left: -edge / 2, width: edge, cursor: 'ew-resize' })} />
+                    <div onMouseDown={(e) => onHandleDown('e', e)} style={handleStyle({ top: hs, bottom: hs, right: -edge / 2, width: edge, cursor: 'ew-resize' })} />
+                    <div onMouseDown={(e) => onHandleDown('nw', e)} style={handleStyle({ left: -hs / 2, top: -hs / 2, width: hs, height: hs, cursor: 'nwse-resize' })} />
+                    <div onMouseDown={(e) => onHandleDown('ne', e)} style={handleStyle({ right: -hs / 2, top: -hs / 2, width: hs, height: hs, cursor: 'nesw-resize' })} />
+                    <div onMouseDown={(e) => onHandleDown('sw', e)} style={handleStyle({ left: -hs / 2, bottom: -hs / 2, width: hs, height: hs, cursor: 'nesw-resize' })} />
+                    <div onMouseDown={(e) => onHandleDown('se', e)} style={handleStyle({ right: -hs / 2, bottom: -hs / 2, width: hs, height: hs, cursor: 'nwse-resize' })} />
+                  </div>
+                );
+              })()}
+              {phase === 'place' && crop && (
+                <div style={{
+                  position: 'absolute',
+                  left: destPos.x,
+                  top: destPos.y,
+                  width: crop.w,
+                  height: crop.h,
+                  outline: '1px solid #6b66ff',
+                  outlineOffset: 0,
+                  pointerEvents: 'none',
+                  imageRendering: 'pixelated',
+                }}>
+                  {cropPreview && !hidePreview && previewOpacity > 0 && (
+                    <img
+                      src={cropPreview}
+                      alt=""
+                      draggable={false}
+                      style={{
+                        width: '100%',
+                        height: '100%',
+                        imageRendering: 'pixelated',
+                        opacity: previewOpacity / 100,
+                        display: 'block',
+                      }}
+                    />
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+        <div className="modal-footer" style={{ flexDirection: 'column', alignItems: 'stretch', gap: '10px' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '8px 12px' }}>
+            <button className="btn btn-outline" onClick={() => { setSourceId(null); setPhase('select'); }}>
+              Cambiar fuente
+            </button>
+            {phase === 'place' && (
+              <button className="btn btn-outline" onClick={() => setPhase('select')}>
+                Volver a recortar
+              </button>
+            )}
+            {shownRect && (
+              <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                {phase === 'select'
+                  ? `Recorte ${shownRect.w}×${shownRect.h} en (${shownRect.x}, ${shownRect.y}) · Arrastrá los lados para ajustar`
+                  : crop
+                    ? `Pegar ${crop.w}×${crop.h} en (${destPos.x}, ${destPos.y})`
+                    : ''}
+              </span>
+            )}
+            {phase === 'place' && (
+              <>
+                <label
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                    fontSize: '0.75rem',
+                    color: includeEmpty ? 'var(--accent)' : 'var(--text-light)',
+                    cursor: 'pointer',
+                    userSelect: 'none',
+                    whiteSpace: 'nowrap',
+                  }}
+                  title="Si está activo, el recorte también pisa con los píxeles vacíos de la fuente"
+                >
+                  <input
+                    type="checkbox"
+                    checked={includeEmpty}
+                    onChange={(e) => setIncludeEmpty(e.target.checked)}
+                    style={{ cursor: 'pointer' }}
+                  />
+                  Pegar vacío
+                </label>
+                <label
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                    fontSize: '0.75rem',
+                    color: hidePreview ? 'var(--accent)' : 'var(--text-light)',
+                    cursor: 'pointer',
+                    userSelect: 'none',
+                    whiteSpace: 'nowrap',
+                  }}
+                  title="Oculta el recorte y deja solo el marco, para ver el destino"
+                >
+                  <input
+                    type="checkbox"
+                    checked={hidePreview}
+                    onChange={(e) => setHidePreview(e.target.checked)}
+                    style={{ cursor: 'pointer' }}
+                  />
+                  Ocultar recorte
+                </label>
+              </>
+            )}
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '10px 12px' }}>
+            <div className="slider-item" style={{ flex: 1, marginBottom: 0, minWidth: '140px' }}>
+              <div className="slider-label">
+                <span><Search size={14} /> Zoom</span>
+                <span>{zoom.toFixed(1)}x</span>
+              </div>
+              <input type="range" min="0.5" max="8" step="0.1" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
+            </div>
+            {phase === 'place' && !hidePreview && (
+              <div className="slider-item" style={{ flex: 1, marginBottom: 0, minWidth: '140px' }}>
+                <div className="slider-label">
+                  <span>Vista previa</span>
+                  <span>{previewOpacity}%</span>
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  value={previewOpacity}
+                  onChange={(e) => setPreviewOpacity(parseInt(e.target.value, 10))}
+                  title="Transparencia de lo que vas a pegar"
+                />
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: '8px', marginLeft: 'auto', flexWrap: 'wrap' }}>
+              {phase === 'select' ? (
+                <button className="btn btn-primary" disabled={!crop} onClick={goPlace}>
+                  Colocar recorte
+                </button>
+              ) : (
+                <>
+                  <button className="btn btn-outline" onClick={undo} disabled={historyLen === 0} title="Ctrl+Z">
+                    <RotateCcw size={16} /> Deshacer
+                  </button>
+                  <button className="btn btn-outline" onClick={handleReset}>Reiniciar</button>
+                  <button className="btn btn-outline" onClick={stampCrop} disabled={!crop} title="Pega el recorte en la posición actual (flechas para mover 1 px)">
+                    Pegar
+                  </button>
+                  <button className="btn btn-primary" onClick={handleSave}>Guardar Cambios</button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // --- Transform Modal Component ---
 interface TransformModalProps {
   sprite: SpriteData;
@@ -515,7 +3738,8 @@ const TransformModal: React.FC<TransformModalProps> = ({ sprite, onSave, onClose
   const [rotation, setRotation] = useState(sprite.rotation || 0);
   const [offsetX, setOffsetX] = useState(sprite.offsetX || 0);
   const [offsetY, setOffsetY] = useState(sprite.offsetY || 0);
-  const [zoom, setZoom] = useState(1);
+  const [zoom, setZoom] = useState(() => clampNum(loadPref('joa-transform-zoom', 1), 0.5, 8, 1));
+  useModalWheelControls({ zoom, setZoom });
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   
@@ -541,6 +3765,10 @@ const TransformModal: React.FC<TransformModalProps> = ({ sprite, onSave, onClose
     ctx.drawImage(sprite.img, -sw/2, -sh/2, sw, sh);
     ctx.restore();
   }, [sprite, rotation, offsetX, offsetY, zoom]);
+
+  useEffect(() => {
+    savePref('joa-transform-zoom', zoom);
+  }, [zoom]);
 
   const handleMouseDown = (e: React.MouseEvent) => {
     setIsDragging(true);
@@ -605,7 +3833,8 @@ interface StretchModalProps {
 const StretchModal: React.FC<StretchModalProps> = ({ sprite, onSave, onClose, isWhiteBg }) => {
   const [stretchX, setStretchX] = useState(sprite.stretchX || 1);
   const [stretchY, setStretchY] = useState(sprite.stretchY || 1);
-  const [zoom, setZoom] = useState(1);
+  const [zoom, setZoom] = useState(() => clampNum(loadPref('joa-stretch-zoom', 1), 0.5, 8, 1));
+  useModalWheelControls({ zoom, setZoom });
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -630,6 +3859,10 @@ const StretchModal: React.FC<StretchModalProps> = ({ sprite, onSave, onClose, is
     ctx.restore();
   }, [sprite, stretchX, stretchY, zoom]);
 
+  useEffect(() => {
+    savePref('joa-stretch-zoom', zoom);
+  }, [zoom]);
+
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal-content" onClick={e => e.stopPropagation()}>
@@ -646,11 +3879,11 @@ const StretchModal: React.FC<StretchModalProps> = ({ sprite, onSave, onClose, is
         <div className="modal-footer" style={{ padding: '20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '24px' }}>
           <div className="slider-item" style={{ flex: 1, marginBottom: 0 }}>
             <div className="slider-label"><span>Ancho (X)</span><span>{stretchX.toFixed(2)}x</span></div>
-            <input type="range" min="0.1" max="4" step="0.05" value={stretchX} onChange={(e) => setStretchX(parseFloat(e.target.value))} />
+            <input type="range" min="0.1" max="4" step="0.01" value={stretchX} onChange={(e) => setStretchX(parseFloat(e.target.value))} />
           </div>
           <div className="slider-item" style={{ flex: 1, marginBottom: 0 }}>
             <div className="slider-label"><span>Alto (Y)</span><span>{stretchY.toFixed(2)}x</span></div>
-            <input type="range" min="0.1" max="4" step="0.05" value={stretchY} onChange={(e) => setStretchY(parseFloat(e.target.value))} />
+            <input type="range" min="0.1" max="4" step="0.01" value={stretchY} onChange={(e) => setStretchY(parseFloat(e.target.value))} />
           </div>
           <div className="slider-item" style={{ width: '120px', marginBottom: 0 }}>
             <div className="slider-label"><span>Zoom</span><span>{zoom.toFixed(1)}x</span></div>
@@ -659,6 +3892,318 @@ const StretchModal: React.FC<StretchModalProps> = ({ sprite, onSave, onClose, is
           <div style={{ display: 'flex', gap: '12px' }}>
             <button className="btn btn-outline" onClick={() => { setStretchX(1); setStretchY(1); }}>Reset</button>
             <button className="btn btn-primary" style={{ paddingLeft: '24px', paddingRight: '24px' }} onClick={() => onSave(sprite.id, { stretchX, stretchY })}>Guardar Cambios</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- Effect Mask Modal Component ---
+interface EffectMaskSaveData {
+  mode: 'rect' | 'brush';
+  masks: Region[];
+  brush: string | null;
+}
+
+interface EffectMaskModalProps {
+  sprite: SpriteData;
+  onSave: (id: string, data: EffectMaskSaveData) => void;
+  onClose: () => void;
+  isWhiteBg?: boolean;
+}
+
+const EffectMaskModal: React.FC<EffectMaskModalProps> = ({ sprite, onSave, onClose, isWhiteBg }) => {
+  const [toolMode, setToolMode] = useState<'rect' | 'brush'>(
+    sprite.effectMaskMode || (sprite.effectMaskBrush ? 'brush' : 'rect')
+  );
+  const [masks, setMasks] = useState<Region[]>(sprite.effectMasks || []);
+  const [brushSize, setBrushSize] = useState(() => Math.round(clampNum(loadPref('joa-effect-mask-brush', 16), 2, 64, 16)));
+  const [zoom, setZoom] = useState(() => clampNum(loadPref('joa-effect-mask-zoom', 1), 0.5, 8, 1));
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const maskCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  useModalWheelControls({ zoom, setZoom, brushSize, setBrushSize, brushMin: 2, brushMax: 64, workspaceRef });
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [startPoint, setStartPoint] = useState<{ x: number; y: number } | null>(null);
+  const [currentRect, setCurrentRect] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+  const [lastBrushPoint, setLastBrushPoint] = useState<{ x: number; y: number } | null>(null);
+  const [brushTick, setBrushTick] = useState(0);
+
+  useEffect(() => {
+    if (!maskCanvasRef.current) {
+      maskCanvasRef.current = document.createElement('canvas');
+    }
+    const maskCanvas = maskCanvasRef.current;
+    maskCanvas.width = sprite.img.width;
+    maskCanvas.height = sprite.img.height;
+    const mctx = maskCanvas.getContext('2d')!;
+    mctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+    if (sprite.effectMaskBrush) {
+      const img = new Image();
+      img.onload = () => {
+        mctx.drawImage(img, 0, 0);
+        setBrushTick(t => t + 1);
+      };
+      img.src = sprite.effectMaskBrush;
+    }
+  }, [sprite.id, sprite.effectMaskBrush, sprite.img.width, sprite.img.height]);
+
+  useEffect(() => {
+    savePref('joa-effect-mask-zoom', zoom);
+    savePref('joa-effect-mask-brush', brushSize);
+  }, [zoom, brushSize]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const maskCanvas = maskCanvasRef.current;
+    if (!canvas || !maskCanvas) return;
+    const ctx = canvas.getContext('2d')!;
+    canvas.width = sprite.img.width;
+    canvas.height = sprite.img.height;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(sprite.img, 0, 0);
+
+    if (toolMode === 'rect') {
+      masks.forEach((m, idx) => {
+        ctx.strokeStyle = '#6b66ff';
+        ctx.lineWidth = 2 / zoom;
+        ctx.strokeRect(m.x, m.y, m.w, m.h);
+        ctx.fillStyle = 'rgba(107, 102, 255, 0.2)';
+        ctx.fillRect(m.x, m.y, m.w, m.h);
+        ctx.fillStyle = '#6b66ff';
+        ctx.font = `${Math.max(10, 12 / zoom)}px sans-serif`;
+        ctx.fillText(`${idx + 1}`, m.x + 4, m.y + 14 / zoom);
+      });
+      if (currentRect) {
+        ctx.strokeStyle = '#00ffcc';
+        ctx.setLineDash([5 / zoom, 5 / zoom]);
+        ctx.strokeRect(currentRect.x, currentRect.y, currentRect.w, currentRect.h);
+        ctx.setLineDash([]);
+      }
+    } else {
+      ctx.save();
+      ctx.globalAlpha = 0.35;
+      ctx.drawImage(maskCanvas, 0, 0);
+      ctx.restore();
+      ctx.strokeStyle = '#6b66ff';
+      ctx.lineWidth = 1 / zoom;
+      ctx.strokeRect(0, 0, canvas.width, canvas.height);
+    }
+  }, [sprite, masks, zoom, currentRect, toolMode, brushTick]);
+
+  const getCanvasCoords = (e: React.MouseEvent) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return { x: 0, y: 0 };
+    const rect = canvas.getBoundingClientRect();
+    const x = Math.floor((e.clientX - rect.left) * (canvas.width / rect.width));
+    const y = Math.floor((e.clientY - rect.top) * (canvas.height / rect.height));
+    return { x: Math.max(0, Math.min(canvas.width - 1, x)), y: Math.max(0, Math.min(canvas.height - 1, y)) };
+  };
+
+  const paintBrushStroke = (from: { x: number; y: number }, to: { x: number; y: number }) => {
+    const mctx = maskCanvasRef.current!.getContext('2d')!;
+    mctx.strokeStyle = '#ffffff';
+    mctx.fillStyle = '#ffffff';
+    mctx.lineWidth = brushSize;
+    mctx.lineCap = 'round';
+    mctx.lineJoin = 'round';
+    mctx.beginPath();
+    mctx.moveTo(from.x, from.y);
+    mctx.lineTo(to.x, to.y);
+    mctx.stroke();
+    mctx.beginPath();
+    mctx.arc(to.x, to.y, brushSize / 2, 0, Math.PI * 2);
+    mctx.fill();
+    setBrushTick(t => t + 1);
+  };
+
+  const paintBrushDot = (coords: { x: number; y: number }) => {
+    const mctx = maskCanvasRef.current!.getContext('2d')!;
+    mctx.fillStyle = '#ffffff';
+    mctx.beginPath();
+    mctx.arc(coords.x, coords.y, brushSize / 2, 0, Math.PI * 2);
+    mctx.fill();
+    setBrushTick(t => t + 1);
+  };
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    const coords = getCanvasCoords(e);
+    setIsDrawing(true);
+    if (toolMode === 'rect') {
+      setStartPoint(coords);
+      setCurrentRect(null);
+    } else {
+      setLastBrushPoint(coords);
+      paintBrushDot(coords);
+    }
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!isDrawing) return;
+    const coords = getCanvasCoords(e);
+    if (toolMode === 'rect' && startPoint) {
+      setCurrentRect({
+        x: Math.min(startPoint.x, coords.x),
+        y: Math.min(startPoint.y, coords.y),
+        w: Math.abs(coords.x - startPoint.x),
+        h: Math.abs(coords.y - startPoint.y),
+      });
+    } else if (toolMode === 'brush' && lastBrushPoint) {
+      paintBrushStroke(lastBrushPoint, coords);
+      setLastBrushPoint(coords);
+    }
+  };
+
+  const handleMouseUp = (e: React.MouseEvent) => {
+    if (toolMode === 'rect' && isDrawing && startPoint) {
+      const coords = getCanvasCoords(e);
+      const finalRect = {
+        x: Math.min(startPoint.x, coords.x),
+        y: Math.min(startPoint.y, coords.y),
+        w: Math.abs(coords.x - startPoint.x),
+        h: Math.abs(coords.y - startPoint.y),
+      };
+      if (finalRect.w > 2 && finalRect.h > 2) {
+        setMasks(prev => [...prev, {
+          id: generateId(),
+          label: `Área ${prev.length + 1}`,
+          ...finalRect,
+        }]);
+      }
+    }
+    setIsDrawing(false);
+    setStartPoint(null);
+    setCurrentRect(null);
+    setLastBrushPoint(null);
+  };
+
+  const deleteMask = (id: string) => setMasks(prev => prev.filter(m => m.id !== id));
+
+  const clearAll = () => {
+    if (toolMode === 'rect') {
+      setMasks([]);
+    } else {
+      const mctx = maskCanvasRef.current!.getContext('2d')!;
+      mctx.clearRect(0, 0, maskCanvasRef.current!.width, maskCanvasRef.current!.height);
+      setBrushTick(t => t + 1);
+    }
+  };
+
+  const handleSave = () => {
+    if (toolMode === 'rect') {
+      onSave(sprite.id, { mode: 'rect', masks, brush: null });
+    } else {
+      const brush = maskCanvasRef.current!.toDataURL('image/png');
+      onSave(sprite.id, { mode: 'brush', masks: [], brush });
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content tagging-modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <Crop size={18} color="var(--accent)" />
+            <h3 style={{ fontSize: '1rem' }}>Áreas de Efecto: {sprite.name}</h3>
+          </div>
+          <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
+        </div>
+        <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+          <div className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`} ref={workspaceRef} style={{ flex: 1, overflow: 'auto' }}>
+            <div style={{
+              width: sprite.img.width * zoom,
+              height: sprite.img.height * zoom,
+              margin: 'auto',
+              position: 'relative',
+            }}>
+              <div style={{
+                position: 'absolute',
+                left: 0,
+                top: 0,
+                cursor: toolMode === 'brush' ? 'crosshair' : 'crosshair',
+                width: sprite.img.width,
+                height: sprite.img.height,
+                transform: `scale(${zoom})`,
+                transformOrigin: 'top left',
+              }}>
+              <canvas
+                ref={canvasRef}
+                onMouseDown={handleMouseDown}
+                onMouseMove={handleMouseMove}
+                onMouseUp={handleMouseUp}
+                onMouseLeave={handleMouseUp}
+              />
+              </div>
+            </div>
+            <div style={{ position: 'sticky', bottom: '20px', left: '50%', transform: 'translateX(-50%)', background: 'rgba(0,0,0,0.7)', padding: '8px 16px', borderRadius: '20px', fontSize: '0.7rem', color: 'white', pointerEvents: 'none', width: 'max-content', margin: '12px auto 0' }}>
+              {toolMode === 'rect'
+                ? 'Arrastra para añadir rectángulos. Los ajustes del panel solo afectan las zonas marcadas.'
+                : 'Pinta sobre la imagen con el pincel. Ajusta el grosor en la barra inferior.'}
+            </div>
+          </div>
+          <div className="tagging-sidebar" style={{ minWidth: '260px' }}>
+            <div className="sidebar-section">
+              <span className="section-title">Forma de Selección</span>
+              <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+                <button
+                  className={`btn btn-outline ${toolMode === 'rect' ? 'active' : ''}`}
+                  style={{ flex: 1, justifyContent: 'center', fontSize: '0.65rem', borderColor: toolMode === 'rect' ? 'var(--accent)' : undefined, color: toolMode === 'rect' ? 'var(--accent)' : undefined }}
+                  onClick={() => setToolMode('rect')}
+                >
+                  <Square size={14} /> Rectángulo
+                </button>
+                <button
+                  className={`btn btn-outline ${toolMode === 'brush' ? 'active' : ''}`}
+                  style={{ flex: 1, justifyContent: 'center', fontSize: '0.65rem', borderColor: toolMode === 'brush' ? 'var(--accent)' : undefined, color: toolMode === 'brush' ? 'var(--accent)' : undefined }}
+                  onClick={() => setToolMode('brush')}
+                >
+                  <Brush size={14} /> Pincel
+                </button>
+              </div>
+            </div>
+            {toolMode === 'rect' ? (
+              <div className="sidebar-section">
+                <span className="section-title">Áreas Activas ({masks.length})</span>
+                <div className="region-list">
+                  {masks.map((m, idx) => (
+                    <div key={m.id} className="region-item">
+                      <div className="region-info">
+                        <span className="region-label">Área {idx + 1}</span>
+                        <span className="region-coords">{m.x},{m.y} {m.w}×{m.h}</span>
+                      </div>
+                      <button className="btn-ghost btn-danger" onClick={() => deleteMask(m.id)}><Trash2 size={12} /></button>
+                    </div>
+                  ))}
+                  {masks.length === 0 && (
+                    <div className="empty-msg">Arrastra sobre la imagen para crear la primera área</div>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="sidebar-section">
+                <span className="section-title">Pincel</span>
+                <p style={{ fontSize: '0.65rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>
+                  Pinta libremente la zona donde quieres aplicar efectos. Usa <strong>Limpiar Todo</strong> para borrar el trazo.
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="modal-footer" style={{ padding: '16px 20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '16px', flexWrap: 'wrap' }}>
+          <div className="slider-item" style={{ flex: 1, minWidth: '140px', marginBottom: 0 }}>
+            <div className="slider-label"><span><Search size={14} /> Zoom</span><span>{zoom.toFixed(1)}x</span></div>
+            <input type="range" min="0.5" max="8" step="0.1" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
+          </div>
+          {toolMode === 'brush' && (
+            <div className="slider-item" style={{ flex: 1, minWidth: '140px', marginBottom: 0 }}>
+              <div className="slider-label"><span><Brush size={14} /> Grosor</span><span>{brushSize}px</span></div>
+              <input type="range" min="2" max="64" step="1" value={brushSize} onChange={(e) => setBrushSize(parseInt(e.target.value))} />
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: '12px', marginLeft: 'auto' }}>
+            <button className="btn btn-outline" onClick={clearAll}>Limpiar Todo</button>
+            <button className="btn btn-primary" style={{ paddingLeft: '24px', paddingRight: '24px' }} onClick={handleSave}>Guardar Áreas</button>
           </div>
         </div>
       </div>
@@ -676,13 +4221,14 @@ interface TaggingModalProps {
 
 const TaggingModal: React.FC<TaggingModalProps> = ({ sprite, onSave, onClose, isWhiteBg }) => {
   const [regions, setRegions] = useState<Region[]>(sprite.regions || []);
-  const [zoom, setZoom] = useState(1);
+  const [zoom, setZoom] = useState(() => clampNum(loadPref('joa-tagging-zoom', 1), 0.5, 8, 1));
   const [isDrawing, setIsDrawing] = useState(false);
   const [startPoint, setStartPoint] = useState<{ x: number, y: number } | null>(null);
   const [currentRect, setCurrentRect] = useState<{ x: number, y: number, w: number, h: number } | null>(null);
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const workspaceRef = useRef<HTMLDivElement>(null);
+  useModalWheelControls({ zoom, setZoom, workspaceRef });
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -710,6 +4256,10 @@ const TaggingModal: React.FC<TaggingModalProps> = ({ sprite, onSave, onClose, is
       ctx.setLineDash([]);
     }
   }, [sprite, regions, zoom, currentRect]);
+
+  useEffect(() => {
+    savePref('joa-tagging-zoom', zoom);
+  }, [zoom]);
 
   const getCanvasCoords = (e: React.MouseEvent) => {
     const canvas = canvasRef.current;
@@ -776,21 +4326,29 @@ const TaggingModal: React.FC<TaggingModalProps> = ({ sprite, onSave, onClose, is
         
         <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
           <div className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`} ref={workspaceRef} style={{ flex: 1, overflow: 'auto' }}>
-            <div style={{ 
-              position: 'relative', 
-              cursor: 'crosshair',
-              width: 'fit-content',
-              height: 'fit-content',
+            <div style={{
+              width: sprite.img.width * zoom,
+              height: sprite.img.height * zoom,
               margin: 'auto',
-              transform: `scale(${zoom})`,
-              transformOrigin: 'center center'
+              position: 'relative',
             }}>
+              <div style={{
+                position: 'absolute',
+                left: 0,
+                top: 0,
+                cursor: 'crosshair',
+                width: sprite.img.width,
+                height: sprite.img.height,
+                transform: `scale(${zoom})`,
+                transformOrigin: 'top left',
+              }}>
               <canvas 
                 ref={canvasRef}
                 onMouseDown={handleMouseDown}
                 onMouseMove={handleMouseMove}
                 onMouseUp={handleMouseUp}
               />
+              </div>
             </div>
           </div>
 
@@ -839,6 +4397,398 @@ const TaggingModal: React.FC<TaggingModalProps> = ({ sprite, onSave, onClose, is
   );
 };
 
+// --- Bucket Modal Component ---
+interface BucketModalProps {
+  sprite: SpriteData;
+  onSave: (id: string, img: HTMLImageElement) => void;
+  onClose: () => void;
+  isWhiteBg?: boolean;
+}
+
+type BucketMode = 'global' | 'contiguous' | 'precise';
+
+type BucketPrefs = {
+  zoom: number;
+  replaceColor: string;
+  mode: BucketMode;
+  tolerance: number;
+};
+
+const BUCKET_PREFS_KEY = 'joa-bucket-prefs';
+
+const loadBucketPrefs = (): BucketPrefs => {
+  const saved = loadPref<Partial<BucketPrefs>>(BUCKET_PREFS_KEY, {});
+  const mode: BucketMode =
+    saved.mode === 'precise' || saved.mode === 'contiguous' || saved.mode === 'global'
+      ? saved.mode
+      : 'global';
+  return {
+    zoom: clampNum(saved.zoom, 0.5, 8, 1),
+    replaceColor: normalizeHexColor(saved.replaceColor, loadLastColor('#00ff00')) || '#00ff00',
+    mode,
+    tolerance: Math.round(clampNum(saved.tolerance, 0, 255, 0)),
+  };
+};
+
+const BucketModal: React.FC<BucketModalProps> = ({ sprite, onSave, onClose, isWhiteBg }) => {
+  const [zoom, setZoom] = useState(() => loadBucketPrefs().zoom);
+  const [replaceColor, setReplaceColor] = useState(() => loadBucketPrefs().replaceColor);
+  const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-bucket-scroll', sprite.name, [zoom]);
+  useModalWheelControls({ zoom, setZoom, workspaceRef });
+  const [mode, setMode] = useState<BucketMode>(() => loadBucketPrefs().mode);
+  const [tolerance, setTolerance] = useState(() => loadBucketPrefs().tolerance);
+  const [hoverColor, setHoverColor] = useState<number[] | null>(null);
+  const [history, setHistory] = useState<ImageData[]>([]);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.width = sprite.img.width;
+    canvas.height = sprite.img.height;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    ctx.drawImage(sprite.img, 0, 0);
+  }, [sprite]);
+
+  useEffect(() => {
+    savePref(BUCKET_PREFS_KEY, { zoom, replaceColor, mode, tolerance });
+    rememberLastColor(replaceColor);
+  }, [zoom, replaceColor, mode, tolerance]);
+
+  const hexToRgb = (hex: string) => {
+    const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+    return result ? { r: parseInt(result[1], 16), g: parseInt(result[2], 16), b: parseInt(result[3], 16) } : null;
+  };
+
+  const colorDist = (
+    r1: number, g1: number, b1: number, a1: number,
+    r2: number, g2: number, b2: number, a2: number,
+  ) => Math.max(
+    Math.abs(r1 - r2),
+    Math.abs(g1 - g2),
+    Math.abs(b1 - b2),
+    Math.abs(a1 - a2),
+  );
+
+  const commitChange = (newData: ImageData) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    const oldData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    setHistory(prev => {
+      const arr = [...prev, oldData];
+      if (arr.length > 20) arr.shift();
+      return arr;
+    });
+    ctx.putImageData(newData, 0, 0);
+  };
+
+  const undo = () => {
+    if (history.length === 0) return;
+    const prev = history[history.length - 1];
+    setHistory(h => h.slice(0, -1));
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+      ctx.putImageData(prev, 0, 0);
+    }
+  };
+
+  const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = Math.floor((e.clientX - rect.left) / zoom);
+    const y = Math.floor((e.clientY - rect.top) / zoom);
+    
+    if (x < 0 || x >= canvas.width || y < 0 || y >= canvas.height) return;
+
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    const targetData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const data = targetData.data;
+
+    const startIdx = (y * canvas.width + x) * 4;
+    const tr = data[startIdx];
+    const tg = data[startIdx+1];
+    const tb = data[startIdx+2];
+    const ta = data[startIdx+3];
+    
+    const repRGB = hexToRgb(replaceColor);
+    if (!repRGB) return;
+
+    if (tr === repRGB.r && tg === repRGB.g && tb === repRGB.b && ta === 255) return;
+
+    const matchTol = Math.max(tolerance, 4);
+    const EMPTY_A = 40;
+    const PAINT_A = 160;
+    const seedIsEmpty = ta < EMPTY_A;
+    const seedIsNearWhite = ta >= 200 && tr >= 242 && tg >= 242 && tb >= 242;
+    const seedIsHole = seedIsEmpty || seedIsNearWhite;
+
+    const distToSeedAt = (i: number) => {
+      if (seedIsEmpty && data[i + 3] < EMPTY_A) return 0;
+      return colorDist(data[i], data[i + 1], data[i + 2], data[i + 3], tr, tg, tb, ta);
+    };
+    const isMatchAt = (i: number) => {
+      const a = data[i + 3];
+      if (seedIsHole) {
+        // Hueco: el vacío cuenta aunque el clic haya sido en blanco opaco.
+        if (a < EMPTY_A) return true;
+        if (seedIsEmpty) return false;
+        return distToSeedAt(i) <= matchTol;
+      }
+      if (a < 8) return false;
+      return distToSeedAt(i) <= matchTol;
+    };
+
+    const paintAt = (i: number) => {
+      data[i] = repRGB.r;
+      data[i + 1] = repRGB.g;
+      data[i + 2] = repRGB.b;
+      data[i + 3] = 255;
+    };
+
+    if (mode === 'global') {
+      for (let i = 0; i < data.length; i += 4) {
+        if (isMatchAt(i)) paintAt(i);
+      }
+    } else {
+      const precise = mode === 'precise';
+      const w = canvas.width;
+      const h = canvas.height;
+      const visited = new Uint8Array(w * h);
+      const orthoOf = (pos: number) => {
+        const cx = pos % w;
+        const cy = (pos / w) | 0;
+        return [
+          cx > 0 ? pos - 1 : -1,
+          cx + 1 < w ? pos + 1 : -1,
+          cy > 0 ? pos - w : -1,
+          cy + 1 < h ? pos + w : -1,
+        ];
+      };
+
+      const stack = [y * w + x];
+      visited[y * w + x] = 1;
+
+      // 4-conectado: respeta contornos de pixel art.
+      while (stack.length > 0) {
+        const pos = stack.pop()!;
+        paintAt(pos * 4);
+        for (const np of orthoOf(pos)) {
+          if (np < 0 || visited[np]) continue;
+          if (!isMatchAt(np * 4)) continue;
+          visited[np] = 1;
+          stack.push(np);
+        }
+      }
+
+      if (seedIsHole) {
+        // Seguir por vacío / semi-vacío hasta tocar algo pintado (a >= PAINT_A).
+        const grow: number[] = [];
+        for (let p = 0; p < visited.length; p++) {
+          if (visited[p]) grow.push(p);
+        }
+        while (grow.length > 0) {
+          const pos = grow.pop()!;
+          for (const np of orthoOf(pos)) {
+            if (np < 0 || visited[np]) continue;
+            if (data[np * 4 + 3] >= PAINT_A) continue;
+            visited[np] = 1;
+            paintAt(np * 4);
+            grow.push(np);
+          }
+        }
+      } else {
+        // Recolor de pintura: solo come 1–2 px de vacío pegados al relleno y al dibujo.
+        for (let pass = 0; pass < 2; pass++) {
+          const extra: number[] = [];
+          for (let pos = 0; pos < visited.length; pos++) {
+            if (visited[pos]) continue;
+            if (data[pos * 4 + 3] >= EMPTY_A) continue;
+            let touchFill = false;
+            let touchPaint = false;
+            for (const np of orthoOf(pos)) {
+              if (np < 0) continue;
+              if (visited[np]) touchFill = true;
+              else if (data[np * 4 + 3] >= PAINT_A) touchPaint = true;
+            }
+            if (touchFill && touchPaint) extra.push(pos);
+          }
+          if (extra.length === 0) break;
+          for (const pos of extra) {
+            visited[pos] = 1;
+            paintAt(pos * 4);
+          }
+        }
+      }
+
+      if (precise) {
+        // Integra semitransparentes / blur hasta el primer píxel 100% opaco.
+        const grow: number[] = [];
+        for (let p = 0; p < visited.length; p++) {
+          if (visited[p]) grow.push(p);
+        }
+        while (grow.length > 0) {
+          const pos = grow.pop()!;
+          for (const np of orthoOf(pos)) {
+            if (np < 0 || visited[np]) continue;
+            if (data[np * 4 + 3] >= 255) continue;
+            visited[np] = 1;
+            paintAt(np * 4);
+            grow.push(np);
+          }
+        }
+      }
+    }
+    commitChange(targetData);
+  };
+
+  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = Math.floor((e.clientX - rect.left) / zoom);
+    const y = Math.floor((e.clientY - rect.top) / zoom);
+    
+    if (x < 0 || x >= canvas.width || y < 0 || y >= canvas.height) {
+      setHoverColor(null);
+      return;
+    }
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    const pixel = ctx.getImageData(x, y, 1, 1).data;
+    if (pixel[3] > 0) {
+      setHoverColor([pixel[0], pixel[1], pixel[2]]);
+    } else {
+      setHoverColor(null);
+    }
+  };
+
+  const handleCompile = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const newImg = new Image();
+    newImg.onload = () => onSave(sprite.id, newImg);
+    newImg.src = canvas.toDataURL('image/png');
+  };
+
+  const handleReset = () => {
+    if (!confirm('¿Seguro que quieres resetear los cambios de esta imagen?')) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(sprite.originalImg || sprite.img, 0, 0);
+    setHistory([]);
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <PaintBucket size={18} color="var(--accent)" />
+            <h3 style={{ fontSize: '1rem' }}>Balde de Pintura: {sprite.name}</h3>
+          </div>
+          <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
+        </div>
+        
+        <div
+          ref={workspaceRef}
+          className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`}
+          style={{ overflow: 'auto' }}
+          onScroll={onWorkspaceScroll}
+        >
+           <div style={{
+             width: sprite.img.width * zoom,
+             height: sprite.img.height * zoom,
+             margin: 'auto',
+             position: 'relative'
+           }}>
+             <div style={{ 
+               position: 'absolute',
+               left: 0,
+               top: 0,
+               width: sprite.img.width,
+               height: sprite.img.height,
+               transform: `scale(${zoom})`,
+               transformOrigin: 'top left',
+               cursor: 'crosshair'
+             }}>
+               <canvas 
+                ref={canvasRef}
+                onClick={handleCanvasClick}
+                onMouseMove={handleMouseMove}
+                onMouseLeave={() => setHoverColor(null)}
+               />
+             </div>
+           </div>
+        </div>
+
+        <div className="modal-footer" style={{ padding: '20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '24px', flexWrap: 'wrap' }}>
+          
+          <div style={{ display: 'flex', alignItems: 'center', gap: '16px', flex: 1 }}>
+             <div className="slider-item" style={{ flex: 'none', width: '200px', marginBottom: 0 }}>
+               <div className="slider-label"><span><Search size={14} /> Zoom</span><span>{zoom.toFixed(1)}x</span></div>
+               <input type="range" min="0.5" max="8" step="0.1" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
+             </div>
+             
+             <div className="slider-item" style={{ flex: 'none', width: '220px', marginBottom: 0 }}>
+                <div className="slider-label">
+                  <span>Modo</span>
+                </div>
+                <select
+                  className="input-small"
+                  value={mode}
+                  onChange={(e) => setMode(e.target.value as BucketMode)}
+                  style={{ width: '100%' }}
+                  title={
+                    mode === 'precise'
+                      ? 'Igual que Contiguo, y sigue por píxeles semitransparentes hasta el primer opaco (alfa 255)'
+                      : mode === 'contiguous'
+                        ? 'Rellena la zona conectada hasta el borde del dibujo'
+                        : 'Reemplaza ese color en todo el sprite'
+                  }
+                >
+                   <option value="global">🎨 Todo (Global)</option>
+                   <option value="contiguous">💧 Contiguo (Balde)</option>
+                   <option value="precise">✦ Super precisa (opacidad)</option>
+                </select>
+             </div>
+             
+             <div className="slider-item" style={{ flex: 'none', width: '90px', marginBottom: 0 }}>
+                <div className="slider-label">
+                  <span>Tolerancia</span>
+                  <span>{tolerance}</span>
+                </div>
+                <input type="range" min="0" max="100" value={Math.round((tolerance/255)*100)} onChange={(e) => setTolerance(Math.round(parseInt(e.target.value)*2.55))} />
+             </div>
+             
+             <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <span className="slider-label" style={{ marginBottom: 0 }}>Color Objetivo (Cursor)</span>
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                   <div style={{ width: '24px', height: '24px', background: hoverColor ? `rgb(${hoverColor[0]},${hoverColor[1]},${hoverColor[2]})` : 'transparent', border: '1px solid var(--border)', borderRadius: '4px' }} />
+                   <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{hoverColor ? `RGB(${hoverColor.join(',')})` : 'Ninguno'}</span>
+                </div>
+             </div>
+             
+             <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <span className="slider-label" style={{ marginBottom: 0 }}>Color Nuevo</span>
+                <input type="color" value={replaceColor} onChange={(e) => setReplaceColor(e.target.value)} style={{ width: '40px', height: '32px', padding: 0, border: 'none', background: 'none', cursor: 'pointer' }} />
+             </div>
+          </div>
+
+          <div style={{ display: 'flex', gap: '12px', alignItems: 'flex-end' }}>
+             <button className="btn btn-outline" onClick={undo} disabled={history.length === 0}><RotateCcw size={16} /> Deshacer</button>
+             <button className="btn btn-outline" onClick={handleReset} style={{ color: 'var(--danger)', borderColor: 'rgba(255,100,100,0.2)' }}>Reset</button>
+             <button className="btn btn-primary" onClick={handleCompile}><Save size={16} /> Guardar</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // --- Paint Modal Component ---
 interface PaintModalProps {
   sprite: SpriteData;
@@ -847,44 +4797,261 @@ interface PaintModalProps {
   isWhiteBg?: boolean;
 }
 
+type PaintPrefs = {
+  zoom: number;
+  brushSize: number;
+  brushShape: 'circle' | 'square';
+  paintColor: string;
+  paintOpacity: number;
+  paintBehind: boolean;
+};
+
+const PAINT_PREFS_KEY = 'joa-paint-prefs';
+
+const loadPaintPrefs = (): PaintPrefs => {
+  const saved = loadPref<Partial<PaintPrefs>>(PAINT_PREFS_KEY, {});
+  return {
+    zoom: clampNum(saved.zoom, 0.5, 8, 1),
+    brushSize: Math.round(clampNum(saved.brushSize, 1, 100, 10)),
+    brushShape: saved.brushShape === 'square' ? 'square' : 'circle',
+    paintColor: normalizeHexColor(saved.paintColor, loadLastColor('#ff0000')) || '#ff0000',
+    paintOpacity: Math.round(clampNum(saved.paintOpacity, 1, 100, 100)),
+    paintBehind: saved.paintBehind === true,
+  };
+};
+
 const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhiteBg }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [brushSize, setBrushSize] = useState(10);
-  const [paintColor, setPaintColor] = useState('#ff0000');
-  const [zoom, setZoom] = useState(1);
-  const [isDrawing, setIsDrawing] = useState(false);
+  const [brushSize, setBrushSize] = useState(() => loadPaintPrefs().brushSize);
+  const [brushShape, setBrushShape] = useState<'circle' | 'square'>(() => loadPaintPrefs().brushShape);
+  const [paintColor, setPaintColor] = useState(() => loadPaintPrefs().paintColor);
+  const [paintOpacity, setPaintOpacity] = useState(() => loadPaintPrefs().paintOpacity);
+  const [paintBehind, setPaintBehind] = useState(() => loadPaintPrefs().paintBehind);
+  const [eyedropperMode, setEyedropperMode] = useState(false);
+  const [zoom, setZoom] = useState(() => loadPaintPrefs().zoom);
+  const [colorDraft, setColorDraft] = useState(() => loadPaintPrefs().paintColor);
   const [mousePos, setMousePos] = useState<{ x: number, y: number } | null>(null);
+  const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-paint-scroll', sprite.name, [zoom]);
+  useModalWheelControls({ zoom, setZoom, brushSize, setBrushSize, workspaceRef });
+  const [historyLen, setHistoryLen] = useState(0);
+  const lastPos = useRef<{ x: number, y: number } | null>(null);
+  /** Historial local del lienzo de este modal (no toca el undo global ni otros sprites). */
+  const historyRef = useRef<ImageData[]>([]);
+  const strokeSavedRef = useRef(false);
+  const isDrawingRef = useRef(false);
+  /** Evita acumular alfa al pasar dos veces el mismo píxel en un mismo trazo semitransparente. */
+  const strokePaintedRef = useRef<Set<string> | null>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext('2d')!;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     canvas.width = sprite.img.width;
     canvas.height = sprite.img.height;
     ctx.drawImage(sprite.img, 0, 0);
+    historyRef.current = [];
+    setHistoryLen(0);
   }, [sprite]);
 
-  const draw = (e: React.MouseEvent) => {
+  useEffect(() => {
+    savePref(PAINT_PREFS_KEY, { zoom, brushSize, brushShape, paintColor, paintOpacity, paintBehind });
+    rememberLastColor(paintColor);
+    setColorDraft(paintColor);
+  }, [zoom, brushSize, brushShape, paintColor, paintOpacity, paintBehind]);
+
+  const pushHistory = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    const snapshot = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const next = [...historyRef.current, snapshot];
+    if (next.length > 40) next.shift();
+    historyRef.current = next;
+    setHistoryLen(next.length);
+  };
+
+  const undo = () => {
+    if (historyRef.current.length === 0) return;
+    const snapshot = historyRef.current[historyRef.current.length - 1];
+    historyRef.current = historyRef.current.slice(0, -1);
+    setHistoryLen(historyRef.current.length);
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.putImageData(snapshot, 0, 0);
+  };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        undo();
+        return;
+      }
+      if (e.key.toLowerCase() === 'i' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        const tag = (e.target as HTMLElement)?.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+        e.preventDefault();
+        setEyedropperMode(v => !v);
+      }
+      if (e.key === 'Escape' && eyedropperMode) {
+        setEyedropperMode(false);
+      }
+    };
+    // Capture: intercepta antes que el Ctrl+Z global de la app.
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [eyedropperMode]);
+
+  const toHex = (r: number, g: number, b: number) =>
+    '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
+
+  const sampleCanvasColor = (e: React.MouseEvent) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / (rect.width / zoom);
+    const scaleY = canvas.height / (rect.height / zoom);
+    const px = Math.floor(((e.clientX - rect.left) / zoom) * scaleX);
+    const py = Math.floor(((e.clientY - rect.top) / zoom) * scaleY);
+    if (px < 0 || py < 0 || px >= canvas.width || py >= canvas.height) return;
+    const { data } = ctx.getImageData(px, py, 1, 1);
+    if (data[3] < 8) return; // vacío: no cambiar color
+    const hex = rememberLastColor(toHex(data[0], data[1], data[2]));
+    if (hex) setPaintColor(hex);
+    setEyedropperMode(false);
+  };
+
+  const openScreenEyedropper = async () => {
+    const EyeDropperCtor = (window as unknown as { EyeDropper?: new () => { open: () => Promise<{ sRGBHex: string }> } }).EyeDropper;
+    if (!EyeDropperCtor) {
+      setEyedropperMode(true);
+      return;
+    }
+    try {
+      const result = await new EyeDropperCtor().open();
+      const hex = rememberLastColor(result?.sRGBHex || '');
+      if (hex) setPaintColor(hex);
+    } catch {
+      // Cancelado por el usuario
+    }
+  };
+
+  const paintCssColor = () => {
+    const hex = normalizeHexColor(paintColor, '#ff0000') || '#ff0000';
+    const r = parseInt(hex.slice(1, 3), 16);
+    const g = parseInt(hex.slice(3, 5), 16);
+    const b = parseInt(hex.slice(5, 7), 16);
+    const a = Math.max(0, Math.min(1, paintOpacity / 100));
+    return `rgba(${r}, ${g}, ${b}, ${a})`;
+  };
+
+  const stampBrush = (
+    ctx: CanvasRenderingContext2D,
+    px: number,
+    py: number,
+    painted: Set<string> | null,
+  ) => {
+    const ix = Math.round(px);
+    const iy = Math.round(py);
+    const r = brushSize;
+    const x0 = Math.floor(ix - r);
+    const y0 = Math.floor(iy - r);
+    const x1 = Math.ceil(ix + r);
+    const y1 = Math.ceil(iy + r);
+    const r2 = r * r;
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        if (brushShape === 'circle') {
+          const dx = x + 0.5 - px;
+          const dy = y + 0.5 - py;
+          if (dx * dx + dy * dy > r2) continue;
+        } else if (x < px - r || x >= px + r || y < py - r || y >= py + r) {
+          continue;
+        }
+        if (painted) {
+          const key = `${x},${y}`;
+          if (painted.has(key)) continue;
+          painted.add(key);
+        }
+        ctx.fillRect(x, y, 1, 1);
+      }
+    }
+  };
+
+  const draw = (e: React.MouseEvent, forceFirstPoint = false) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     
-    const ctx = canvas.getContext('2d')!;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     const rect = canvas.getBoundingClientRect();
     const x = (e.clientX - rect.left) / zoom;
     const y = (e.clientY - rect.top) / zoom;
 
     setMousePos({ x, y });
 
-    if (!isDrawing) return;
+    if (!isDrawingRef.current && !forceFirstPoint) {
+      lastPos.current = null;
+      return;
+    }
 
     const scaleX = canvas.width / (rect.width / zoom);
     const scaleY = canvas.height / (rect.height / zoom);
+    const currX = x * scaleX;
+    const currY = y * scaleY;
     
+    // destination-over: paint only shows through transparent / empty pixels
+    ctx.globalCompositeOperation = paintBehind ? 'destination-over' : 'source-over';
+    ctx.fillStyle = paintCssColor();
+    const painted = strokePaintedRef.current;
+
+    if (lastPos.current && !forceFirstPoint) {
+      const dx = currX - lastPos.current.x;
+      const dy = currY - lastPos.current.y;
+      const dist = Math.hypot(dx, dy);
+      const steps = Math.max(1, Math.ceil(dist / Math.max(1, brushSize * 0.35)));
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        stampBrush(ctx, lastPos.current.x + dx * t, lastPos.current.y + dy * t, painted);
+      }
+    } else {
+      stampBrush(ctx, currX, currY, painted);
+    }
+    lastPos.current = { x: currX, y: currY };
+  };
+
+  const beginStroke = (e: React.MouseEvent) => {
+    if (eyedropperMode) {
+      sampleCanvasColor(e);
+      return;
+    }
+    if (!strokeSavedRef.current) {
+      pushHistory();
+      strokeSavedRef.current = true;
+    }
+    strokePaintedRef.current = paintOpacity < 100 ? new Set() : null;
+    isDrawingRef.current = true;
+    draw(e, true);
+  };
+
+  const endStroke = () => {
+    isDrawingRef.current = false;
+    lastPos.current = null;
+    strokePaintedRef.current = null;
+    strokeSavedRef.current = false;
+  };
+
+  const handleReset = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    pushHistory();
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     ctx.globalCompositeOperation = 'source-over';
-    ctx.fillStyle = paintColor;
-    ctx.beginPath();
-    ctx.arc(x * scaleX, y * scaleY, brushSize, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(sprite.img, 0, 0);
   };
 
   const handleSave = () => {
@@ -906,7 +5073,12 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
           </div>
           <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
         </div>
-        <div className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`} style={{ overflow: 'auto' }}>
+        <div
+          ref={workspaceRef}
+          className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`}
+          style={{ overflow: 'auto' }}
+          onScroll={onWorkspaceScroll}
+        >
            <div style={{
              width: sprite.img.width * zoom,
              height: sprite.img.height * zoom,
@@ -917,7 +5089,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
                position: 'absolute',
                left: 0,
                top: 0,
-               cursor: 'none', 
+               cursor: eyedropperMode ? 'crosshair' : 'none', 
                width: sprite.img.width,
                height: sprite.img.height,
                transform: `scale(${zoom})`,
@@ -925,54 +5097,195 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
              }}>
              <canvas 
               ref={canvasRef}
-              onMouseDown={() => setIsDrawing(true)}
-              onMouseUp={() => setIsDrawing(false)}
-              onMouseMove={draw}
+              onMouseDown={beginStroke}
+              onMouseUp={endStroke}
+              onMouseMove={(e) => {
+                if (eyedropperMode) {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  setMousePos({ x: (e.clientX - rect.left) / zoom, y: (e.clientY - rect.top) / zoom });
+                  return;
+                }
+                draw(e);
+              }}
               onMouseEnter={(e) => {
                 const rect = e.currentTarget.getBoundingClientRect();
                 setMousePos({ x: (e.clientX - rect.left) / zoom, y: (e.clientY - rect.top) / zoom });
               }}
               onMouseLeave={() => {
-                setIsDrawing(false);
+                endStroke();
                 setMousePos(null);
               }}
              />
-             {mousePos && canvasRef.current && (
+             {mousePos && canvasRef.current && !eyedropperMode && (
                <div className="brush-preview" style={{
                  left: mousePos.x,
                  top: mousePos.y,
                  width: brushSize * (canvasRef.current.offsetWidth / canvasRef.current.width) * 2,
                  height: brushSize * (canvasRef.current.offsetWidth / canvasRef.current.width) * 2,
-                 borderColor: paintColor
+                 borderColor: paintColor,
+                 background: paintCssColor(),
+                 opacity: 1,
+                 borderRadius: brushShape === 'circle' ? '50%' : '0'
                }} />
              )}
              </div>
            </div>
         </div>
         <div className="modal-footer" style={{ padding: '20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '24px' }}>
-          <div className="slider-item" style={{ width: '150px', marginBottom: 0 }}>
+          <div className="slider-item" style={{ width: '190px', marginBottom: 0 }}>
              <div className="slider-label"><span>Color</span></div>
-             <div style={{ display: 'flex', gap: '8px' }}>
+             <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                 <input type="color" value={paintColor} onChange={(e) => setPaintColor(e.target.value)} style={{ width: '40px', height: '32px', padding: 0, border: 'none', background: 'none' }} />
-                <input type="text" className="input-small" value={paintColor} onChange={(e) => setPaintColor(e.target.value)} style={{ flex: 1, textTransform: 'uppercase' }} />
+                <input
+                  type="text"
+                  className="input-small"
+                  value={colorDraft}
+                  onChange={(e) => {
+                    setColorDraft(e.target.value);
+                    const hex = normalizeHexColor(e.target.value);
+                    if (hex) setPaintColor(hex);
+                  }}
+                  onBlur={() => setColorDraft(paintColor)}
+                  style={{ flex: 1, textTransform: 'uppercase' }}
+                />
+                <button
+                  type="button"
+                  className={`btn-ghost ${eyedropperMode ? 'active' : ''}`}
+                  title="Gotero: click para tomar color de la pantalla. Click derecho o I: tomar del sprite. Esc cancela."
+                  onClick={openScreenEyedropper}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    setEyedropperMode(v => !v);
+                  }}
+                  style={{
+                    width: '32px',
+                    height: '32px',
+                    padding: 0,
+                    borderColor: eyedropperMode ? 'var(--accent)' : undefined,
+                    color: eyedropperMode ? 'var(--accent)' : undefined,
+                  }}
+                >
+                  <Pipette size={16} />
+                </button>
              </div>
           </div>
           <div className="slider-item" style={{ flex: 1, marginBottom: 0 }}>
-            <div className="slider-label"><span><Search size={14} /> Zoom</span><span>{zoom.toFixed(1)}x</span></div>
+            <div className="slider-label">
+              <span><Search size={14} /> Zoom</span>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: '2px' }}>
+                <input
+                  type="number"
+                  min={0.5}
+                  max={8}
+                  step={0.1}
+                  value={Number(zoom.toFixed(1))}
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    if (!Number.isFinite(v)) return;
+                    setZoom(Math.min(8, Math.max(0.5, v)));
+                  }}
+                  style={{
+                    width: '48px', background: '#1a1a1a', border: '1px solid #333', color: 'white',
+                    padding: '2px 4px', borderRadius: '4px', textAlign: 'right', fontSize: '0.75rem',
+                  }}
+                />
+                x
+              </span>
+            </div>
             <input type="range" min="0.5" max="8" step="0.1" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
           </div>
           <div className="slider-item" style={{ flex: 1, marginBottom: 0 }}>
-            <div className="slider-label"><span>Tamaño de Pincel</span><span>{brushSize}px</span></div>
+            <div className="slider-label">
+              <span>Tamaño de Pincel</span>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: '2px' }}>
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  step={1}
+                  value={brushSize}
+                  onChange={(e) => {
+                    const v = parseInt(e.target.value, 10);
+                    if (!Number.isFinite(v)) return;
+                    setBrushSize(Math.min(100, Math.max(1, v)));
+                  }}
+                  style={{
+                    width: '48px', background: '#1a1a1a', border: '1px solid #333', color: 'white',
+                    padding: '2px 4px', borderRadius: '4px', textAlign: 'right', fontSize: '0.75rem',
+                  }}
+                />
+                px
+              </span>
+            </div>
             <input type="range" min="1" max="100" value={brushSize} onChange={(e) => setBrushSize(parseInt(e.target.value))} />
           </div>
+          <div className="slider-item" style={{ flex: 1, marginBottom: 0, minWidth: '120px' }}>
+            <div className="slider-label">
+              <span>Opacidad</span>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: '2px' }}>
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  step={1}
+                  value={paintOpacity}
+                  onChange={(e) => {
+                    const v = parseInt(e.target.value, 10);
+                    if (!Number.isFinite(v)) return;
+                    setPaintOpacity(Math.min(100, Math.max(1, v)));
+                  }}
+                  style={{
+                    width: '48px', background: '#1a1a1a', border: '1px solid #333', color: 'white',
+                    padding: '2px 4px', borderRadius: '4px', textAlign: 'right', fontSize: '0.75rem',
+                  }}
+                />
+                %
+              </span>
+            </div>
+            <input
+              type="range"
+              min="1"
+              max="100"
+              value={paintOpacity}
+              onChange={(e) => setPaintOpacity(parseInt(e.target.value, 10))}
+              title="Opacidad del pincel (píxeles semitransparentes)"
+            />
+          </div>
+          <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+            <button className={`btn-ghost ${brushShape === 'circle' ? 'active' : ''}`} onClick={() => setBrushShape('circle')} title="Círculo">
+              <Circle size={16} fill={brushShape === 'circle' ? 'currentColor' : 'none'} />
+            </button>
+            <button className={`btn-ghost ${brushShape === 'square' ? 'active' : ''}`} onClick={() => setBrushShape('square')} title="Cuadrado">
+              <Square size={16} fill={brushShape === 'square' ? 'currentColor' : 'none'} />
+            </button>
+            <button
+              className={`btn-ghost ${paintBehind ? 'active' : ''}`}
+              onClick={() => setPaintBehind(v => !v)}
+              title="Pintar solo en espacios vacíos (detrás del sprite)"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '4px',
+                fontSize: '0.7rem',
+                padding: '4px 8px',
+                borderColor: paintBehind ? 'var(--accent)' : undefined,
+                color: paintBehind ? 'var(--accent)' : undefined,
+              }}
+            >
+              <Layers size={14} />
+              Detrás
+            </button>
+          </div>
           <div style={{ display: 'flex', gap: '12px' }}>
-            <button className="btn btn-outline" onClick={() => {
-              const ctx = canvasRef.current?.getContext('2d');
-              if(ctx) {
-                ctx.clearRect(0, 0, canvasRef.current!.width, canvasRef.current!.height);
-                ctx.drawImage(sprite.img, 0, 0);
-              }
-            }}>Reiniciar</button>
+            <button
+              className="btn btn-outline"
+              onClick={undo}
+              disabled={historyLen === 0}
+              title="Ctrl+Z — deshace el último trazo (solo este sprite)"
+            >
+              <RotateCcw size={16} /> Deshacer
+            </button>
+            <button className="btn btn-outline" onClick={handleReset}>Reiniciar</button>
             <button className="btn btn-primary" style={{ paddingLeft: '24px', paddingRight: '24px' }} onClick={handleSave}>Guardar Cambios</button>
           </div>
         </div>
@@ -1006,6 +5319,11 @@ const CompositeModal: React.FC<CompositeModalProps> = ({ sprite, onSave, onClose
   const [zoom, setZoom] = useState(1);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const workspaceRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  useModalWheelControls({
+    zoom, setZoom, zoomMin: 0.1, zoomMax: 8, zoomStep: 0.05,
+    workspaceRef, contentRef,
+  });
 
   // Auto-fit zoom on mount
   useEffect(() => {
@@ -1108,7 +5426,7 @@ const CompositeModal: React.FC<CompositeModalProps> = ({ sprite, onSave, onClose
     if (!e.target.files) return;
     for (let i = 0; i < e.target.files.length; i++) {
       const file = e.target.files[i];
-      if (!file.type.startsWith('image/')) continue;
+      if (!isProbablyImageFile(file)) continue;
       
       const img = await new Promise<HTMLImageElement>((res) => {
         const reader = new FileReader();
@@ -1200,7 +5518,7 @@ const CompositeModal: React.FC<CompositeModalProps> = ({ sprite, onSave, onClose
         </div>
 
         <div className={`eraser-workspace ${isWhiteBg ? 'white-bg' : ''}`} ref={workspaceRef} style={{ overflow: 'auto', position: 'relative', flex: 1, backgroundColor: 'var(--bg-window, #151515)' }}>
-           <div className="checker-mini" style={{ position: 'relative', width: `${canvasSize * zoom}px`, height: `${canvasSize * zoom}px`, minWidth: `${canvasSize * zoom}px`, minHeight: `${canvasSize * zoom}px`, flexShrink: 0, margin: '20px auto', boxShadow: '0 0 40px rgba(0,0,0,0.8)', border: '1px solid rgba(255,255,255,0.1)' }}>
+           <div ref={contentRef} className="checker-mini" style={{ position: 'relative', width: `${canvasSize * zoom}px`, height: `${canvasSize * zoom}px`, minWidth: `${canvasSize * zoom}px`, minHeight: `${canvasSize * zoom}px`, flexShrink: 0, margin: '20px auto', boxShadow: '0 0 40px rgba(0,0,0,0.8)', border: '1px solid rgba(255,255,255,0.1)' }}>
              <canvas 
                ref={canvasRef}
                style={{ width: '100%', height: '100%', cursor: isDragging ? 'grabbing' : 'grab', outline: 'none', display: 'block' }}
@@ -1219,7 +5537,7 @@ const CompositeModal: React.FC<CompositeModalProps> = ({ sprite, onSave, onClose
         <div className="modal-footer" style={{ padding: '20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', display: 'flex', gap: '24px', alignItems: 'center' }}>
             <div className="slider-item" style={{ width: '200px', marginBottom: 0 }}>
               <div className="slider-label"><span><Search size={14} /> Zoom</span><span>{zoom.toFixed(2)}x</span></div>
-              <input type="range" min="0.1" max="8" step="0.05" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
+              <input type="range" min="0.1" max="8" step="0.01" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
             </div>
             <div style={{ flex: 1 }} />
             <div style={{ display: 'flex', gap: '12px' }}>
@@ -1254,6 +5572,9 @@ const AnimationModal: React.FC<AnimationModalProps> = ({ onClose }) => {
   const [exportW, setExportW] = useState(0);
   const [exportH, setExportH] = useState(0);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const previewContentRef = useRef<HTMLDivElement>(null);
+  useModalWheelControls({ zoom, setZoom, workspaceRef, contentRef: previewContentRef });
 
   const requestRef = useRef<number>(0);
   const lastTimeRef = useRef<number>(0);
@@ -1327,7 +5648,7 @@ const AnimationModal: React.FC<AnimationModalProps> = ({ onClose }) => {
     const newFrames: AnimFrame[] = [];
     for (let i = 0; i < e.target.files.length; i++) {
       const file = e.target.files[i];
-      if (!file.type.startsWith('image/')) continue;
+      if (!isProbablyImageFile(file)) continue;
       const img = await new Promise<HTMLImageElement>((res) => {
         const reader = new FileReader();
         reader.onload = (ev) => {
@@ -1359,6 +5680,7 @@ const AnimationModal: React.FC<AnimationModalProps> = ({ onClose }) => {
 
   const handleExportSpritesheet = async () => {
     if (frames.length === 0) return;
+    const fileName = `joa_anim_spritesheet_${Date.now()}.png`;
     
     let autoWidth = 0;
     let autoHeight = 0;
@@ -1392,10 +5714,7 @@ const AnimationModal: React.FC<AnimationModalProps> = ({ onClose }) => {
     });
 
     const blob = await new Promise<Blob>((res) => canvas.toBlob(res as any, 'image/png'));
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = `joa_anim_spritesheet_${Date.now()}.png`;
-    link.click();
+    await saveBlobToDisk(blob, fileName, [{ name: 'PNG Image', extensions: ['png'] }]);
   };
 
   const removeFrame = (id: string) => {
@@ -1411,6 +5730,17 @@ const AnimationModal: React.FC<AnimationModalProps> = ({ onClose }) => {
   if (bgColor === 'white') bgClass = 'white-bg';
   if (bgColor === 'black') bgClass = 'black-bg';
 
+  const previewSize = (() => {
+    let maxWidth = 200;
+    let maxHeight = 200;
+    frames.forEach(f => {
+      const sc = f.scale || 1.0;
+      maxWidth = Math.max(maxWidth, f.img.width * sc);
+      maxHeight = Math.max(maxHeight, f.img.height * sc);
+    });
+    return { w: maxWidth, h: maxHeight };
+  })();
+
   return (
     <div className="modal-overlay" onClick={onClose} style={{ zIndex: 9999 }}>
       <div className="modal-content tagging-modal" onClick={e => e.stopPropagation()}>
@@ -1424,20 +5754,21 @@ const AnimationModal: React.FC<AnimationModalProps> = ({ onClose }) => {
 
         <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
           {/* VISOR PRINCIPAL */}
-          <div className="eraser-workspace" style={{ flex: 1, overflow: 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: 'var(--bg-window, #151515)', position: 'relative' }}>
+          <div ref={workspaceRef} className="eraser-workspace" style={{ flex: 1, overflow: 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: 'var(--bg-window, #151515)', position: 'relative' }}>
              
              {frames.length === 0 ? (
                 <div className="empty-msg" style={{ opacity: 0.5 }}>Añade frames en la barra lateral para ver la animación</div>
              ) : (
-                <div className={bgClass} style={{ 
+                <div ref={previewContentRef} className={bgClass} style={{ 
                                 position: 'relative', 
                                 boxShadow: '0 0 40px rgba(0,0,0,0.8)', 
                                 border: '1px solid rgba(255,255,255,0.1)',
-                                transform: `scale(${zoom})`,
-                                transformOrigin: 'center center',
-                                margin: 'auto'
+                                width: previewSize.w * zoom,
+                                height: previewSize.h * zoom,
+                                margin: 'auto',
+                                flexShrink: 0,
                               }}>
-                  <canvas ref={canvasRef} style={{ display: 'block' }} />
+                  <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%', imageRendering: 'pixelated' }} />
                 </div>
              )}
 
@@ -1531,14 +5862,48 @@ const App: React.FC = () => {
   const [sprites, setSprites] = useState<SpriteData[]>([]);
   const [selection, setSelection] = useState<string[]>([]);
   const [referenceId, setReferenceId] = useState<string | null>(null);
-  const [gridZoom, setGridZoom] = useState(1);
+  const [gridZoom, setGridZoom] = useState(() => clampNum(loadPref('joa-grid-zoom', 1), 0.4, 3, 1));
   const [eraserTargetId, setEraserTargetId] = useState<string | null>(null);
+  const [replaceTargetId, setReplaceTargetId] = useState<string | null>(null);
+  const [copyRectTargetId, setCopyRectTargetId] = useState<string | null>(null);
+  const [pixelEditorTargetId, setPixelEditorTargetId] = useState<string | null>(null);
   const [transformTargetId, setTransformTargetId] = useState<string | null>(null);
   const [taggingTargetId, setTaggingTargetId] = useState<string | null>(null);
+  const [effectMaskTargetId, setEffectMaskTargetId] = useState<string | null>(null);
   const [paintTargetId, setPaintTargetId] = useState<string | null>(null);
+  const [bucketTargetId, setBucketTargetId] = useState<string | null>(null);
   const [stretchTargetId, setStretchTargetId] = useState<string | null>(null);
   const [compositeTarget, setCompositeTarget] = useState<{ id: string, size: number } | null>(null);
   const [showAnimationModal, setShowAnimationModal] = useState(false);
+  const anyModalOpen = !!(
+    eraserTargetId || replaceTargetId || copyRectTargetId || pixelEditorTargetId || transformTargetId ||
+    taggingTargetId || effectMaskTargetId || paintTargetId || bucketTargetId ||
+    stretchTargetId || compositeTarget || showAnimationModal
+  );
+  useModalWheelControls({
+    zoom: gridZoom,
+    setZoom: setGridZoom,
+    zoomMin: 0.5,
+    zoomMax: 2,
+    zoomStep: 0.1,
+    enabled: !anyModalOpen,
+  });
+
+  const CONTROLS_MIN = 240;
+  const CONTROLS_MAX = 720;
+  const CONTROLS_DEFAULT = 340;
+  const [controlsVisible, setControlsVisible] = useState(() => {
+    try { return localStorage.getItem('joa-controls-visible') !== '0'; } catch { return true; }
+  });
+  const [controlsWidth, setControlsWidth] = useState(() => {
+    try {
+      const saved = Number(localStorage.getItem('joa-controls-width'));
+      if (Number.isFinite(saved) && saved >= CONTROLS_MIN && saved <= CONTROLS_MAX) return saved;
+    } catch { /* ignore */ }
+    return CONTROLS_DEFAULT;
+  });
+  const [isResizingControls, setIsResizingControls] = useState(false);
+  const controlsResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
 
   // --- UNDO SYSTEM ---
   const [history, setHistory] = useState<SpriteData[][]>([]);
@@ -1569,6 +5934,8 @@ const App: React.FC = () => {
 
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
+      // Modales con lienzo propio manejan su Ctrl+Z; no tocar el historial global.
+      if (paintTargetId || bucketTargetId || pixelEditorTargetId || eraserTargetId || replaceTargetId || copyRectTargetId) return;
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
         if (e.shiftKey) redo(); else undo();
         e.preventDefault();
@@ -1579,23 +5946,67 @@ const App: React.FC = () => {
     };
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
-  }, [historyIndex, history]);
+  }, [historyIndex, history, paintTargetId, bucketTargetId, pixelEditorTargetId, eraserTargetId, replaceTargetId, copyRectTargetId]);
+
+  useEffect(() => {
+    try { localStorage.setItem('joa-controls-width', String(controlsWidth)); } catch { /* ignore */ }
+  }, [controlsWidth]);
+
+  useEffect(() => {
+    try { localStorage.setItem('joa-controls-visible', controlsVisible ? '1' : '0'); } catch { /* ignore */ }
+  }, [controlsVisible]);
+
+  useEffect(() => {
+    savePref('joa-grid-zoom', gridZoom);
+  }, [gridZoom]);
+
+  useEffect(() => {
+    if (!isResizingControls) return;
+    const onMove = (e: MouseEvent) => {
+      const start = controlsResizeRef.current;
+      if (!start) return;
+      const next = Math.min(CONTROLS_MAX, Math.max(CONTROLS_MIN, start.startWidth + (start.startX - e.clientX)));
+      setControlsWidth(next);
+    };
+    const onUp = () => {
+      controlsResizeRef.current = null;
+      setIsResizingControls(false);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [isResizingControls]);
   const [targets, setTargets] = useState({ top: 100, bottom: 100, left: 100, right: 100 });
+  const [contentNudgeStep, setContentNudgeStep] = useState(() => Math.round(clampNum(loadPref('joa-content-nudge-step', 1), 1, 512, 1)));
+  useEffect(() => {
+    savePref('joa-content-nudge-step', contentNudgeStep);
+  }, [contentNudgeStep]);
   const [dirHandle, setDirHandle] = useState<FileSystemDirectoryHandle | null>(null);
+  const [workingFolder, setWorkingFolder] = useState<DesktopFolder | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  const [batchExportFormat, setBatchExportFormat] = useState<'png' | 'dds' | null>(null);
   const [showGridlines, setShowGridlines] = useState(false);
   const [isWhiteBg, setIsWhiteBg] = useState(false);
   const [highlightedYs, setHighlightedYs] = useState<number[]>([]);
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
+  const [draggedSpriteId, setDraggedSpriteId] = useState<string | null>(null);
 
-  useEffect(() => {
-  }, []);
+  const linkedFolderName = workingFolder?.name || dirHandle?.name || null;
+  const hasLinkedFolder = !!(workingFolder || dirHandle);
 
-  const handleFiles = async (files: FileList | File[]) => {
+  const handleFiles = async (rawFiles: FileList | File[]) => {
+    const files = Array.from(rawFiles);
     const newSprites: SpriteData[] = [];
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      if (!file || !file.type.startsWith('image/')) continue;
+      if (!file || !isProbablyImageFile(file)) continue;
       const img = await new Promise<HTMLImageElement>((res, rej) => {
         const reader = new FileReader();
         reader.onload = (e) => {
@@ -1606,9 +6017,19 @@ const App: React.FC = () => {
         };
         reader.readAsDataURL(file);
       });
+      let finalName = file.name;
+      let counter = 1;
+      const baseName = file.name.replace(/\.[^/.]+$/, "");
+      const extension = file.name.match(/\.[^/.]+$/)?.[0] || "";
+      const nameExists = (n: string) => sprites.some((s: SpriteData) => s.name === n) || newSprites.some(s => s.name === n);
+      while (nameExists(finalName)) {
+        finalName = `${baseName}_${counter}${extension}`;
+        counter++;
+      }
+
       newSprites.push({ 
         id: generateId(), 
-        name: file.name, 
+        name: finalName, 
         img, 
         originalImg: img,
         scale: 1,
@@ -1637,6 +6058,147 @@ const App: React.FC = () => {
     }
   };
 
+  const openImportFiles = async () => {
+    const desktop = getDesktop();
+    if (desktop) {
+      try {
+        const items = await desktop.pickOpenFiles({
+          title: 'Importar lote de imágenes',
+          multiple: true,
+        });
+        if (items.length === 0) return;
+        const folder = await desktop.getWorkingFolder();
+        if (folder) setWorkingFolder(folder);
+        await handleFiles(filesFromDesktopOpen(items));
+      } catch (err) {
+        console.error(err);
+      }
+      return;
+    }
+
+    const files = await pickImageFiles(true, dirHandle);
+    if (files === null) {
+      document.getElementById('grid-up')?.click();
+      return;
+    }
+    if (files.length === 0) return;
+    await handleFiles(files);
+  };
+
+  const openSliceFile = async () => {
+    const desktop = getDesktop();
+    if (desktop) {
+      try {
+        const items = await desktop.pickOpenFiles({
+          title: 'Cortar spritesheet',
+          multiple: false,
+        });
+        if (items.length === 0) return;
+        const folder = await desktop.getWorkingFolder();
+        if (folder) setWorkingFolder(folder);
+        await handleSliceFile(filesFromDesktopOpen(items)[0]);
+      } catch (err) {
+        console.error(err);
+      }
+      return;
+    }
+
+    const files = await pickImageFiles(false, dirHandle);
+    if (files === null) {
+      document.getElementById('slice-up')?.click();
+      return;
+    }
+    if (files[0]) await handleSliceFile(files[0]);
+  };
+
+  const handleSliceFile = async (file: File) => {
+    if (!file || !isProbablyImageFile(file)) return;
+    const colsStr = prompt('¿En cuántas columnas (cortes verticales) deseas dividir la imagen?', '1');
+    if (!colsStr) return;
+    const cols = parseInt(colsStr, 10);
+    
+    const rowsStr = prompt('¿En cuántas filas (cortes horizontales) deseas dividir la imagen?', '1');
+    if (!rowsStr) return;
+    const rows = parseInt(rowsStr, 10);
+
+    if (isNaN(cols) || cols <= 0 || isNaN(rows) || rows <= 0) {
+      alert('Número de filas o columnas inválido');
+      return;
+    }
+
+    const img = await new Promise<HTMLImageElement>((res, rej) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const image = new Image();
+        image.onload = () => res(image);
+        image.onerror = rej;
+        image.src = e.target?.result as string;
+      };
+      reader.readAsDataURL(file);
+    });
+
+    const sliceWidth = Math.floor(img.width / cols);
+    const sliceHeight = Math.floor(img.height / rows);
+    if (sliceWidth === 0 || sliceHeight === 0) {
+      alert('La imagen es demasiado pequeña para cortarse en tantas partes.');
+      return;
+    }
+
+    const newSprites: SpriteData[] = [];
+    const baseName = file.name.replace(/\.[^/.]+$/, ""); // Remove extension
+    
+    const canvas = document.createElement('canvas');
+    canvas.width = sliceWidth;
+    canvas.height = sliceHeight;
+    const ctx = canvas.getContext('2d')!;
+
+    let counter = 1;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        ctx.clearRect(0, 0, sliceWidth, sliceHeight);
+        ctx.drawImage(img, c * sliceWidth, r * sliceHeight, sliceWidth, sliceHeight, 0, 0, sliceWidth, sliceHeight);
+        
+        const sliceImg = await new Promise<HTMLImageElement>((res, rej) => {
+          const image = new Image();
+          image.onload = () => res(image);
+          image.onerror = rej;
+          image.src = canvas.toDataURL('image/png');
+        });
+
+        newSprites.push({
+          id: generateId(),
+          name: `${baseName}_frame_${counter}.png`,
+          img: sliceImg,
+          originalImg: sliceImg,
+          scale: 1,
+          rotation: 0,
+          offsetX: 0,
+          offsetY: 0,
+          flipH: false,
+          flipV: false,
+          regions: [],
+          padding: { top: 0, bottom: 0, left: 0, right: 0 },
+          anchor: { x: Math.floor(sliceWidth / 2), y: Math.floor(sliceHeight / 2) },
+          pixelation: 1,
+          brightness: 100,
+          contrast: 100,
+          saturation: 100,
+          hue: 0,
+          opacity: 100,
+          tintColor: '#000000',
+          tintOpacity: 0
+        });
+        counter++;
+      }
+    }
+
+    if (newSprites.length > 0) {
+      const merged = [...sprites, ...newSprites];
+      commitSprites(merged);
+      setSelection(newSprites.map((s: SpriteData) => s.id));
+    }
+  };
+
   const toggleSelect = (id: string, multi: boolean) => {
     if (multi) {
       setSelection(prev => {
@@ -1649,88 +6211,86 @@ const App: React.FC = () => {
     }
   };
 
+  const updateDirHandle = (handle: FileSystemDirectoryHandle | null) => {
+    setDirHandle(handle);
+    void saveWorkingDirHandle(handle);
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const desktop = getDesktop();
+      if (desktop) {
+        const folder = await desktop.getWorkingFolder();
+        if (!cancelled && folder) setWorkingFolder(folder);
+        return;
+      }
+      const saved = await loadWorkingDirHandle();
+      if (!cancelled && saved) setDirHandle(saved);
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   const selectDirectory = async () => {
+    const desktop = getDesktop();
+    if (desktop) {
+      try {
+        const folder = await desktop.pickFolder();
+        if (folder) setWorkingFolder(folder);
+      } catch (err) {
+        console.error('Directory selection failed:', err);
+      }
+      return;
+    }
     try {
-      const handle = await (window as any).showDirectoryPicker();
-      setDirHandle(handle);
+      const handle = await (window as any).showDirectoryPicker({
+        id: WORKING_PICKER_ID,
+        mode: 'readwrite',
+        startIn: dirHandle || undefined,
+      });
+      updateDirHandle(handle);
     } catch (err) {
       console.error('Directory selection failed:', err);
     }
   };
 
   const overwriteAll = async () => {
+    const desktop = getDesktop();
+    if (desktop) {
+      let folder = workingFolder || await desktop.getWorkingFolder();
+      if (!folder) {
+        folder = await desktop.pickFolder();
+        if (!folder) return;
+        setWorkingFolder(folder);
+      }
+      setIsSaving(true);
+      try {
+        const files: { name: string; data: ArrayBuffer }[] = [];
+        for (const s of sprites) {
+          const canvas = renderSpriteToCanvas(s, true);
+          const blob = await new Promise<Blob>(res => canvas.toBlob(res as any, 'image/png'));
+          files.push({ name: s.name, data: await arrayBufferFromBlob(blob) });
+        }
+        await desktop.writeFilesToFolder(folder.path, files);
+        alert('¡Todos los archivos originales han sido reemplazados con éxito!');
+      } catch (err) {
+        console.error('Overwrite failed:', err);
+        alert('Error al sobrescribir archivos.');
+      } finally {
+        setIsSaving(false);
+      }
+      return;
+    }
+
     if (!dirHandle) return;
+    if (!(await ensureHandlePermission(dirHandle, 'readwrite'))) {
+      alert('No hay permiso de escritura sobre la carpeta vinculada. Volvé a vincularla.');
+      return;
+    }
     setIsSaving(true);
     try {
       for (const s of sprites) {
-        const canvas = document.createElement('canvas');
-        const scX = (s.scale || 1) * (s.stretchX || 1);
-        const scY = (s.scale || 1) * (s.stretchY || 1);
-        const sw = s.img.width * scX;
-        const sh = s.img.height * scY;
-        canvas.width = sw + s.padding.left + s.padding.right;
-        canvas.height = sh + s.padding.top + s.padding.bottom;
-        const ctx = canvas.getContext('2d')!;
-        ctx.imageSmoothingEnabled = false;
-        
-        ctx.filter = getSpriteFilter(s, true);
-
-        const rot = (s.rotation || 0) * Math.PI / 180;
-        const ox = s.offsetX || 0;
-        const oy = s.offsetY || 0;
-
-        const hSign = s.flipH ? -1 : 1;
-        const vSign = s.flipV ? -1 : 1;
-
-        if (s.pixelation && s.pixelation > 1) {
-          const p = s.pixelation;
-          const tw = Math.max(1, Math.floor(sw / p));
-          const th = Math.max(1, Math.floor(sh / p));
-          const tempCanvas = document.createElement('canvas');
-          tempCanvas.width = tw;
-          tempCanvas.height = th;
-          const tctx = tempCanvas.getContext('2d')!;
-          tctx.imageSmoothingEnabled = false;
-          tctx.drawImage(s.img, 0, 0, tw, th);
-
-          ctx.save();
-          ctx.translate(s.padding.left + sw/2 + ox, s.padding.top + sh/2 + oy);
-          ctx.rotate(rot);
-          ctx.scale(hSign, vSign);
-          ctx.drawImage(tempCanvas, 0, 0, tw, th, -sw/2, -sh/2, sw, sh);
-          ctx.restore();
-        } else {
-          ctx.save();
-          ctx.translate(s.padding.left + sw/2 + ox, s.padding.top + sh/2 + oy);
-          ctx.rotate(rot);
-          ctx.scale(hSign, vSign);
-          ctx.drawImage(s.img, -sw/2, -sh/2, sw, sh);
-          ctx.restore();
-        }
-        ctx.filter = 'none';
-
-        if (s.posterize && s.posterize >= 2) {
-          const idata = ctx.getImageData(0, 0, canvas.width, canvas.height);
-          const d = idata.data;
-          const steps = s.posterize;
-          const factor = 255 / (steps - 1);
-          for (let i = 0; i < d.length; i += 4) {
-            if (d[i+3] === 0) continue;
-            d[i] = Math.round((d[i] / 255) * (steps - 1)) * factor;
-            d[i+1] = Math.round((d[i+1] / 255) * (steps - 1)) * factor;
-            d[i+2] = Math.round((d[i+2] / 255) * (steps - 1)) * factor;
-          }
-          ctx.putImageData(idata, 0, 0);
-        }
-        
-        if (s.tintOpacity && s.tintOpacity > 0) {
-          ctx.save();
-          ctx.globalCompositeOperation = 'source-atop';
-          ctx.fillStyle = s.tintColor || '#000000';
-          ctx.globalAlpha = s.tintOpacity / 100;
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
-          ctx.restore();
-        }
+        const canvas = renderSpriteToCanvas(s, true);
 
         const blob = await new Promise<Blob>(res => canvas.toBlob(res as any, 'image/png'));
         const fileHandle = await dirHandle.getFileHandle(s.name, { create: true });
@@ -1770,6 +6330,104 @@ const App: React.FC = () => {
     commitSprites(next);
   };
 
+  const updateBulkInternalScale = (val: number) => {
+    const next = sprites.map((s: SpriteData) => {
+      if (!selection.includes(s.id)) return s;
+      const stretchX = s.stretchX || 1;
+      const stretchY = s.stretchY || 1;
+      const currScX = (s.scale || 1) * stretchX;
+      const currScY = (s.scale || 1) * stretchY;
+      const currW = s.img.width * currScX;
+      const currH = s.img.height * currScY;
+      
+      const newScX = val * stretchX;
+      const newScY = val * stretchY;
+      const newW = s.img.width * newScX;
+      const newH = s.img.height * newScY;
+      
+      const diffW = currW - newW;
+      const diffH = currH - newH;
+      
+      return { 
+        ...s, 
+        scale: val,
+        padding: {
+          left: s.padding.left + diffW / 2,
+          right: s.padding.right + diffW / 2,
+          top: s.padding.top + diffH / 2,
+          bottom: s.padding.bottom + diffH / 2
+        }
+      };
+    });
+    commitSprites(next);
+  };
+
+  const updateBulkInternalWidth = (val: number) => {
+    const next = sprites.map((s: SpriteData) => {
+      if (!selection.includes(s.id)) return s;
+      const stretchX = s.stretchX || 1;
+      const stretchY = s.stretchY || 1;
+      const currScX = (s.scale || 1) * stretchX;
+      const currScY = (s.scale || 1) * stretchY;
+      const currW = s.img.width * currScX;
+      const currH = s.img.height * currScY;
+      
+      const newScale = val / (s.img.width * stretchX);
+      const newScX = newScale * stretchX;
+      const newScY = newScale * stretchY;
+      const newW = s.img.width * newScX;
+      const newH = s.img.height * newScY;
+      
+      const diffW = currW - newW;
+      const diffH = currH - newH;
+      
+      return { 
+        ...s, 
+        scale: newScale,
+        padding: {
+          left: s.padding.left + diffW / 2,
+          right: s.padding.right + diffW / 2,
+          top: s.padding.top + diffH / 2,
+          bottom: s.padding.bottom + diffH / 2
+        }
+      };
+    });
+    commitSprites(next);
+  };
+
+  const updateBulkInternalHeight = (val: number) => {
+    const next = sprites.map((s: SpriteData) => {
+      if (!selection.includes(s.id)) return s;
+      const stretchX = s.stretchX || 1;
+      const stretchY = s.stretchY || 1;
+      const currScX = (s.scale || 1) * stretchX;
+      const currScY = (s.scale || 1) * stretchY;
+      const currW = s.img.width * currScX;
+      const currH = s.img.height * currScY;
+      
+      const newScale = val / (s.img.height * stretchY);
+      const newScX = newScale * stretchX;
+      const newScY = newScale * stretchY;
+      const newW = s.img.width * newScX;
+      const newH = s.img.height * newScY;
+      
+      const diffW = currW - newW;
+      const diffH = currH - newH;
+      
+      return { 
+        ...s, 
+        scale: newScale,
+        padding: {
+          left: s.padding.left + diffW / 2,
+          right: s.padding.right + diffW / 2,
+          top: s.padding.top + diffH / 2,
+          bottom: s.padding.bottom + diffH / 2
+        }
+      };
+    });
+    commitSprites(next);
+  };
+
   const updateBulkStretchX = (val: number) => {
     const next = sprites.map((s: SpriteData) => selection.includes(s.id) ? { ...s, stretchX: val } : s);
     commitSprites(next);
@@ -1790,6 +6448,292 @@ const App: React.FC = () => {
       return { ...s, scale: newScale };
     });
     commitSprites(next);
+  };
+
+  const applyReferenceFrame = () => {
+    const ref = sprites.find((s: SpriteData) => s.id === referenceId);
+    if (!ref) return;
+
+    const refSc = ref.scale || 1;
+    const refSX = ref.stretchX || 1;
+    const refSY = ref.stretchY || 1;
+    const refScX = refSc * refSX;
+    const refScY = refSc * refSY;
+    const refContentW = ref.img.width * refScX;
+    const refContentH = ref.img.height * refScY;
+    const refW = refContentW + ref.padding.left + ref.padding.right;
+    const refH = refContentH + ref.padding.top + ref.padding.bottom;
+
+    const refAnchorX = ref.anchor?.x ?? ref.img.width / 2;
+    const refAnchorY = ref.anchor?.y ?? ref.img.height / 2;
+    const refDLeft = ref.padding.left + refAnchorX * refScX;
+    const refDTop = ref.padding.top + refAnchorY * refScY;
+    const refDRight = ref.padding.right + (refContentW - refAnchorX * refScX);
+    const refDBottom = ref.padding.bottom + (refContentH - refAnchorY * refScY);
+
+    const next = sprites.map((s: SpriteData) => {
+      if (!selection.includes(s.id) || s.id === referenceId) return s;
+
+      const stretchX = s.stretchX || 1;
+      const stretchY = s.stretchY || 1;
+      const baseW = s.img.width * stretchX;
+      const baseH = s.img.height * stretchY;
+
+      const targetScale = Math.min(refW / baseW, refH / baseH);
+      const contentW = baseW * targetScale;
+      const contentH = baseH * targetScale;
+
+      const anchorX = s.anchor?.x ?? s.img.width / 2;
+      const anchorY = s.anchor?.y ?? s.img.height / 2;
+
+      let padLeft = refDLeft - anchorX * targetScale * stretchX;
+      let padTop = refDTop - anchorY * targetScale * stretchY;
+      let padRight = refDRight - (contentW - anchorX * targetScale * stretchX);
+      let padBottom = refDBottom - (contentH - anchorY * targetScale * stretchY);
+
+      if (padLeft < 0 || padRight < 0 || padTop < 0 || padBottom < 0) {
+        const diffW = refW - contentW;
+        const diffH = refH - contentH;
+        padLeft = Math.max(0, Math.floor(diffW / 2));
+        padRight = Math.max(0, diffW - padLeft);
+        padTop = Math.max(0, Math.floor(diffH / 2));
+        padBottom = Math.max(0, diffH - padTop);
+      }
+
+      return {
+        ...s,
+        scale: targetScale,
+        padding: {
+          left: Math.round(padLeft),
+          right: Math.round(padRight),
+          top: Math.round(padTop),
+          bottom: Math.round(padBottom),
+        },
+      };
+    });
+    commitSprites(next);
+  };
+  const autoMaximizeInternal = () => {
+    if (selection.length === 0) return;
+    
+    const next = sprites.map((s: SpriteData) => {
+      if (!selection.includes(s.id)) return s;
+
+      const canvas = document.createElement('canvas');
+      canvas.width = s.img.width;
+      canvas.height = s.img.height;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx) return s;
+      ctx.drawImage(s.img, 0, 0);
+      const data = ctx.getImageData(0, 0, s.img.width, s.img.height).data;
+
+      let minX = s.img.width, minY = s.img.height, maxX = 0, maxY = 0;
+      let hasPixels = false;
+      for (let y = 0; y < s.img.height; y++) {
+        for (let x = 0; x < s.img.width; x++) {
+          const alpha = data[(y * s.img.width + x) * 4 + 3];
+          if (alpha > 0) {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+            hasPixels = true;
+          }
+        }
+      }
+
+      if (!hasPixels) return s;
+
+      const boxW = (maxX + 1) - minX;
+      const boxH = (maxY + 1) - minY;
+
+      const stretchX = s.stretchX || 1;
+      const stretchY = s.stretchY || 1;
+      const currScale = s.scale || 1;
+
+      const totalW = (s.img.width * currScale * stretchX) + s.padding.left + s.padding.right;
+      const totalH = (s.img.height * currScale * stretchY) + s.padding.top + s.padding.bottom;
+
+      const visibleW = boxW * currScale * stretchX;
+      const visibleH = boxH * currScale * stretchY;
+
+      if (visibleW === 0 || visibleH === 0 || totalW <= 0 || totalH <= 0) return s;
+
+      const M = Math.min(totalW / visibleW, totalH / visibleH);
+
+      const newScale = currScale * M;
+      const newImgW = s.img.width * newScale * stretchX;
+      const newImgH = s.img.height * newScale * stretchY;
+
+      const newContentW = boxW * newScale * stretchX;
+      const newContentH = boxH * newScale * stretchY;
+
+      const newContentLeft = (totalW - newContentW) / 2;
+      const newContentTop = (totalH - newContentH) / 2;
+
+      const newPaddingLeft = newContentLeft - (minX * newScale * stretchX);
+      const newPaddingRight = totalW - newImgW - newPaddingLeft;
+
+      const newPaddingTop = newContentTop - (minY * newScale * stretchY);
+      const newPaddingBottom = totalH - newImgH - newPaddingTop;
+
+      return {
+        ...s,
+        scale: newScale,
+        padding: {
+          left: newPaddingLeft,
+          right: newPaddingRight,
+          top: newPaddingTop,
+          bottom: newPaddingBottom
+        }
+      };
+    });
+    
+    commitSprites(next);
+  };
+
+  const removeBlackBackground = async (img: HTMLImageElement, threshold: number): Promise<HTMLImageElement> => {
+    return new Promise((resolve) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+      ctx.drawImage(img, 0, 0);
+      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const data = imgData.data;
+
+      const w = canvas.width;
+      const h = canvas.height;
+      
+      const isBlack = (idx: number) => {
+        return data[idx] <= threshold && data[idx + 1] <= threshold && data[idx + 2] <= threshold && data[idx + 3] > 0;
+      };
+
+      const stack: number[] = [];
+      
+      for (let x = 0; x < w; x++) {
+        const top = (0 * w + x) * 4;
+        if (isBlack(top)) stack.push(top);
+        
+        const bottom = ((h - 1) * w + x) * 4;
+        if (isBlack(bottom)) stack.push(bottom);
+      }
+      for (let y = 0; y < h; y++) {
+        const left = (y * w + 0) * 4;
+        if (isBlack(left)) stack.push(left);
+        
+        const right = (y * w + w - 1) * 4;
+        if (isBlack(right)) stack.push(right);
+      }
+
+      while (stack.length > 0) {
+        const idx = stack.pop()!;
+        if (data[idx + 3] === 0) continue;
+        
+        data[idx + 3] = 0;
+
+        const pixelIndex = idx / 4;
+        const x = pixelIndex % w;
+        const y = Math.floor(pixelIndex / w);
+
+        if (x > 0) {
+          const left = idx - 4;
+          if (data[left + 3] > 0 && isBlack(left)) stack.push(left);
+        }
+        if (x < w - 1) {
+          const right = idx + 4;
+          if (data[right + 3] > 0 && isBlack(right)) stack.push(right);
+        }
+        if (y > 0) {
+          const top = idx - w * 4;
+          if (data[top + 3] > 0 && isBlack(top)) stack.push(top);
+        }
+        if (y < h - 1) {
+          const bottom = idx + w * 4;
+          if (data[bottom + 3] > 0 && isBlack(bottom)) stack.push(bottom);
+        }
+      }
+
+      ctx.putImageData(imgData, 0, 0);
+      const newImg = new Image();
+      newImg.onload = () => resolve(newImg);
+      newImg.src = canvas.toDataURL('image/png');
+    });
+  };
+
+  const removeBackgroundBulk = async () => {
+    if (selection.length === 0) return;
+
+    const tolStr = prompt('Tolerancia de color negro (0 a 100, donde 0 es solo negro absoluto):', '5');
+    if (tolStr === null) return;
+    const tol = parseInt(tolStr, 10);
+    if (isNaN(tol) || tol < 0 || tol > 255) {
+      alert('Tolerancia inválida.');
+      return;
+    }
+
+    setIsSaving(true);
+    
+    try {
+      const next = [...sprites];
+      let changed = false;
+      for (let i = 0; i < next.length; i++) {
+        if (selection.includes(next[i].id)) {
+          const newImg = await removeBlackBackground(next[i].originalImg || next[i].img, tol);
+          next[i] = { ...next[i], img: newImg, originalImg: newImg };
+          changed = true;
+        }
+      }
+      
+      if (changed) {
+        commitSprites(next);
+      }
+    } catch (e) {
+      console.error(e);
+      alert('Hubo un error procesando las imágenes.');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+  const flipHorizontalBulk = async () => {
+    if (selection.length === 0) return;
+    
+    setIsSaving(true);
+    try {
+      const next = [...sprites];
+      let changed = false;
+      for (let i = 0; i < next.length; i++) {
+        if (selection.includes(next[i].id)) {
+          const s = next[i];
+          const img = s.originalImg || s.img;
+          const canvas = document.createElement('canvas');
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const ctx = canvas.getContext('2d')!;
+          ctx.translate(canvas.width, 0);
+          ctx.scale(-1, 1);
+          ctx.drawImage(img, 0, 0);
+          
+          const newImg = await new Promise<HTMLImageElement>((resolve) => {
+            const temp = new Image();
+            temp.onload = () => resolve(temp);
+            temp.src = canvas.toDataURL('image/png');
+          });
+          
+          next[i] = { ...s, img: newImg, originalImg: newImg };
+          changed = true;
+        }
+      }
+      
+      if (changed) {
+        commitSprites(next);
+      }
+    } catch (e) {
+      console.error(e);
+      alert('Hubo un error volteando las imágenes.');
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const applyAlignment = () => {
@@ -1844,6 +6788,24 @@ const App: React.FC = () => {
      commitSprites(next);
   };
 
+  /** Mueve el dibujo dentro del envase (dx/dy en px). Full no cambia: solo redistribuye padding. */
+  const nudgeSelectedContent = (dx: number, dy: number) => {
+    if ((!dx && !dy) || selection.length === 0) return;
+    const next = sprites.map((s: SpriteData) => {
+      if (!selection.includes(s.id)) return s;
+      return {
+        ...s,
+        padding: {
+          left: s.padding.left + dx,
+          right: s.padding.right - dx,
+          top: s.padding.top + dy,
+          bottom: s.padding.bottom - dy,
+        },
+      };
+    });
+    commitSprites(next);
+  };
+
   const updateBulkPixelation = (val: number) => {
     const next = sprites.map((s: SpriteData) => selection.includes(s.id) ? { ...s, pixelation: val } : s);
     commitSprites(next);
@@ -1866,6 +6828,7 @@ const App: React.FC = () => {
         saturation: ref.saturation ?? 100,
         hue: ref.hue ?? 0,
         opacity: ref.opacity ?? 100,
+        opacityMode: ref.opacityMode ?? 'absolute',
         grayscale: ref.grayscale ?? 0,
         sepia: ref.sepia ?? 0,
         invert: ref.invert ?? 0,
@@ -1875,6 +6838,18 @@ const App: React.FC = () => {
         posterize: ref.posterize,
         outlineColor: ref.outlineColor,
         outlineWidth: ref.outlineWidth,
+        outlineStyle: ref.outlineStyle ?? 'smooth',
+        greenHueShift: ref.greenHueShift,
+        greenSaturation: ref.greenSaturation,
+        greenOpacity: ref.greenOpacity,
+        blackHueShift: ref.blackHueShift,
+        blackSaturation: ref.blackSaturation,
+        blackOpacity: ref.blackOpacity,
+        whiteHueShift: ref.whiteHueShift,
+        whiteSaturation: ref.whiteSaturation,
+        whiteOpacity: ref.whiteOpacity,
+        handDrawn: ref.handDrawn ?? 0,
+        pencilDrawn: ref.pencilDrawn ?? 0,
         shadowX: ref.shadowX,
         shadowY: ref.shadowY,
         shadowBlur: ref.shadowBlur,
@@ -1888,144 +6863,489 @@ const App: React.FC = () => {
     commitSprites(next);
   };
 
+  /**
+   * Tamaño del “píxel de arte” del dibujo (no la resolución del archivo).
+   * - MAE: mayor N donde promediar bloques N×N casi no cambia la imagen (upscale limpio)
+   * - Runs: longitud típica entre cambios fuertes de color (pixel art grueso nativo)
+   */
   const detectIntrinsicPixelSize = (img: HTMLImageElement): number => {
+    const w = img.width;
+    const h = img.height;
+    if (w < 2 || h < 2) return 1;
+
     const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return 1;
-    canvas.width = img.width;
-    canvas.height = img.height;
     ctx.drawImage(img, 0, 0);
-    const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    const { data } = ctx.getImageData(0, 0, w, h);
 
-    const getGcd = (a: number, b: number): number => {
-      while (b) { a %= b; [a, b] = [b, a]; }
-      return a;
-    };
+    const maxN = Math.min(48, Math.floor(Math.min(w, h) / 3));
 
-    let resultGcd = 0;
-    const sampleRows = [Math.floor(canvas.height / 2), Math.floor(canvas.height / 4), Math.floor(3 * canvas.height / 4)];
-    
-    sampleRows.forEach(row => {
-      let run = 1;
-      for (let x = 1; x < canvas.width; x++) {
-        const idx1 = (row * canvas.width + (x - 1)) * 4;
-        const idx2 = (row * canvas.width + x) * 4;
-        const same = data[idx1] === data[idx2] && data[idx1+1] === data[idx2+1] && data[idx1+2] === data[idx2+2] && data[idx1+3] === data[idx2+3];
-        if (same) {
-          run++;
-        } else {
-          if (run > 0 && data[idx1+3] > 0) { // Only count non-transparent runs
-            resultGcd = resultGcd === 0 ? run : getGcd(resultGcd, run);
+    /** Error medio al reemplazar cada bloque N×N por su color promedio. */
+    const maeForN = (n: number): number => {
+      let err = 0;
+      let count = 0;
+      for (let by = 0; by + n <= h; by += n) {
+        for (let bx = 0; bx + n <= w; bx += n) {
+          let r = 0;
+          let g = 0;
+          let b = 0;
+          let op = 0;
+          for (let dy = 0; dy < n; dy++) {
+            for (let dx = 0; dx < n; dx++) {
+              const i = ((by + dy) * w + (bx + dx)) * 4;
+              if (data[i + 3] < 12) continue;
+              r += data[i];
+              g += data[i + 1];
+              b += data[i + 2];
+              op++;
+            }
           }
-          run = 1;
+          if (op < n * n * 0.35) continue;
+          r = (r / op) | 0;
+          g = (g / op) | 0;
+          b = (b / op) | 0;
+          for (let dy = 0; dy < n; dy++) {
+            for (let dx = 0; dx < n; dx++) {
+              const i = ((by + dy) * w + (bx + dx)) * 4;
+              if (data[i + 3] < 12) continue;
+              err += Math.abs(data[i] - r) + Math.abs(data[i + 1] - g) + Math.abs(data[i + 2] - b);
+              count++;
+            }
+          }
         }
       }
-    });
+      return count ? err / (count * 3) : 999;
+    };
 
-    return resultGcd || 1;
+    /** Upscale / grilla limpia: el mayor N con error bajo al promediar. */
+    const detectByMae = (): number => {
+      const T = 8;
+      for (let n = maxN; n >= 2; n--) {
+        if (maeForN(n) <= T) return n;
+      }
+      return 1;
+    };
+
+    /**
+     * Grosor visual del trazo: longitud típica de tramos entre saltos fuertes de color.
+     * Tolera ruido interno en rellenos; mide el tamaño de las manchas del pixel art.
+     */
+    const detectByStrongRuns = (): number => {
+      const strongDiff = (i: number, j: number) =>
+        Math.abs(data[i] - data[j]) +
+          Math.abs(data[i + 1] - data[j + 1]) +
+          Math.abs(data[i + 2] - data[j + 2]) >
+        45;
+
+      const runs: number[] = [];
+      const push = (len: number) => {
+        if (len >= 1) runs.push(Math.min(len, maxN * 2));
+      };
+
+      const rowStep = Math.max(1, Math.floor(h / 60));
+      for (let y = 0; y < h; y += rowStep) {
+        let x = 0;
+        while (x < w) {
+          const i0 = (y * w + x) * 4;
+          if (data[i0 + 3] < 12) {
+            x++;
+            continue;
+          }
+          let len = 1;
+          while (x + len < w) {
+            const iPrev = (y * w + x + len - 1) * 4;
+            const i1 = (y * w + x + len) * 4;
+            if (data[i1 + 3] < 12 || strongDiff(iPrev, i1)) break;
+            len++;
+          }
+          push(len);
+          x += len;
+        }
+      }
+
+      const colStep = Math.max(1, Math.floor(w / 60));
+      for (let x = 0; x < w; x += colStep) {
+        let y = 0;
+        while (y < h) {
+          const i0 = (y * w + x) * 4;
+          if (data[i0 + 3] < 12) {
+            y++;
+            continue;
+          }
+          let len = 1;
+          while (y + len < h) {
+            const iPrev = ((y + len - 1) * w + x) * 4;
+            const i1 = ((y + len) * w + x) * 4;
+            if (data[i1 + 3] < 12 || strongDiff(iPrev, i1)) break;
+            len++;
+          }
+          push(len);
+          y += len;
+        }
+      }
+
+      if (runs.length < 24) return 1;
+      runs.sort((a, b) => a - b);
+      // ~percentil 35: tamaño típico de mancha, sin inflar por planos enormes de piel.
+      return Math.max(1, Math.min(maxN, runs[Math.floor(runs.length * 0.35)] || 1));
+    };
+
+    const byMae = detectByMae();
+    const byRuns = detectByStrongRuns();
+    // Ambas estiman el mismo concepto; nos quedamos con la señal más gruesa fiable.
+    return Math.max(byMae, byRuns);
+  };
+
+  /** Tamaño visual de un píxel de arte sobre el canvas ya escalado. */
+  const getVisualArtPixelSize = (sprite: SpriteData): number => {
+    const base = detectIntrinsicPixelSize(sprite.img);
+    const scale = sprite.scale || 1;
+    const p = sprite.pixelation || 1;
+    if (p > 1) return p;
+    return Math.max(1, base * scale);
   };
 
   const applyReferencePixelation = () => {
     const ref = sprites.find((s: SpriteData) => s.id === referenceId);
     if (!ref) return;
-    
-    const refBase = detectIntrinsicPixelSize(ref.img);
-    const refTarget = refBase * (ref.scale || 1) * (ref.pixelation || 1);
+
+    const targetVisual = getVisualArtPixelSize(ref);
+    const goal = Math.max(1, Math.round(targetVisual));
+
+    if (goal <= 1) {
+      // REF ya es detalle ~1px: no hay grilla más gruesa que aplicar.
+      return;
+    }
 
     const next = sprites.map((s: SpriteData) => {
       if (!selection.includes(s.id) || s.id === referenceId) return s;
-      const sBase = detectIntrinsicPixelSize(s.img);
-      const sTargetPixelation = refTarget / (sBase * (s.scale || 1));
-      return { 
-        ...s, 
-        pixelation: Math.max(1, Math.round(sTargetPixelation))
-      };
+
+      const natural = Math.max(1, detectIntrinsicPixelSize(s.img) * (s.scale || 1));
+
+      // Ya tan grueso (o más) que la REF.
+      if (natural >= goal * 0.85) {
+        return { ...s, pixelation: 1 };
+      }
+
+      // Más detallado → llevar a la grilla visual medida en la REF.
+      return { ...s, pixelation: goal };
     });
     commitSprites(next);
   };
 
-  const exportZip = async () => {
-    const zip = new JSZip();
-    for (const s of sprites) {
-      const canvas = document.createElement('canvas');
-      const scX = (s.scale || 1) * (s.stretchX || 1);
-      const scY = (s.scale || 1) * (s.stretchY || 1);
-      const sw = s.img.width * scX;
-      const sh = s.img.height * scY;
-      canvas.width = sw + s.padding.left + s.padding.right;
-      canvas.height = sh + s.padding.top + s.padding.bottom;
-      const ctx = canvas.getContext('2d')!;
-      ctx.imageSmoothingEnabled = false;
-      ctx.filter = getSpriteFilter(s, true);
-
-      const rot = (s.rotation || 0) * Math.PI / 180;
-      const ox = s.offsetX || 0;
-      const oy = s.offsetY || 0;
-
-      const hSign = s.flipH ? -1 : 1;
-      const vSign = s.flipV ? -1 : 1;
-
-      if (s.pixelation && s.pixelation > 1) {
-          const p = s.pixelation;
-          const tw = Math.max(1, Math.floor(sw / p));
-          const th = Math.max(1, Math.floor(sh / p));
-          const tempCanvas = document.createElement('canvas');
-          tempCanvas.width = tw;
-          tempCanvas.height = th;
-          const tctx = tempCanvas.getContext('2d')!;
-          tctx.imageSmoothingEnabled = false;
-          tctx.drawImage(s.img, 0, 0, tw, th);
-
-          ctx.save();
-          ctx.translate(s.padding.left + sw/2 + ox, s.padding.top + sh/2 + oy);
-          ctx.rotate(rot);
-          ctx.scale(hSign, vSign);
-          ctx.drawImage(tempCanvas, 0, 0, tw, th, -sw/2, -sh/2, sw, sh);
-          ctx.restore();
-      } else {
-          ctx.save();
-          ctx.translate(s.padding.left + sw/2 + ox, s.padding.top + sh/2 + oy);
-          ctx.rotate(rot);
-          ctx.scale(hSign, vSign);
-          ctx.drawImage(s.img, -sw/2, -sh/2, sw, sh);
-          ctx.restore();
-      }
-      ctx.filter = 'none';
-
-      if (s.posterize && s.posterize >= 2) {
-        const idata = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const d = idata.data;
-        const steps = s.posterize;
-        const factor = 255 / (steps - 1);
-        for (let i = 0; i < d.length; i += 4) {
-          if (d[i+3] === 0) continue;
-          d[i] = Math.round((d[i] / 255) * (steps - 1)) * factor;
-          d[i+1] = Math.round((d[i+1] / 255) * (steps - 1)) * factor;
-          d[i+2] = Math.round((d[i+2] / 255) * (steps - 1)) * factor;
-        }
-        ctx.putImageData(idata, 0, 0);
-      }
-      
-      if (s.tintOpacity && s.tintOpacity > 0) {
-        ctx.save();
-        ctx.globalCompositeOperation = 'source-atop';
-        ctx.fillStyle = s.tintColor || '#000000';
-        ctx.globalAlpha = s.tintOpacity / 100;
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.restore();
-      }
-
-      const blob = await new Promise<Blob>(res => canvas.toBlob(res as any, 'image/png'));
-      zip.file(s.name, blob);
+  const handleExportSprite = async (id: string, format: 'png' | 'ico' | 'dds' = 'png') => {
+    const s = sprites.find((x: SpriteData) => x.id === id);
+    if (!s) {
+      alert('No se encontró el sprite a exportar.');
+      return;
     }
-    const blob = await zip.generateAsync({ type: 'blob' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = `joa_batch_${Date.now()}.zip`;
-    link.click();
+    if (!s.img || !s.img.width || !s.img.height) {
+      alert('El sprite no tiene imagen válida para exportar.');
+      return;
+    }
+
+    const finalExt = format === 'ico' ? '.ico' : format === 'dds' ? '.dds' : '.png';
+    const defaultName = sanitizeExportFileName(s.name, finalExt);
+    const filters =
+      format === 'ico' ? [{ name: 'Icon File', extensions: ['ico'] }]
+      : format === 'dds' ? [{ name: 'DDS Texture (BC7)', extensions: ['dds'] }]
+      : [{ name: 'PNG Image', extensions: ['png'] }];
+
+    // El diálogo tiene que abrirse con el gesto del click, antes de generar el archivo.
+    let dest: SaveDestination | null = null;
+    try {
+      dest = await openSaveDestination(defaultName, filters);
+    } catch (err) {
+      console.error(err);
+      dest = downloadDestination(defaultName);
+    }
+    if (!dest) return; // canceló
+
+    setIsSaving(true);
+    try {
+      const canvas = renderSpriteToCanvas(s, true);
+      if (!canvas.width || !canvas.height) {
+        throw new Error('El canvas de exportación quedó vacío.');
+      }
+
+      let blob: Blob;
+
+      if (format === 'dds') {
+        const dds = await canvasToBc7Dds(canvas);
+        if (!dds || (dds instanceof ArrayBuffer ? dds.byteLength === 0 : (dds as Uint8Array).byteLength === 0)) {
+          throw new Error('La conversión DDS BC7 devolvió un archivo vacío.');
+        }
+        blob = new Blob([dds], { type: 'application/octet-stream' });
+      } else {
+        const pngBlob = await canvasToPngBlob(canvas);
+
+        if (format === 'ico') {
+          const sizes = [256, 128, 64, 48, 32, 16];
+          const entries: { size: number; buf: Uint8Array }[] = [];
+
+          for (const size of sizes) {
+            const c = document.createElement('canvas');
+            c.width = size;
+            c.height = size;
+            const cx = c.getContext('2d');
+            if (!cx) continue;
+            cx.imageSmoothingEnabled = false;
+
+            const scale = Math.min(size / canvas.width, size / canvas.height);
+            const dw = Math.max(1, Math.floor(canvas.width * scale));
+            const dh = Math.max(1, Math.floor(canvas.height * scale));
+            const dx = Math.floor((size - dw) / 2);
+            const dy = Math.floor((size - dh) / 2);
+            cx.drawImage(canvas, dx, dy, dw, dh);
+
+            try {
+              const b = await canvasToPngBlob(c);
+              entries.push({ size, buf: new Uint8Array(await b.arrayBuffer()) });
+            } catch {
+              // Si un tamaño falla, seguimos con los demás.
+            }
+          }
+
+          if (entries.length === 0) {
+            // Mejor un PNG que nada: el usuario pidió exportar.
+            const pngName = sanitizeExportFileName(s.name, '.png');
+            if (!forceDownloadBlob(pngBlob, pngName)) {
+              throw new Error('No se pudo armar el ICO ni descargar el PNG de respaldo.');
+            }
+            alert('No se pudo armar el ICO. Se descargó un PNG de respaldo.');
+            return;
+          }
+
+          const header = new Uint8Array(6);
+          header[0] = 0; header[1] = 0; header[2] = 1; header[3] = 0;
+          header[4] = entries.length & 0xff; header[5] = (entries.length >> 8) & 0xff;
+
+          let currentOffset = 6 + 16 * entries.length;
+          const directory = new Uint8Array(16 * entries.length);
+
+          for (let i = 0; i < entries.length; i++) {
+            const { size, buf } = entries[i];
+            const w = size >= 256 ? 0 : size;
+            const h = size >= 256 ? 0 : size;
+            const dirOffset = i * 16;
+            directory[dirOffset + 0] = w;
+            directory[dirOffset + 1] = h;
+            directory[dirOffset + 2] = 0;
+            directory[dirOffset + 3] = 0;
+            directory[dirOffset + 4] = 1;
+            directory[dirOffset + 5] = 0;
+            directory[dirOffset + 6] = 32;
+            directory[dirOffset + 7] = 0;
+
+            const len = buf.length;
+            directory[dirOffset + 8] = len & 0xff;
+            directory[dirOffset + 9] = (len >> 8) & 0xff;
+            directory[dirOffset + 10] = (len >> 16) & 0xff;
+            directory[dirOffset + 11] = (len >> 24) & 0xff;
+
+            directory[dirOffset + 12] = currentOffset & 0xff;
+            directory[dirOffset + 13] = (currentOffset >> 8) & 0xff;
+            directory[dirOffset + 14] = (currentOffset >> 16) & 0xff;
+            directory[dirOffset + 15] = (currentOffset >> 24) & 0xff;
+
+            currentOffset += len;
+          }
+
+          const icoData = new Uint8Array(currentOffset);
+          icoData.set(header, 0);
+          icoData.set(directory, 6);
+
+          let dataOffset = 6 + 16 * entries.length;
+          for (let i = 0; i < entries.length; i++) {
+            icoData.set(entries[i].buf, dataOffset);
+            dataOffset += entries[i].buf.length;
+          }
+
+          blob = new Blob([icoData], { type: 'image/x-icon' });
+        } else {
+          blob = pngBlob;
+        }
+      }
+
+      if (!blob || blob.size === 0) {
+        throw new Error('El archivo a exportar quedó vacío.');
+      }
+
+      const result = await writeBlobWithFallback(dest, blob, defaultName);
+      if (result === 'failed') {
+        throw new Error('No se pudo guardar ni descargar el archivo.');
+      }
+      if (result === 'downloaded' && dest.kind !== 'download') {
+        alert('No se pudo escribir en la ubicación elegida. Se descargó una copia en Descargas.');
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      alert(`Error al exportar${format === 'dds' ? ' DDS BC7' : format === 'ico' ? ' ICO' : ' Sprite'}:\n${msg}`);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const exportGridSpritesheet = async () => {
+    if (sprites.length === 0) return;
+
+    const colsStr = prompt('¿Cuántas columnas deseas para el spritesheet al exportar?', '10');
+    if (!colsStr) return;
+    const cols = parseInt(colsStr, 10);
+
+    const rowsStr = prompt('¿Cuántas filas deseas para el spritesheet al exportar?', '1');
+    if (!rowsStr) return;
+    const rows = parseInt(rowsStr, 10);
+
+    if (isNaN(cols) || cols <= 0 || isNaN(rows) || rows <= 0) {
+      alert('Número de filas o columnas inválido.');
+      return;
+    }
+
+    const includeGrid = window.confirm('¿Deseas dibujar una cuadrícula guía sobre las imágenes exportadas?');
+
+    setIsSaving(true);
+    let maxW = 0;
+    let maxH = 0;
+    
+    // First pass to determine cell dimensions
+    const processedCanvases: HTMLCanvasElement[] = [];
+
+    for (const s of sprites) {
+      const canvas = renderSpriteToCanvas(s, true);
+      maxW = Math.max(maxW, canvas.width);
+      maxH = Math.max(maxH, canvas.height);
+      processedCanvases.push(canvas);
+    }
+
+    const compiledCanvas = document.createElement('canvas');
+    compiledCanvas.width = maxW * cols;
+    compiledCanvas.height = maxH * rows;
+    const ctx = compiledCanvas.getContext('2d')!;
+
+    for (let i = 0; i < processedCanvases.length && i < rows * cols; i++) {
+        const c = i % cols;
+        const r = Math.floor(i / cols);
+        const cellCanvas = processedCanvases[i];
+        
+        const dx = (c * maxW) + Math.floor((maxW - cellCanvas.width) / 2);
+        const dy = (r * maxH) + Math.floor((maxH - cellCanvas.height) / 2);
+        
+        ctx.drawImage(cellCanvas, dx, dy);
+        
+        if (includeGrid) {
+            ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(c * maxW + 0.5, r * maxH + 0.5, maxW - 1, maxH - 1);
+        }
+    }
+
+    const blob = await new Promise<Blob | null>(resolve => compiledCanvas.toBlob(resolve, 'image/png'));
+    if (!blob) {
+      setIsSaving(false);
+      return;
+    }
+
+    try {
+      await saveBlobToDisk(blob, 'spritesheet_export.png', [{ name: 'PNG Image', extensions: ['png'] }]);
+    } catch (err) {
+      console.error(err);
+    }
+    setIsSaving(false);
+  };
+
+  const spriteNameToPng = (name: string) => name.replace(/\.[^.]+$/i, '') + '.png';
+
+  const exportBatch = async (format: 'png' | 'dds', destination: 'zip' | 'folder') => {
+    if (sprites.length === 0) return;
+    setBatchExportFormat(null);
+    setIsSaving(true);
+    try {
+      const desktop = getDesktop();
+      const zip = destination === 'zip' ? new JSZip() : null;
+      let directory: FileSystemDirectoryHandle | null = null;
+      let desktopFolder: DesktopFolder | null = null;
+
+      if (destination === 'folder') {
+        if (desktop) {
+          // Mostrar siempre el navegador nativo. La carpeta recordada es solo
+          // el punto de partida; el usuario confirma o cambia el destino.
+          desktopFolder = await desktop.pickFolder();
+          if (!desktopFolder) return;
+          setWorkingFolder(desktopFolder);
+        } else {
+          if (!('showDirectoryPicker' in window)) {
+            throw new Error('Este navegador no permite elegir carpetas. Usá la opción ZIP o abrí la herramienta en Chrome/Edge.');
+          }
+          directory = await (window as any).showDirectoryPicker({
+            id: WORKING_PICKER_ID,
+            mode: 'readwrite',
+            startIn: dirHandle || undefined,
+          });
+          if (directory && await ensureHandlePermission(directory, 'readwrite')) {
+            updateDirHandle(directory);
+          }
+        }
+      }
+
+      const desktopFiles: { name: string; data: ArrayBuffer }[] = [];
+
+      for (const s of sprites) {
+        const canvas = renderSpriteToCanvas(s, true);
+        const fileName = format === 'dds' ? spriteNameToDds(s.name) : spriteNameToPng(s.name);
+        let content: Blob | ArrayBuffer;
+
+        if (format === 'dds') {
+          content = await canvasToBc7Dds(canvas);
+        } else {
+          const png = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
+          if (!png) throw new Error(`No se pudo generar ${fileName}.`);
+          content = png;
+        }
+
+        if (zip) {
+          zip.file(fileName, content);
+        } else if (desktop && desktopFolder) {
+          desktopFiles.push({
+            name: fileName,
+            data: content instanceof ArrayBuffer ? content : await arrayBufferFromBlob(content),
+          });
+        } else if (directory) {
+          const fileHandle = await directory.getFileHandle(fileName, { create: true });
+          const writable = await fileHandle.createWritable();
+          await writable.write(content);
+          await writable.close();
+        }
+
+        await new Promise((r) => setTimeout(r, 0));
+      }
+
+      if (desktop && desktopFolder && desktopFiles.length > 0) {
+        await desktop.writeFilesToFolder(desktopFolder.path, desktopFiles);
+      }
+
+      if (zip) {
+        const blob = await zip.generateAsync({ type: 'blob' });
+        await saveBlobToDisk(
+          blob,
+          `joa_batch_${format}_${Date.now()}.zip`,
+          [{ name: 'ZIP Archive', extensions: ['zip'] }]
+        );
+      }
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      const msg = err instanceof Error ? err.message : String(err);
+      alert(`Error al exportar ${format.toUpperCase()}:\n${msg}`);
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const firstSelected = sprites.find(s => s.id === selection[0]);
+  const selectedWithMask = sprites.filter(s => selection.includes(s.id) && hasActiveEffectMask(s));
 
   return (
     <div className="layout">
@@ -2042,6 +7362,21 @@ const App: React.FC = () => {
               <input type="checkbox" checked={isWhiteBg} onChange={(e) => setIsWhiteBg(e.target.checked)} style={{ marginRight: '6px', cursor: 'pointer' }} />
               Fondo Blanco
             </label>
+            <span style={{ marginLeft: '16px', height: '20px', width: '1px', background: 'var(--border)', display: 'inline-block' }} />
+            <label style={{ marginLeft: '12px', fontSize: '0.7rem', display: 'inline-flex', alignItems: 'center', gap: '8px', fontWeight: 'normal', color: 'var(--text-muted)', userSelect: 'none' }}>
+              Visualización
+              <input
+                type="range"
+                min="0.5"
+                max="2"
+                step="0.1"
+                value={gridZoom}
+                onChange={(e) => setGridZoom(parseFloat(e.target.value))}
+                style={{ width: '110px', cursor: 'pointer' }}
+                title={`${gridZoom.toFixed(1)}x — Shift + rueda para zoom`}
+              />
+              <span style={{ minWidth: '2.2em', color: 'var(--text-main)', fontWeight: 600 }}>{gridZoom.toFixed(1)}x</span>
+            </label>
           </h1>
         </div>
         <div className="top-actions">
@@ -2049,18 +7384,39 @@ const App: React.FC = () => {
              <Film size={16} /> Probar Animación
            </button>
            <div style={{ height: '24px', width: '1px', background: 'var(--border)', margin: '0 8px' }} />
-           <button className="btn btn-primary" onClick={() => document.getElementById('grid-up')?.click()}>
+           <button className="btn btn-outline" onClick={() => setSelection(sprites.map((s: SpriteData) => s.id))}>
+             <CheckSquare size={16} /> Todos
+           </button>
+           <button className="btn btn-danger" onClick={() => { 
+             const next = sprites.filter((s: SpriteData) => !selection.includes(s.id));
+             commitSprites(next);
+             setSelection([]); 
+           }}>
+             <Trash2 size={16} /> Eliminar
+           </button>
+           <div style={{ height: '24px', width: '1px', background: 'var(--border)', margin: '0 8px' }} />
+           <button className="btn btn-primary" onClick={openImportFiles}>
              <Plus size={16} /> Importar Lote
            </button>
-           <input type="file" id="grid-up" hidden multiple accept="image/*" onChange={(e) => e.target.files && handleFiles(e.target.files)} />
+           <button className="btn btn-primary" onClick={openSliceFile}>
+             <Scissors size={16} /> Cortar Spritesheet
+           </button>
+           <button className="btn btn-outline" onClick={exportGridSpritesheet} disabled={sprites.length === 0}>
+             <Grid size={16} /> Exportar como Tira
+           </button>
+           <input type="file" id="grid-up" hidden multiple accept="image/*" onChange={(e) => { if (e.target.files) handleFiles(e.target.files); e.target.value = ''; }} />
+           <input type="file" id="slice-up" hidden accept="image/*" onChange={(e) => { if (e.target.files && e.target.files[0]) handleSliceFile(e.target.files[0]); e.target.value = ''; }} />
            <div style={{ height: '24px', width: '1px', background: 'var(--border)', margin: '0 8px' }} />
-           <button className="btn btn-outline" onClick={exportZip} disabled={sprites.length === 0}>
-             <Archive size={16} /> Exportar ZIP
+           <button className="btn btn-outline" onClick={() => setBatchExportFormat('png')} disabled={sprites.length === 0 || isSaving}>
+             <Archive size={16} /> Exportar PNG
+           </button>
+           <button className="btn btn-outline" onClick={() => setBatchExportFormat('dds')} disabled={sprites.length === 0 || isSaving} title="Exporta BC7 DDS reales con mipmaps completos, alfa straight y recorte de verde del juego">
+             <Layers size={16} /> {isSaving ? 'Exportando…' : 'Exportar DDS'}
            </button>
         </div>
       </header>
 
-      <div className="main-content" style={{ position: 'relative', display: 'flex' }}
+      <div className="main-content"
         onMouseMove={(e) => {
           if (draggingIndex !== null) {
             const container = document.querySelector('.grid-container');
@@ -2112,6 +7468,40 @@ const App: React.FC = () => {
           ) : (
             <div className="sprite-grid" style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${280 * gridZoom}px, 1fr))` }}>
               {sprites.map((s: SpriteData) => (
+                <div 
+                  key={s.id}
+                  draggable
+                  onDragStart={(e) => {
+                    setDraggedSpriteId(s.id);
+                    e.dataTransfer.effectAllowed = 'move';
+                  }}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = 'move';
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    if (!draggedSpriteId || draggedSpriteId === s.id) return;
+                    
+                    const oldIndex = sprites.findIndex((sp: SpriteData) => sp.id === draggedSpriteId);
+                    const newIndex = sprites.findIndex((sp: SpriteData) => sp.id === s.id);
+                    if (oldIndex === -1 || newIndex === -1) return;
+                    
+                    const newSprites = [...sprites];
+                    const [moved] = newSprites.splice(oldIndex, 1);
+                    newSprites.splice(newIndex, 0, moved);
+                    
+                    commitSprites(newSprites);
+                    setDraggedSpriteId(null);
+                  }}
+                  onDragEnd={() => setDraggedSpriteId(null)}
+                  style={{
+                    opacity: draggedSpriteId === s.id ? 0.4 : 1,
+                    cursor: draggedSpriteId === s.id ? 'grabbing' : 'grab',
+                    transition: 'opacity 0.2s ease',
+                    position: 'relative'
+                  }}
+                >
                 <SpriteModule key={s.id} sprite={s} 
                   isSelected={selection.includes(s.id)}
                   isReference={referenceId === s.id}
@@ -2127,40 +7517,124 @@ const App: React.FC = () => {
                     commitSprites(next);
                   }}
                   onOpenEraser={(id) => setEraserTargetId(id)}
+                  onOpenReplace={(id) => setReplaceTargetId(id)}
+                  onOpenCopyRect={(id) => setCopyRectTargetId(id)}
+                  onOpenPixelEditor={(id) => setPixelEditorTargetId(id)}
                   onOpenTransform={(id) => setTransformTargetId(id)}
                   onOpenTagging={(id) => setTaggingTargetId(id)}
                   onOpenPaint={(id) => setPaintTargetId(id)}
+                  onOpenBucket={(id) => setBucketTargetId(id)}
                   onOpenStretch={(id) => setStretchTargetId(id)}
                   onOpenComposite={(id, size) => setCompositeTarget({ id, size: size || 8192 })}
+                  onExport={handleExportSprite}
                   isWhiteBg={isWhiteBg}
                   onUpdateSprite={(id, updates) => {
                     const next = sprites.map((s: SpriteData) => s.id === id ? { ...s, ...updates } : s);
                     commitSprites(next);
                   }}
                 />
+                </div>
               ))}
             </div>
           )}
         </div>
 
         {/* RIGHT CONTROLS */}
-        <aside className="controls-panel">
+        {!controlsVisible && (
+          <button
+            type="button"
+            className="controls-panel-show-tab"
+            onClick={() => setControlsVisible(true)}
+            title="Mostrar panel de opciones"
+          >
+            <ChevronLeft size={14} />
+            Opciones
+          </button>
+        )}
+        <aside
+          className={`controls-panel${controlsVisible ? '' : ' is-hidden'}${isResizingControls ? ' is-resizing' : ''}`}
+          style={{ '--controls-width': `${controlsWidth}px`, width: controlsVisible ? controlsWidth : 0 } as React.CSSProperties}
+          aria-hidden={!controlsVisible}
+        >
+          <div
+            className="controls-resize-handle"
+            title="Arrastrar para cambiar el ancho · Doble clic para restablecer"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              controlsResizeRef.current = { startX: e.clientX, startWidth: controlsWidth };
+              setIsResizingControls(true);
+            }}
+            onDoubleClick={() => setControlsWidth(CONTROLS_DEFAULT)}
+          />
+          <div className="controls-panel-header">
+            <span>Opciones</span>
+            <button
+              type="button"
+              className="btn-ghost"
+              title="Ocultar panel"
+              onClick={() => setControlsVisible(false)}
+              style={{ padding: '4px 6px' }}
+            >
+              <ChevronRight size={16} />
+            </button>
+          </div>
+          <div className="card">
+            <span className="card-title">Áreas de Efecto</span>
+            <p style={{ fontSize: '0.65rem', color: 'var(--text-muted)', marginBottom: '12px', lineHeight: 1.4 }}>
+              Define una o más zonas del sprite. Los ajustes del panel solo se aplican dentro de esas áreas, y únicamente sobre píxeles con dibujo (se ignoran los vacíos).
+            </p>
+            {selectedWithMask.length > 0 && (
+              <div style={{ fontSize: '0.65rem', color: '#6b66ff', marginBottom: '8px', textAlign: 'center' }}>
+                {selectedWithMask.length} sprite(s) con áreas activas
+              </div>
+            )}
+            <button
+              className="btn btn-primary"
+              style={{ width: '100%', marginBottom: '8px' }}
+              disabled={selection.length === 0}
+              onClick={() => {
+                if (selection.length === 0) return;
+                setEffectMaskTargetId(selection[0]);
+              }}
+            >
+              <Crop size={16} /> Seleccionar Áreas
+            </button>
+            <button
+              className="btn btn-outline"
+              style={{ width: '100%' }}
+              disabled={selection.length === 0}
+              onClick={() => {
+                const next = sprites.map(s =>
+                  selection.includes(s.id) ? { ...s, effectMasks: [], effectMaskBrush: null, effectMaskMode: 'rect' as const } : s
+                );
+                commitSprites(next);
+              }}
+            >
+              Quitar Áreas (Seleccionados)
+            </button>
+          </div>
+
           <div className="card">
             <span className="card-title">Sincronización Local</span>
             <div className="sync-indicator">
-               <div className={`sync-dot ${dirHandle ? 'active' : ''}`} />
-               <span>{dirHandle ? `Sincronizado: ${dirHandle.name}` : 'Sin carpeta seleccionada'}</span>
+               <div className={`sync-dot ${hasLinkedFolder ? 'active' : ''}`} />
+               <span>{hasLinkedFolder ? `Sincronizado: ${linkedFolderName}` : 'Sin carpeta seleccionada'}</span>
             </div>
-            {!dirHandle ? (
+            {!hasLinkedFolder ? (
               <button className="btn btn-outline" style={{ width: '100%' }} onClick={selectDirectory}>
                 <FolderSync size={16} /> Vincular Carpeta
               </button>
             ) : (
-              <button className="btn btn-danger" style={{ width: '100%' }} onClick={overwriteAll} disabled={isSaving || sprites.length === 0}>
-                {isSaving ? 'Guardando...' : <><Save size={16} /> Sobrescribir Originales</>}
-              </button>
+              <>
+                <button className="btn btn-danger" style={{ width: '100%' }} onClick={overwriteAll} disabled={isSaving || sprites.length === 0}>
+                  {isSaving ? 'Guardando...' : <><Save size={16} /> Sobrescribir Originales</>}
+                </button>
+                <button className="btn btn-outline" style={{ width: '100%', marginTop: '8px' }} onClick={selectDirectory} disabled={isSaving}>
+                  <FolderSync size={16} /> Cambiar Carpeta
+                </button>
+              </>
             )}
-            {dirHandle && (
+            {hasLinkedFolder && (
               <p style={{ fontSize: '0.6rem', color: 'var(--text-muted)', marginTop: '8px', textAlign: 'center' }}>
                 <AlertTriangle size={10} style={{ marginRight: '4px' }} /> 
                 Esto reemplazará los archivos en tu disco inmediatamente.
@@ -2183,14 +7657,108 @@ const App: React.FC = () => {
             <button className="btn btn-primary" style={{ marginTop: '16px', width: '100%' }} onClick={applyAlignment} disabled={selection.length === 0}>
                <Target size={16} /> Aplicar Alineación
             </button>
+            <button className="btn btn-outline" style={{ marginTop: '8px', width: '100%' }} onClick={autoMaximizeInternal} disabled={selection.length === 0}>
+               <Maximize size={16} /> Auto-Maximizar a los Márgenes
+            </button>
+            <button className="btn btn-outline" style={{ marginTop: '8px', width: '100%' }} onClick={removeBackgroundBulk} disabled={selection.length === 0}>
+               <Eraser size={16} /> Quitar Fondo Negro Inteligente
+            </button>
+            <button className="btn btn-outline" style={{ marginTop: '8px', width: '100%' }} onClick={flipHorizontalBulk} disabled={selection.length === 0}>
+               <FlipHorizontal size={16} /> Voltear Horizontalmente
+            </button>
             <button className="btn btn-outline" style={{ marginTop: '8px', width: '100%', borderColor: referenceId ? '#ffcc00' : undefined, color: referenceId ? '#ffcc00' : undefined }} 
               onClick={applyReferenceScale} disabled={!referenceId || selection.length === 0}>
                <FolderSync size={16} /> Igualar Resolución
             </button>
             <button className="btn btn-outline" style={{ marginTop: '8px', width: '100%', borderColor: referenceId ? '#ffcc00' : undefined, color: referenceId ? '#ffcc00' : undefined }} 
+              onClick={applyReferenceFrame} disabled={!referenceId || selection.length === 0}>
+               <Maximize size={16} /> Igualar Envase (Por Margen)
+            </button>
+            <button className="btn btn-outline" style={{ marginTop: '8px', width: '100%', borderColor: referenceId ? '#ffcc00' : undefined, color: referenceId ? '#ffcc00' : undefined }} 
               onClick={applyReferenceAlignment} disabled={!referenceId || selection.length === 0}>
                <Save size={16} /> Alinear por Referencia
             </button>
+
+            <div style={{ marginTop: '16px', paddingTop: '12px', borderTop: '1px solid var(--border)' }}>
+              <span className="card-title" style={{ display: 'block', marginBottom: '6px' }}>Recolocar contenido</span>
+              <p style={{ fontSize: '0.65rem', color: 'var(--text-muted)', marginBottom: '10px', lineHeight: 1.4 }}>
+                Desplaza el dibujo de los seleccionados dentro del envase (arriba/abajo/izquierda/derecha) sin cambiar la resolución Full.
+              </p>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+                <div
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(3, 34px)',
+                    gridTemplateRows: 'repeat(3, 34px)',
+                    gap: '4px',
+                    justifyItems: 'center',
+                    alignItems: 'center',
+                  }}
+                >
+                  <span />
+                  <button
+                    type="button"
+                    className="btn btn-outline"
+                    style={{ width: '34px', height: '34px', padding: 0 }}
+                    title="Subir contenido"
+                    disabled={selection.length === 0}
+                    onClick={() => nudgeSelectedContent(0, -contentNudgeStep)}
+                  >
+                    <ArrowUp size={16} />
+                  </button>
+                  <span />
+                  <button
+                    type="button"
+                    className="btn btn-outline"
+                    style={{ width: '34px', height: '34px', padding: 0 }}
+                    title="Mover a la izquierda"
+                    disabled={selection.length === 0}
+                    onClick={() => nudgeSelectedContent(-contentNudgeStep, 0)}
+                  >
+                    <ArrowLeft size={16} />
+                  </button>
+                  <span style={{ fontSize: '0.6rem', color: 'var(--text-muted)' }}>px</span>
+                  <button
+                    type="button"
+                    className="btn btn-outline"
+                    style={{ width: '34px', height: '34px', padding: 0 }}
+                    title="Mover a la derecha"
+                    disabled={selection.length === 0}
+                    onClick={() => nudgeSelectedContent(contentNudgeStep, 0)}
+                  >
+                    <ArrowRight size={16} />
+                  </button>
+                  <span />
+                  <button
+                    type="button"
+                    className="btn btn-outline"
+                    style={{ width: '34px', height: '34px', padding: 0 }}
+                    title="Bajar contenido"
+                    disabled={selection.length === 0}
+                    onClick={() => nudgeSelectedContent(0, contentNudgeStep)}
+                  >
+                    <ArrowDown size={16} />
+                  </button>
+                  <span />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div className="slider-label" style={{ marginBottom: '4px' }}>
+                    <span>Paso</span>
+                    <span>{contentNudgeStep}px</span>
+                  </div>
+                  <input
+                    type="number"
+                    min={1}
+                    max={512}
+                    className="input-small"
+                    style={{ width: '100%' }}
+                    value={contentNudgeStep}
+                    disabled={selection.length === 0}
+                    onChange={(e) => setContentNudgeStep(Math.max(1, parseInt(e.target.value, 10) || 1))}
+                  />
+                </div>
+              </div>
+            </div>
           </div>
 
           <div className="card">
@@ -2198,7 +7766,7 @@ const App: React.FC = () => {
             <div className="slider-group">
               <div className="slider-item">
                 <div className="slider-label"><span>Escala</span><span>{firstSelected ? (firstSelected.scale || 1).toFixed(2) : 1}x</span></div>
-                <input type="range" min="0.1" max="4" step="0.05" value={firstSelected ? (firstSelected.scale || 1) : 1}
+                <input type="range" min="0.1" max="4" step="0.01" value={firstSelected ? (firstSelected.scale || 1) : 1}
                   onChange={(e) => updateBulkScale(parseFloat(e.target.value))} disabled={selection.length === 0}
                 />
               </div>
@@ -2222,13 +7790,13 @@ const App: React.FC = () => {
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
                 <div className="slider-item">
                   <div className="slider-label"><span>Estirar H</span><span>{firstSelected ? (firstSelected.stretchX || 1).toFixed(2) : '1.00'}x</span></div>
-                  <input type="range" min="0.1" max="4" step="0.05" value={firstSelected ? (firstSelected.stretchX || 1) : 1}
+                  <input type="range" min="0.1" max="4" step="0.01" value={firstSelected ? (firstSelected.stretchX || 1) : 1}
                     onChange={(e) => updateBulkStretchX(parseFloat(e.target.value))} disabled={selection.length === 0}
                   />
                 </div>
                 <div className="slider-item">
                   <div className="slider-label"><span>Estirar V</span><span>{firstSelected ? (firstSelected.stretchY || 1).toFixed(2) : '1.00'}x</span></div>
-                  <input type="range" min="0.1" max="4" step="0.05" value={firstSelected ? (firstSelected.stretchY || 1) : 1}
+                  <input type="range" min="0.1" max="4" step="0.01" value={firstSelected ? (firstSelected.stretchY || 1) : 1}
                     onChange={(e) => updateBulkStretchY(parseFloat(e.target.value))} disabled={selection.length === 0}
                   />
                 </div>
@@ -2245,12 +7813,52 @@ const App: React.FC = () => {
           </div>
 
           <div className="card">
+            <span className="card-title">Ajuste Dinámico - Escala Interna (Conserva Envase)</span>
+            <div className="slider-group">
+              <div className="slider-item">
+                <div className="slider-label"><span>Escala Interna</span><span>{firstSelected ? (firstSelected.scale || 1).toFixed(2) : 1}x</span></div>
+                <input type="range" min="0.1" max="4" step="0.01" value={firstSelected ? (firstSelected.scale || 1) : 1}
+                  onChange={(e) => updateBulkInternalScale(parseFloat(e.target.value))} disabled={selection.length === 0}
+                />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '8px' }}>
+                <div className="slider-item" style={{ marginBottom: 0 }}>
+                  <div className="slider-label"><span>Ancho Interno (px)</span></div>
+                  <input type="number" step="1" style={{ width: '100%', background: '#1a1a1a', border: '1px solid #333', color: 'white', padding: '4px', borderRadius: '4px' }}
+                    value={firstSelected ? Math.round(firstSelected.img.width * (firstSelected.scale || 1) * (firstSelected.stretchX || 1)) : 0}
+                    onChange={(e) => updateBulkInternalWidth(parseInt(e.target.value) || 0)} disabled={selection.length === 0}
+                  />
+                </div>
+                <div className="slider-item" style={{ marginBottom: 0 }}>
+                  <div className="slider-label"><span>Alto Interno (px)</span></div>
+                  <input type="number" step="1" style={{ width: '100%', background: '#1a1a1a', border: '1px solid #333', color: 'white', padding: '4px', borderRadius: '4px' }}
+                    value={firstSelected ? Math.round(firstSelected.img.height * (firstSelected.scale || 1) * (firstSelected.stretchY || 1)) : 0}
+                    onChange={(e) => updateBulkInternalHeight(parseInt(e.target.value) || 0)} disabled={selection.length === 0}
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="card">
             <span className="card-title">Ajuste Dinámico - Efectos</span>
             <div className="slider-group">
               <div className="slider-item">
                 <div className="slider-label"><span>Pixelación</span><span>{firstSelected ? (firstSelected.pixelation || 1) : 1}px</span></div>
                 <input type="range" min="1" max="100" value={firstSelected ? (firstSelected.pixelation || 1) : 1}
                   onChange={(e) => updateBulkPixelation(parseInt(e.target.value))} disabled={selection.length === 0}
+                />
+              </div>
+              <div className="slider-item">
+                <div className="slider-label"><span>Dibujo a Mano</span><span>{firstSelected ? (firstSelected.handDrawn ?? 0) : 0}%</span></div>
+                <input type="range" min="0" max="100" value={firstSelected ? (firstSelected.handDrawn ?? 0) : 0}
+                  onChange={(e) => updateBulkFilter('handDrawn', parseInt(e.target.value))} disabled={selection.length === 0}
+                />
+              </div>
+              <div className="slider-item">
+                <div className="slider-label"><span>Dibujo a Lápiz</span><span>{firstSelected ? (firstSelected.pencilDrawn ?? 0) : 0}%</span></div>
+                <input type="range" min="0" max="100" value={firstSelected ? (firstSelected.pencilDrawn ?? 0) : 0}
+                  onChange={(e) => updateBulkFilter('pencilDrawn', parseInt(e.target.value))} disabled={selection.length === 0}
                 />
               </div>
               <div className="slider-item">
@@ -2287,10 +7895,97 @@ const App: React.FC = () => {
                 />
               </div>
               <div className="slider-item">
-                <div className="slider-label"><span>Opacidad</span><span>{firstSelected ? (firstSelected.opacity ?? 100) : 100}%</span></div>
+                <div className="slider-label"><span>Tono Verdes</span><span>{firstSelected ? (firstSelected.greenHueShift ?? 0) : 0}º</span></div>
+                <input type="range" min="-180" max="180" value={firstSelected ? (firstSelected.greenHueShift ?? 0) : 0}
+                  onChange={(e) => updateBulkFilter('greenHueShift', parseInt(e.target.value))} disabled={selection.length === 0}
+                />
+              </div>
+              <div className="slider-item">
+                <div className="slider-label"><span>Saturación Verdes</span><span>{firstSelected ? (firstSelected.greenSaturation ?? 100) : 100}%</span></div>
+                <input type="range" min="0" max="200" value={firstSelected ? (firstSelected.greenSaturation ?? 100) : 100}
+                  onChange={(e) => updateBulkFilter('greenSaturation', parseInt(e.target.value))} disabled={selection.length === 0}
+                />
+              </div>
+              <div className="slider-item">
+                <div className="slider-label"><span>Opacidad Verdes</span><span>{firstSelected ? (firstSelected.greenOpacity ?? 100) : 100}%</span></div>
+                <input type="range" min="0" max="100" value={firstSelected ? (firstSelected.greenOpacity ?? 100) : 100}
+                  onChange={(e) => updateBulkFilter('greenOpacity', parseInt(e.target.value))} disabled={selection.length === 0}
+                />
+              </div>
+              <div className="slider-item">
+                <div className="slider-label"><span>Tono Negros</span><span>{firstSelected ? (firstSelected.blackHueShift ?? 0) : 0}º</span></div>
+                <input type="range" min="-180" max="180" value={firstSelected ? (firstSelected.blackHueShift ?? 0) : 0}
+                  onChange={(e) => updateBulkFilter('blackHueShift', parseInt(e.target.value))} disabled={selection.length === 0}
+                />
+              </div>
+              <div className="slider-item">
+                <div className="slider-label"><span>Saturación Negros</span><span>{firstSelected ? (firstSelected.blackSaturation ?? 100) : 100}%</span></div>
+                <input type="range" min="0" max="200" value={firstSelected ? (firstSelected.blackSaturation ?? 100) : 100}
+                  onChange={(e) => updateBulkFilter('blackSaturation', parseInt(e.target.value))} disabled={selection.length === 0}
+                />
+              </div>
+              <div className="slider-item">
+                <div className="slider-label"><span>Opacidad Negros</span><span>{firstSelected ? (firstSelected.blackOpacity ?? 100) : 100}%</span></div>
+                <input type="range" min="0" max="100" value={firstSelected ? (firstSelected.blackOpacity ?? 100) : 100}
+                  onChange={(e) => updateBulkFilter('blackOpacity', parseInt(e.target.value))} disabled={selection.length === 0}
+                />
+              </div>
+              <div className="slider-item">
+                <div className="slider-label"><span>Tono Blancos</span><span>{firstSelected ? (firstSelected.whiteHueShift ?? 0) : 0}º</span></div>
+                <input type="range" min="-180" max="180" value={firstSelected ? (firstSelected.whiteHueShift ?? 0) : 0}
+                  onChange={(e) => updateBulkFilter('whiteHueShift', parseInt(e.target.value))} disabled={selection.length === 0}
+                />
+              </div>
+              <div className="slider-item">
+                <div className="slider-label"><span>Saturación Blancos</span><span>{firstSelected ? (firstSelected.whiteSaturation ?? 100) : 100}%</span></div>
+                <input type="range" min="0" max="200" value={firstSelected ? (firstSelected.whiteSaturation ?? 100) : 100}
+                  onChange={(e) => updateBulkFilter('whiteSaturation', parseInt(e.target.value))} disabled={selection.length === 0}
+                />
+              </div>
+              <div className="slider-item">
+                <div className="slider-label"><span>Opacidad Blancos</span><span>{firstSelected ? (firstSelected.whiteOpacity ?? 100) : 100}%</span></div>
+                <input type="range" min="0" max="100" value={firstSelected ? (firstSelected.whiteOpacity ?? 100) : 100}
+                  onChange={(e) => updateBulkFilter('whiteOpacity', parseInt(e.target.value))} disabled={selection.length === 0}
+                />
+              </div>
+              <div className="slider-item">
+                <div className="slider-label">
+                  <span>Opacidad</span>
+                  <span>{firstSelected ? (firstSelected.opacity ?? 100) : 100}%</span>
+                </div>
                 <input type="range" min="0" max="100" value={firstSelected ? (firstSelected.opacity ?? 100) : 100}
                   onChange={(e) => updateBulkFilter('opacity', parseInt(e.target.value))} disabled={selection.length === 0}
                 />
+                <div style={{ display: 'flex', gap: '4px', marginTop: '6px' }}>
+                  <button
+                    type="button"
+                    className={`btn btn-outline ${(firstSelected?.opacityMode ?? 'absolute') === 'absolute' ? 'active' : ''}`}
+                    style={{
+                      flex: 1, fontSize: '0.65rem', padding: '4px 6px',
+                      borderColor: (firstSelected?.opacityMode ?? 'absolute') === 'absolute' ? 'var(--accent)' : undefined,
+                      color: (firstSelected?.opacityMode ?? 'absolute') === 'absolute' ? 'var(--accent)' : undefined,
+                    }}
+                    onClick={() => updateBulkFilter('opacityMode', 'absolute')}
+                    disabled={selection.length === 0}
+                    title="Opacidad uniforme en toda la zona"
+                  >
+                    Absoluta
+                  </button>
+                  <button
+                    type="button"
+                    className={`btn btn-outline ${firstSelected?.opacityMode === 'radial' ? 'active' : ''}`}
+                    style={{
+                      flex: 1, fontSize: '0.65rem', padding: '4px 6px',
+                      borderColor: firstSelected?.opacityMode === 'radial' ? 'var(--accent)' : undefined,
+                      color: firstSelected?.opacityMode === 'radial' ? 'var(--accent)' : undefined,
+                    }}
+                    onClick={() => updateBulkFilter('opacityMode', 'radial')}
+                    disabled={selection.length === 0}
+                    title="Desde el centro de la imagen: más opaco al centro, más transparente hacia los bordes (solo en la zona)"
+                  >
+                    Progresiva
+                  </button>
+                </div>
               </div>
 
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
@@ -2357,9 +8052,39 @@ const App: React.FC = () => {
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '8px', alignItems: 'center' }}>
                   <div className="slider-item" style={{ marginBottom: 0 }}>
                     <div className="slider-label"><span>Contorno (p)</span><span>{firstSelected?.outlineWidth || 0}px</span></div>
-                    <input type="range" min="0" max="10" value={firstSelected?.outlineWidth || 0}
-                      onChange={(e) => updateBulkFilter('outlineWidth', parseInt(e.target.value))} disabled={selection.length === 0}
+                    <input type="range" min="0" max="10" step="0.01" value={firstSelected?.outlineWidth || 0}
+                      onChange={(e) => updateBulkFilter('outlineWidth', parseFloat(e.target.value))} disabled={selection.length === 0}
                     />
+                    <div style={{ display: 'flex', gap: '4px', marginTop: '6px' }}>
+                      <button
+                        type="button"
+                        className={`btn btn-outline ${(firstSelected?.outlineStyle ?? 'smooth') === 'smooth' ? 'active' : ''}`}
+                        style={{
+                          flex: 1, fontSize: '0.65rem', padding: '4px 6px',
+                          borderColor: (firstSelected?.outlineStyle ?? 'smooth') === 'smooth' ? 'var(--accent)' : undefined,
+                          color: (firstSelected?.outlineStyle ?? 'smooth') === 'smooth' ? 'var(--accent)' : undefined,
+                        }}
+                        onClick={() => updateBulkFilter('outlineStyle', 'smooth')}
+                        disabled={selection.length === 0}
+                        title="Contorno limpio (suave)"
+                      >
+                        Limpio
+                      </button>
+                      <button
+                        type="button"
+                        className={`btn btn-outline ${firstSelected?.outlineStyle === 'pixel' ? 'active' : ''}`}
+                        style={{
+                          flex: 1, fontSize: '0.65rem', padding: '4px 6px',
+                          borderColor: firstSelected?.outlineStyle === 'pixel' ? 'var(--accent)' : undefined,
+                          color: firstSelected?.outlineStyle === 'pixel' ? 'var(--accent)' : undefined,
+                        }}
+                        onClick={() => updateBulkFilter('outlineStyle', 'pixel')}
+                        disabled={selection.length === 0}
+                        title="Contorno pixelado: respeta la grilla de pixelación del sprite"
+                      >
+                        Pixelado
+                      </button>
+                    </div>
                   </div>
                   <input type="color" value={firstSelected?.outlineColor || '#ffffff'} 
                     onChange={(e) => updateBulkFilter('outlineColor', e.target.value)} disabled={selection.length === 0}
@@ -2395,27 +8120,61 @@ const App: React.FC = () => {
                  <Droplets size={16} /> Igualar Efectos
               </button>
               <button className="btn btn-outline" style={{ marginTop: '8px', width: '100%', borderColor: referenceId ? '#ffcc00' : undefined, color: referenceId ? '#ffcc00' : undefined }} 
-                onClick={applyReferencePixelation} disabled={!referenceId || selection.length === 0}>
+                onClick={applyReferencePixelation} disabled={!referenceId || selection.length === 0}
+                title="Iguala el tamaño del píxel de arte del dibujo (no la resolución del archivo) al de la referencia">
                  <Grid size={16} /> Igualar Pixelación
               </button>
             </div>
           </div>
 
-          <div className="card">
-            <span className="card-title">Visualización</span>
-            <input type="range" min="0.5" max="2" step="0.1" value={gridZoom} onChange={(e) => setGridZoom(parseFloat(e.target.value))} />
-          </div>
-
-          <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <button className="btn btn-outline" onClick={() => setSelection(sprites.map((s: SpriteData) => s.id))}><CheckSquare size={16} /> Todos</button>
-            <button className="btn btn-danger" onClick={() => { 
-              const next = sprites.filter((s: SpriteData) => !selection.includes(s.id));
-              commitSprites(next);
-              setSelection([]); 
-            }}><Trash2 size={16} /> Eliminar</button>
-          </div>
         </aside>
       </div>
+
+      {batchExportFormat && (
+        <div className="modal-overlay" onClick={() => setBatchExportFormat(null)}>
+          <div
+            className="modal-content"
+            onClick={(e) => e.stopPropagation()}
+            style={{ width: 'min(440px, calc(100vw - 32px))', height: 'auto' }}
+          >
+            <div className="modal-header">
+              <div>
+                <h3 style={{ fontSize: '1rem' }}>Exportar lote {batchExportFormat.toUpperCase()}</h3>
+                <p style={{ marginTop: '5px', color: 'var(--text-muted)', fontSize: '0.7rem' }}>
+                  Elegí cómo querés guardar los {sprites.length} sprites.
+                </p>
+              </div>
+              <button className="btn-ghost" onClick={() => setBatchExportFormat(null)}>
+                <Trash2 size={16} />
+              </button>
+            </div>
+            <div style={{ padding: '20px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+              <button
+                className="btn btn-outline"
+                onClick={() => exportBatch(batchExportFormat, 'zip')}
+                style={{ minHeight: '92px', flexDirection: 'column', gap: '10px' }}
+              >
+                <Archive size={24} />
+                <span>Descargar ZIP</span>
+                <small style={{ color: 'var(--text-muted)', fontWeight: 400 }}>Un solo archivo comprimido</small>
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={() => exportBatch(batchExportFormat, 'folder')}
+                style={{ minHeight: '92px', flexDirection: 'column', gap: '10px' }}
+              >
+                <FolderSync size={24} />
+                <span>Elegir carpeta</span>
+                <small style={{ color: 'rgba(255,255,255,0.75)', fontWeight: 400 }}>
+                  {workingFolder
+                    ? `Abre por defecto en ${workingFolder.name}`
+                    : 'Archivos sueltos en la carpeta'}
+                </small>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {eraserTargetId && (
         <EraserModal 
@@ -2426,6 +8185,44 @@ const App: React.FC = () => {
             const next = sprites.map((s: SpriteData) => s.id === id ? { ...s, img: newImg } : s);
             commitSprites(next);
             setEraserTargetId(null);
+          }}
+        />
+      )}
+      {replaceTargetId && (
+        <ReplaceBrushModal
+          sprite={sprites.find(s => s.id === replaceTargetId)!}
+          sprites={sprites}
+          onClose={() => setReplaceTargetId(null)}
+          isWhiteBg={isWhiteBg}
+          onSave={(id: string, newImg: HTMLImageElement) => {
+            const next = sprites.map((s: SpriteData) => s.id === id ? { ...s, img: newImg } : s);
+            commitSprites(next);
+            setReplaceTargetId(null);
+          }}
+        />
+      )}
+      {copyRectTargetId && (
+        <CopyRectModal
+          sprite={sprites.find(s => s.id === copyRectTargetId)!}
+          sprites={sprites}
+          onClose={() => setCopyRectTargetId(null)}
+          isWhiteBg={isWhiteBg}
+          onSave={(id: string, newImg: HTMLImageElement) => {
+            const next = sprites.map((s: SpriteData) => s.id === id ? { ...s, img: newImg } : s);
+            commitSprites(next);
+            setCopyRectTargetId(null);
+          }}
+        />
+      )}
+      {pixelEditorTargetId && (
+        <PixelEditorModal
+          sprite={sprites.find(s => s.id === pixelEditorTargetId)!}
+          onClose={() => setPixelEditorTargetId(null)}
+          isWhiteBg={isWhiteBg}
+          onSave={(id: string, newImg: HTMLImageElement) => {
+            const next = sprites.map((s: SpriteData) => s.id === id ? { ...s, img: newImg, originalImg: newImg } : s);
+            commitSprites(next);
+            setPixelEditorTargetId(null);
           }}
         />
       )}
@@ -2441,6 +8238,23 @@ const App: React.FC = () => {
           }}
         />
       )}
+      {effectMaskTargetId && (
+        <EffectMaskModal
+          sprite={sprites.find(s => s.id === effectMaskTargetId)!}
+          onClose={() => setEffectMaskTargetId(null)}
+          isWhiteBg={isWhiteBg}
+          onSave={(id: string, data: EffectMaskSaveData) => {
+            const next = sprites.map(s => s.id === id ? {
+              ...s,
+              effectMaskMode: data.mode,
+              effectMasks: data.mode === 'rect' ? data.masks : [],
+              effectMaskBrush: data.mode === 'brush' ? data.brush : null,
+            } : s);
+            commitSprites(next);
+            setEffectMaskTargetId(null);
+          }}
+        />
+      )}
       {taggingTargetId && (
         <TaggingModal 
           sprite={sprites.find(s => s.id === taggingTargetId)!} 
@@ -2450,6 +8264,18 @@ const App: React.FC = () => {
             const next = sprites.map(s => s.id === id ? { ...s, regions } : s);
             commitSprites(next);
             setTaggingTargetId(null);
+          }}
+        />
+      )}
+      {bucketTargetId && (
+        <BucketModal 
+          sprite={sprites.find(s => s.id === bucketTargetId)!} 
+          onClose={() => setBucketTargetId(null)}
+          isWhiteBg={isWhiteBg}
+          onSave={(id: string, newImg: HTMLImageElement) => {
+            const next = sprites.map(s => s.id === id ? { ...s, img: newImg } : s);
+            commitSprites(next);
+            setBucketTargetId(null);
           }}
         />
       )}

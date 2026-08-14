@@ -3,3 +3,7 @@ dist/
 .DS_Store
 *.log
 .env
+
+# Electron-builder output (unpacked Chromium / temp artifacts)
+sprite_padder/release/
+sprite_padder/release-fresh/

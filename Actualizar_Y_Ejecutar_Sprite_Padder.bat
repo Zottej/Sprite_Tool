@@ -2,6 +2,9 @@
 setlocal
 cd /d "%~dp0\sprite_padder"
 
+echo Cerrando la version Desktop anterior si esta abierta...
+taskkill /IM "JOA_Sprite_Padder_Desktop.exe" /F >nul 2>&1
+
 echo [1/3] Instalando dependencias necesarias...
 call npm install
 
@@ -11,21 +14,18 @@ if %errorlevel% neq 0 (
     exit /b %errorlevel%
 )
 
-echo [2/3] Compilando el proyecto con los ultimos cambios...
+echo [2/3] Compilando HTML y EXE con los ultimos cambios...
 call npm run build
 
 if %errorlevel% neq 0 (
-    echo Error durante la compilacion. Revisa el codigo en src.
+    echo Error durante la compilacion o empaquetado. Revisa el codigo en src.
     pause
     exit /b %errorlevel%
 )
 
-echo [3/3] Actualizando JOA_Sprite_Padder.html...
-copy /y "dist\index.html" "..\JOA_Sprite_Padder.html"
-
+echo [3/3] HTML y EXE desplegados...
 echo.
-echo !EXITO! Los cambios de opacidad y sincronizacion ya estan disponibles.
-echo Abriendo JOA_Sprite_Padder.html...
-start "" "..\JOA_Sprite_Padder.html"
-
+echo EXITO: JOA_Sprite_Padder_Desktop.exe actualizado.
+echo Abriendo version Desktop...
+start "" "%~dp0JOA_Sprite_Padder_Desktop.exe"
 exit /b 0
