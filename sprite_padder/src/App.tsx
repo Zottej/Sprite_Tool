@@ -5306,6 +5306,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     ctx.globalCompositeOperation = 'source-over';
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(sprite.img, 0, 0);
+    extractPalette();
   };
 
   const handleSave = () => {
@@ -5659,6 +5660,53 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
                     {opt.label}
                   </button>
                 ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="paint-dock-row">
+            <div className="paint-dock-group grow">
+              <span className="paint-dock-label">Paleta {palette.length > 0 ? `(${palette.length})` : ''}</span>
+              <div className="paint-dock-controls">
+                <button
+                  type="button"
+                  className={`paint-toggle ${paletteLock ? 'active' : ''}`}
+                  onClick={togglePaletteLock}
+                  title="Solo permite colores de la paleta. El gotero del sprite puede agregar; el de pantalla snapea."
+                >
+                  <Lock size={14} />
+                  Lock
+                </button>
+                <button
+                  type="button"
+                  className="paint-toggle"
+                  onClick={extractPalette}
+                  title="Lee los colores del lienzo (los más usados, hasta 64)"
+                >
+                  Extraer
+                </button>
+                <div className="paint-palette" title="Clic: color A. Shift o clic derecho: color B">
+                  {palette.length === 0 && (
+                    <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>Sin colores — Extraer</span>
+                  )}
+                  {palette.map((hex) => (
+                    <button
+                      key={hex}
+                      type="button"
+                      className={`paint-palette-swatch${hex === paintColor ? ' active' : ''}${hex === ditherColorB && ditherPattern !== 'off' ? ' alt' : ''}`}
+                      style={{ background: hex }}
+                      title={`${hex.toUpperCase()} — clic A, Shift/derecho B`}
+                      onClick={(e) => {
+                        if (e.shiftKey) applyDitherColorB(hex);
+                        else applyPaintColor(hex);
+                      }}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        applyDitherColorB(hex);
+                      }}
+                    />
+                  ))}
+                </div>
               </div>
             </div>
           </div>
