@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
 import { 
   Trash2, Plus, Archive, CheckSquare, Square, 
   Target, FolderSync, Save, AlertTriangle, Eraser, RotateCcw, Search, MapPin, Pencil, MoreHorizontal, FlipHorizontal, FlipVertical, Droplets, Grid, Circle, Maximize, Layers, Play, Pause, Film, PaintBucket, Scissors, Type, Crop, Brush, ChevronLeft, ChevronRight,
-  ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Pipette, Stamp
+  ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Pipette, Stamp, Lock
 } from 'lucide-react';
 import JSZip from 'jszip';
 import { canvasToBc7Dds, spriteNameToDds } from './ddsExport';
@@ -12,6 +12,16 @@ import {
   getDesktop,
   type DesktopFolder,
 } from './desktopBridge';
+import {
+  DITHER_OPTIONS,
+  ditherPick,
+  extractPaletteFromImageData,
+  hexToRgbaCss,
+  nearestPaletteHex,
+  parseDitherPattern,
+  rgbToHex,
+  type DitherPattern,
+} from './paintPixelArt';
 
 // Chrome/Edge recuerdan la última carpeta asociada a este mismo ID.
 // Importar archivos usa otro ID: compartir el de carpetas hace fallar
@@ -4412,6 +4422,7 @@ type BucketPrefs = {
   replaceColor: string;
   mode: BucketMode;
   tolerance: number;
+  paintEmpty: boolean;
 };
 
 const BUCKET_PREFS_KEY = 'joa-bucket-prefs';
@@ -4427,6 +4438,7 @@ const loadBucketPrefs = (): BucketPrefs => {
     replaceColor: normalizeHexColor(saved.replaceColor, loadLastColor('#00ff00')) || '#00ff00',
     mode,
     tolerance: Math.round(clampNum(saved.tolerance, 0, 255, 0)),
+    paintEmpty: saved.paintEmpty === true,
   };
 };
 
@@ -4437,6 +4449,7 @@ const BucketModal: React.FC<BucketModalProps> = ({ sprite, onSave, onClose, isWh
   useModalWheelControls({ zoom, setZoom, workspaceRef });
   const [mode, setMode] = useState<BucketMode>(() => loadBucketPrefs().mode);
   const [tolerance, setTolerance] = useState(() => loadBucketPrefs().tolerance);
+  const [paintEmpty, setPaintEmpty] = useState(() => loadBucketPrefs().paintEmpty);
   const [hoverColor, setHoverColor] = useState<number[] | null>(null);
   const [history, setHistory] = useState<ImageData[]>([]);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -4451,9 +4464,9 @@ const BucketModal: React.FC<BucketModalProps> = ({ sprite, onSave, onClose, isWh
   }, [sprite]);
 
   useEffect(() => {
-    savePref(BUCKET_PREFS_KEY, { zoom, replaceColor, mode, tolerance });
+    savePref(BUCKET_PREFS_KEY, { zoom, replaceColor, mode, tolerance, paintEmpty });
     rememberLastColor(replaceColor);
-  }, [zoom, replaceColor, mode, tolerance]);
+  }, [zoom, replaceColor, mode, tolerance, paintEmpty]);
 
   const hexToRgb = (hex: string) => {
     const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
@@ -4513,10 +4526,14 @@ const BucketModal: React.FC<BucketModalProps> = ({ sprite, onSave, onClose, isWh
     const tb = data[startIdx+2];
     const ta = data[startIdx+3];
     
-    const repRGB = hexToRgb(replaceColor);
+    const repRGB = paintEmpty ? { r: 0, g: 0, b: 0 } : hexToRgb(replaceColor);
     if (!repRGB) return;
 
-    if (tr === repRGB.r && tg === repRGB.g && tb === repRGB.b && ta === 255) return;
+    if (paintEmpty) {
+      if (ta < 8) return;
+    } else if (tr === repRGB.r && tg === repRGB.g && tb === repRGB.b && ta === 255) {
+      return;
+    }
 
     const matchTol = Math.max(tolerance, 4);
     const EMPTY_A = 40;
@@ -4542,6 +4559,13 @@ const BucketModal: React.FC<BucketModalProps> = ({ sprite, onSave, onClose, isWh
     };
 
     const paintAt = (i: number) => {
+      if (paintEmpty) {
+        data[i] = 0;
+        data[i + 1] = 0;
+        data[i + 2] = 0;
+        data[i + 3] = 0;
+        return;
+      }
       data[i] = repRGB.r;
       data[i + 1] = repRGB.g;
       data[i + 2] = repRGB.b;
@@ -4774,7 +4798,36 @@ const BucketModal: React.FC<BucketModalProps> = ({ sprite, onSave, onClose, isWh
              
              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
                 <span className="slider-label" style={{ marginBottom: 0 }}>Color Nuevo</span>
-                <input type="color" value={replaceColor} onChange={(e) => setReplaceColor(e.target.value)} style={{ width: '40px', height: '32px', padding: 0, border: 'none', background: 'none', cursor: 'pointer' }} />
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <input
+                    type="color"
+                    value={replaceColor}
+                    onChange={(e) => setReplaceColor(e.target.value)}
+                    disabled={paintEmpty}
+                    style={{ width: '40px', height: '32px', padding: 0, border: 'none', background: 'none', cursor: paintEmpty ? 'not-allowed' : 'pointer', opacity: paintEmpty ? 0.4 : 1 }}
+                  />
+                  <label
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '6px',
+                      fontSize: '0.75rem',
+                      color: paintEmpty ? 'var(--accent)' : 'var(--text-light)',
+                      cursor: 'pointer',
+                      userSelect: 'none',
+                      whiteSpace: 'nowrap',
+                    }}
+                    title="El balde borra la zona y deja transparencia"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={paintEmpty}
+                      onChange={(e) => setPaintEmpty(e.target.checked)}
+                      style={{ cursor: 'pointer' }}
+                    />
+                    Pintar vacío
+                  </label>
+                </div>
              </div>
           </div>
 
@@ -4804,6 +4857,55 @@ type PaintPrefs = {
   paintColor: string;
   paintOpacity: number;
   paintBehind: boolean;
+  gridLock: boolean;
+  showPixelGrid: boolean;
+  ditherPattern: DitherPattern;
+  ditherColorB: string;
+  ditherEmpty: boolean;
+  paletteLock: boolean;
+};
+
+type PaintGridOrigin = { x: number; y: number; size: number };
+
+const paintGridMod = (n: number, m: number) => ((n % m) + m) % m;
+
+const snapPaintGridCell = (px: number, py: number, origin: PaintGridOrigin) => {
+  const { x: ox, y: oy, size } = origin;
+  return {
+    x: ox + Math.floor((px - ox) / size) * size,
+    y: oy + Math.floor((py - oy) / size) * size,
+  };
+};
+
+/** Recorre celdas (índices) entre dos puntos de la malla, sin saltarse ni repetir. */
+const paintGridCellsOnLine = (
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+): { x: number; y: number }[] => {
+  const cells: { x: number; y: number }[] = [];
+  const dx = Math.abs(x1 - x0);
+  const dy = Math.abs(y1 - y0);
+  const sx = x0 < x1 ? 1 : -1;
+  const sy = y0 < y1 ? 1 : -1;
+  let err = dx - dy;
+  let x = x0;
+  let y = y0;
+  while (true) {
+    cells.push({ x, y });
+    if (x === x1 && y === y1) break;
+    const e2 = 2 * err;
+    if (e2 > -dy) {
+      err -= dy;
+      x += sx;
+    }
+    if (e2 < dx) {
+      err += dx;
+      y += sy;
+    }
+  }
+  return cells;
 };
 
 const PAINT_PREFS_KEY = 'joa-paint-prefs';
@@ -4817,6 +4919,12 @@ const loadPaintPrefs = (): PaintPrefs => {
     paintColor: normalizeHexColor(saved.paintColor, loadLastColor('#ff0000')) || '#ff0000',
     paintOpacity: Math.round(clampNum(saved.paintOpacity, 1, 100, 100)),
     paintBehind: saved.paintBehind === true,
+    gridLock: saved.gridLock === true,
+    showPixelGrid: saved.showPixelGrid === true,
+    ditherPattern: parseDitherPattern(saved.ditherPattern),
+    ditherColorB: normalizeHexColor(saved.ditherColorB, '#000000') || '#000000',
+    ditherEmpty: saved.ditherEmpty === true,
+    paletteLock: saved.paletteLock === true,
   };
 };
 
@@ -4827,6 +4935,14 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
   const [paintColor, setPaintColor] = useState(() => loadPaintPrefs().paintColor);
   const [paintOpacity, setPaintOpacity] = useState(() => loadPaintPrefs().paintOpacity);
   const [paintBehind, setPaintBehind] = useState(() => loadPaintPrefs().paintBehind);
+  const [gridLock, setGridLock] = useState(() => loadPaintPrefs().gridLock);
+  const [showPixelGrid, setShowPixelGrid] = useState(() => loadPaintPrefs().showPixelGrid);
+  const [ditherPattern, setDitherPattern] = useState<DitherPattern>(() => loadPaintPrefs().ditherPattern);
+  const [ditherColorB, setDitherColorB] = useState(() => loadPaintPrefs().ditherColorB);
+  const [ditherEmpty, setDitherEmpty] = useState(() => loadPaintPrefs().ditherEmpty);
+  const [paletteLock, setPaletteLock] = useState(() => loadPaintPrefs().paletteLock);
+  const [palette, setPalette] = useState<string[]>([]);
+  const [gridOrigin, setGridOrigin] = useState<PaintGridOrigin | null>(null);
   const [eyedropperMode, setEyedropperMode] = useState(false);
   const [zoom, setZoom] = useState(() => loadPaintPrefs().zoom);
   const [colorDraft, setColorDraft] = useState(() => loadPaintPrefs().paintColor);
@@ -4841,6 +4957,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
   const isDrawingRef = useRef(false);
   /** Evita acumular alfa al pasar dos veces el mismo píxel en un mismo trazo semitransparente. */
   const strokePaintedRef = useRef<Set<string> | null>(null);
+  const gridOriginRef = useRef<PaintGridOrigin | null>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -4851,13 +4968,26 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     ctx.drawImage(sprite.img, 0, 0);
     historyRef.current = [];
     setHistoryLen(0);
+    const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    setPalette(extractPaletteFromImageData(data));
   }, [sprite]);
 
   useEffect(() => {
-    savePref(PAINT_PREFS_KEY, { zoom, brushSize, brushShape, paintColor, paintOpacity, paintBehind });
+    savePref(PAINT_PREFS_KEY, {
+      zoom, brushSize, brushShape, paintColor, paintOpacity, paintBehind, gridLock,
+      showPixelGrid, ditherPattern, ditherColorB, ditherEmpty, paletteLock,
+    });
     rememberLastColor(paintColor);
     setColorDraft(paintColor);
-  }, [zoom, brushSize, brushShape, paintColor, paintOpacity, paintBehind]);
+  }, [zoom, brushSize, brushShape, paintColor, paintOpacity, paintBehind, gridLock, showPixelGrid, ditherPattern, ditherColorB, ditherEmpty, paletteLock]);
+
+  useEffect(() => {
+    const size = Math.max(1, Math.round(brushSize));
+    if (!gridLock || (gridOriginRef.current && gridOriginRef.current.size !== size)) {
+      gridOriginRef.current = null;
+      setGridOrigin(null);
+    }
+  }, [gridLock, brushSize]);
 
   const pushHistory = () => {
     const canvas = canvasRef.current;
@@ -4905,8 +5035,50 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     return () => window.removeEventListener('keydown', onKey, true);
   }, [eyedropperMode]);
 
-  const toHex = (r: number, g: number, b: number) =>
-    '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
+  const extractPalette = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    setPalette(extractPaletteFromImageData(data));
+  };
+
+  const applyPaintColor = (raw: string, opts?: { addIfMissing?: boolean }) => {
+    let hex = normalizeHexColor(raw, paintColor) || paintColor;
+    if (opts?.addIfMissing) {
+      setPalette((prev) => {
+        if (prev.includes(hex)) return prev;
+        return [hex, ...prev].slice(0, 64);
+      });
+      setPaintColor(hex);
+      return;
+    }
+    if (paletteLock && palette.length > 0) {
+      hex = nearestPaletteHex(hex, palette);
+    }
+    setPaintColor(hex);
+  };
+
+  const applyDitherColorB = (raw: string) => {
+    let hex = normalizeHexColor(raw, ditherColorB) || ditherColorB;
+    if (paletteLock && palette.length > 0) hex = nearestPaletteHex(hex, palette);
+    setDitherColorB(hex);
+  };
+
+  const togglePaletteLock = () => {
+    if (paletteLock) {
+      setPaletteLock(false);
+      return;
+    }
+    if (palette.length === 0) extractPalette();
+    setPaletteLock(true);
+  };
+
+  useEffect(() => {
+    if (!paletteLock || palette.length === 0) return;
+    setPaintColor((c) => nearestPaletteHex(c, palette));
+    setDitherColorB((c) => nearestPaletteHex(c, palette));
+  }, [paletteLock, palette]);
 
   const sampleCanvasColor = (e: React.MouseEvent) => {
     const canvas = canvasRef.current;
@@ -4920,8 +5092,8 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     if (px < 0 || py < 0 || px >= canvas.width || py >= canvas.height) return;
     const { data } = ctx.getImageData(px, py, 1, 1);
     if (data[3] < 8) return; // vacío: no cambiar color
-    const hex = rememberLastColor(toHex(data[0], data[1], data[2]));
-    if (hex) setPaintColor(hex);
+    const hex = rememberLastColor(rgbToHex(data[0], data[1], data[2]));
+    if (hex) applyPaintColor(hex, { addIfMissing: paletteLock });
     setEyedropperMode(false);
   };
 
@@ -4934,19 +5106,30 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     try {
       const result = await new EyeDropperCtor().open();
       const hex = rememberLastColor(result?.sRGBHex || '');
-      if (hex) setPaintColor(hex);
+      if (hex) applyPaintColor(hex);
     } catch {
       // Cancelado por el usuario
     }
   };
 
-  const paintCssColor = () => {
-    const hex = normalizeHexColor(paintColor, '#ff0000') || '#ff0000';
-    const r = parseInt(hex.slice(1, 3), 16);
-    const g = parseInt(hex.slice(3, 5), 16);
-    const b = parseInt(hex.slice(5, 7), 16);
-    const a = Math.max(0, Math.min(1, paintOpacity / 100));
-    return `rgba(${r}, ${g}, ${b}, ${a})`;
+  const paintCssColor = (hex = paintColor) =>
+    hexToRgbaCss(normalizeHexColor(hex, '#ff0000') || '#ff0000', paintOpacity);
+
+  const applyDitherStyle = (
+    ctx: CanvasRenderingContext2D,
+    ix: number,
+    iy: number,
+    colorA: string,
+    colorB: string,
+  ): boolean => {
+    if (ditherPattern === 'off') {
+      ctx.fillStyle = colorA;
+      return true;
+    }
+    const pick = ditherPick(ix, iy, ditherPattern);
+    if (pick === 'b' && ditherEmpty) return false;
+    ctx.fillStyle = pick === 'b' ? colorB : colorA;
+    return true;
   };
 
   const stampBrush = (
@@ -4954,6 +5137,8 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     px: number,
     py: number,
     painted: Set<string> | null,
+    colorA: string,
+    colorB: string,
   ) => {
     const ix = Math.round(px);
     const iy = Math.round(py);
@@ -4972,6 +5157,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
         } else if (x < px - r || x >= px + r || y < py - r || y >= py + r) {
           continue;
         }
+        if (!applyDitherStyle(ctx, x, y, colorA, colorB)) continue;
         if (painted) {
           const key = `${x},${y}`;
           if (painted.has(key)) continue;
@@ -4980,6 +5166,54 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
         ctx.fillRect(x, y, 1, 1);
       }
     }
+  };
+
+  const stampGridCell = (
+    ctx: CanvasRenderingContext2D,
+    cellX: number,
+    cellY: number,
+    origin: PaintGridOrigin,
+    painted: Set<string> | null,
+    colorA: string,
+    colorB: string,
+  ) => {
+    const key = `${cellX},${cellY}`;
+    if (painted) {
+      if (painted.has(key)) return;
+      painted.add(key);
+    }
+    const size = origin.size;
+    const ix = Math.round((cellX - origin.x) / size);
+    const iy = Math.round((cellY - origin.y) / size);
+    if (!applyDitherStyle(ctx, ix, iy, colorA, colorB)) return;
+    if (brushShape === 'circle') {
+      const cx = cellX + size / 2;
+      const cy = cellY + size / 2;
+      const r2 = (size / 2) * (size / 2);
+      for (let y = cellY; y < cellY + size; y++) {
+        for (let x = cellX; x < cellX + size; x++) {
+          const dx = x + 0.5 - cx;
+          const dy = y + 0.5 - cy;
+          if (dx * dx + dy * dy > r2) continue;
+          ctx.fillRect(x, y, 1, 1);
+        }
+      }
+      return;
+    }
+    ctx.fillRect(cellX, cellY, size, size);
+  };
+
+  const ensureGridOrigin = (px: number, py: number): PaintGridOrigin => {
+    if (gridOriginRef.current) return gridOriginRef.current;
+    const size = Math.max(1, Math.round(brushSize));
+    const origin: PaintGridOrigin = {
+      x: Math.floor(px) - Math.floor(size / 2),
+      y: Math.floor(py) - Math.floor(size / 2),
+      size,
+    };
+    gridOriginRef.current = origin;
+    setGridOrigin(origin);
+    return origin;
   };
 
   const draw = (e: React.MouseEvent, forceFirstPoint = false) => {
@@ -5005,8 +5239,28 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     
     // destination-over: paint only shows through transparent / empty pixels
     ctx.globalCompositeOperation = paintBehind ? 'destination-over' : 'source-over';
-    ctx.fillStyle = paintCssColor();
+    const colorA = paintCssColor();
+    const colorB = paintCssColor(ditherColorB);
+    ctx.fillStyle = colorA;
     const painted = strokePaintedRef.current;
+
+    if (gridLock) {
+      const origin = ensureGridOrigin(currX, currY);
+      const cell = snapPaintGridCell(currX, currY, origin);
+      const ix = Math.round((cell.x - origin.x) / origin.size);
+      const iy = Math.round((cell.y - origin.y) / origin.size);
+      if (lastPos.current && !forceFirstPoint) {
+        const lx = Math.round((lastPos.current.x - origin.x) / origin.size);
+        const ly = Math.round((lastPos.current.y - origin.y) / origin.size);
+        for (const c of paintGridCellsOnLine(lx, ly, ix, iy)) {
+          stampGridCell(ctx, origin.x + c.x * origin.size, origin.y + c.y * origin.size, origin, painted, colorA, colorB);
+        }
+      } else {
+        stampGridCell(ctx, cell.x, cell.y, origin, painted, colorA, colorB);
+      }
+      lastPos.current = { x: cell.x, y: cell.y };
+      return;
+    }
 
     if (lastPos.current && !forceFirstPoint) {
       const dx = currX - lastPos.current.x;
@@ -5015,10 +5269,10 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
       const steps = Math.max(1, Math.ceil(dist / Math.max(1, brushSize * 0.35)));
       for (let i = 0; i <= steps; i++) {
         const t = i / steps;
-        stampBrush(ctx, lastPos.current.x + dx * t, lastPos.current.y + dy * t, painted);
+        stampBrush(ctx, lastPos.current.x + dx * t, lastPos.current.y + dy * t, painted, colorA, colorB);
       }
     } else {
-      stampBrush(ctx, currX, currY, painted);
+      stampBrush(ctx, currX, currY, painted, colorA, colorB);
     }
     lastPos.current = { x: currX, y: currY };
   };
@@ -5032,7 +5286,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
       pushHistory();
       strokeSavedRef.current = true;
     }
-    strokePaintedRef.current = paintOpacity < 100 ? new Set() : null;
+    strokePaintedRef.current = (gridLock || paintOpacity < 100) ? new Set() : null;
     isDrawingRef.current = true;
     draw(e, true);
   };
@@ -5063,13 +5317,40 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     newImg.src = dataUrl;
   };
 
+  const ditherPreviewBg = () => {
+    const a = paintCssColor();
+    if (ditherPattern === 'off') return a;
+    const b = ditherEmpty ? 'transparent' : paintCssColor(ditherColorB);
+    return `repeating-conic-gradient(${a} 0% 25%, ${b} 0% 50%) 50% / 6px 6px`;
+  };
+
+  const cellGridOverlay: PaintGridOrigin | null = (() => {
+    if (!gridLock) return null;
+    if (gridOrigin) return gridOrigin;
+    if (!mousePos) return null;
+    const size = Math.max(1, Math.round(brushSize));
+    return {
+      x: Math.floor(mousePos.x) - Math.floor(size / 2),
+      y: Math.floor(mousePos.y) - Math.floor(size / 2),
+      size,
+    };
+  })();
+
+  const statusBits = [
+    gridLock ? (gridOrigin ? `Grilla ${gridOrigin.size}px` : 'Grilla: clic para anclar') : null,
+    ditherPattern !== 'off' ? `Dither ${DITHER_OPTIONS.find((o) => o.id === ditherPattern)?.label}` : null,
+    paletteLock ? `Paleta ${palette.length}` : null,
+    paintBehind ? 'Detrás' : null,
+  ].filter(Boolean) as string[];
+
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal-content" onClick={e => e.stopPropagation()}>
         <div className="modal-header">
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0 }}>
             <Pencil size={18} color="var(--accent)" />
-            <h3 style={{ fontSize: '1rem' }}>Pintar: {sprite.name}</h3>
+            <h3 style={{ fontSize: '1rem', margin: 0 }}>Pintar: {sprite.name}</h3>
+            {statusBits.length > 0 && <span className="paint-status">{statusBits.join(' · ')}</span>}
           </div>
           <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
         </div>
@@ -5085,6 +5366,21 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
              margin: 'auto',
              position: 'relative'
            }}>
+             {showPixelGrid && zoom >= 4 && (
+               <div
+                 style={{
+                   position: 'absolute',
+                   left: 0,
+                   top: 0,
+                   width: sprite.img.width * zoom,
+                   height: sprite.img.height * zoom,
+                   pointerEvents: 'none',
+                   backgroundImage: 'linear-gradient(to right, rgba(255,255,255,0.14) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.14) 1px, transparent 1px)',
+                   backgroundSize: `${zoom}px ${zoom}px`,
+                   zIndex: 999,
+                 }}
+               />
+             )}
              <div style={{ 
                position: 'absolute',
                left: 0,
@@ -5116,26 +5412,69 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
                 setMousePos(null);
               }}
              />
-             {mousePos && canvasRef.current && !eyedropperMode && (
+             {cellGridOverlay && (
+               <div
+                 style={{
+                   position: 'absolute',
+                   left: 0,
+                   top: 0,
+                   width: sprite.img.width,
+                   height: sprite.img.height,
+                   pointerEvents: 'none',
+                   backgroundImage: 'linear-gradient(to right, rgba(255,255,255,0.28) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.28) 1px, transparent 1px)',
+                   backgroundSize: `${cellGridOverlay.size}px ${cellGridOverlay.size}px`,
+                   backgroundPosition: `${paintGridMod(cellGridOverlay.x, cellGridOverlay.size)}px ${paintGridMod(cellGridOverlay.y, cellGridOverlay.size)}px`,
+                   zIndex: 1000,
+                 }}
+               />
+             )}
+             {mousePos && canvasRef.current && !eyedropperMode && (() => {
+               const canvas = canvasRef.current!;
+               const scale = canvas.offsetWidth / canvas.width;
+               const previewBg = ditherPreviewBg();
+               if (gridLock) {
+                 const size = gridOrigin?.size ?? Math.max(1, Math.round(brushSize));
+                 const cell = gridOrigin
+                   ? snapPaintGridCell(mousePos.x, mousePos.y, gridOrigin)
+                   : {
+                       x: Math.floor(mousePos.x) - Math.floor(size / 2),
+                       y: Math.floor(mousePos.y) - Math.floor(size / 2),
+                     };
+                 return (
+                   <div className="brush-preview" style={{
+                     left: cell.x + size / 2,
+                     top: cell.y + size / 2,
+                     width: size * scale,
+                     height: size * scale,
+                     borderColor: paintColor,
+                     background: previewBg,
+                     opacity: 1,
+                     borderRadius: brushShape === 'circle' ? '50%' : '0',
+                   }} />
+                 );
+               }
+               return (
                <div className="brush-preview" style={{
                  left: mousePos.x,
                  top: mousePos.y,
-                 width: brushSize * (canvasRef.current.offsetWidth / canvasRef.current.width) * 2,
-                 height: brushSize * (canvasRef.current.offsetWidth / canvasRef.current.width) * 2,
+                 width: brushSize * scale * 2,
+                 height: brushSize * scale * 2,
                  borderColor: paintColor,
-                 background: paintCssColor(),
+                 background: previewBg,
                  opacity: 1,
                  borderRadius: brushShape === 'circle' ? '50%' : '0'
                }} />
-             )}
+               );
+             })()}
              </div>
            </div>
         </div>
-        <div className="modal-footer" style={{ padding: '20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '24px' }}>
-          <div className="slider-item" style={{ width: '190px', marginBottom: 0 }}>
-             <div className="slider-label"><span>Color</span></div>
-             <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                <input type="color" value={paintColor} onChange={(e) => setPaintColor(e.target.value)} style={{ width: '40px', height: '32px', padding: 0, border: 'none', background: 'none' }} />
+        <div className="paint-dock">
+          <div className="paint-dock-row">
+            <div className="paint-dock-group">
+              <span className="paint-dock-label">Color</span>
+              <div className="paint-dock-controls">
+                <input type="color" className="paint-swatch" value={paintColor} onChange={(e) => applyPaintColor(e.target.value)} title="Color A" />
                 <input
                   type="text"
                   className="input-small"
@@ -5143,10 +5482,10 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
                   onChange={(e) => {
                     setColorDraft(e.target.value);
                     const hex = normalizeHexColor(e.target.value);
-                    if (hex) setPaintColor(hex);
+                    if (hex) applyPaintColor(hex);
                   }}
                   onBlur={() => setColorDraft(paintColor)}
-                  style={{ flex: 1, textTransform: 'uppercase' }}
+                  style={{ width: '78px', textTransform: 'uppercase' }}
                 />
                 <button
                   type="button"
@@ -5167,126 +5506,161 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
                 >
                   <Pipette size={16} />
                 </button>
-             </div>
-          </div>
-          <div className="slider-item" style={{ flex: 1, marginBottom: 0 }}>
-            <div className="slider-label">
-              <span><Search size={14} /> Zoom</span>
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: '2px' }}>
-                <input
-                  type="number"
-                  min={0.5}
-                  max={8}
-                  step={0.1}
-                  value={Number(zoom.toFixed(1))}
-                  onChange={(e) => {
-                    const v = parseFloat(e.target.value);
-                    if (!Number.isFinite(v)) return;
-                    setZoom(Math.min(8, Math.max(0.5, v)));
-                  }}
-                  style={{
-                    width: '48px', background: '#1a1a1a', border: '1px solid #333', color: 'white',
-                    padding: '2px 4px', borderRadius: '4px', textAlign: 'right', fontSize: '0.75rem',
-                  }}
-                />
-                x
-              </span>
+                {ditherPattern !== 'off' && (
+                  <>
+                    <input
+                      type="color"
+                      className="paint-swatch"
+                      value={ditherColorB}
+                      disabled={ditherEmpty}
+                      onChange={(e) => applyDitherColorB(e.target.value)}
+                      title="Color B del dither"
+                    />
+                    <button
+                      type="button"
+                      className={`paint-toggle ${ditherEmpty ? 'active' : ''}`}
+                      onClick={() => setDitherEmpty(v => !v)}
+                      title="Las celdas B quedan vacías (transparencia)"
+                    >
+                      Vacío
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
-            <input type="range" min="0.5" max="8" step="0.1" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
-          </div>
-          <div className="slider-item" style={{ flex: 1, marginBottom: 0 }}>
-            <div className="slider-label">
-              <span>Tamaño de Pincel</span>
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: '2px' }}>
-                <input
-                  type="number"
-                  min={1}
-                  max={100}
-                  step={1}
-                  value={brushSize}
-                  onChange={(e) => {
-                    const v = parseInt(e.target.value, 10);
-                    if (!Number.isFinite(v)) return;
-                    setBrushSize(Math.min(100, Math.max(1, v)));
-                  }}
-                  style={{
-                    width: '48px', background: '#1a1a1a', border: '1px solid #333', color: 'white',
-                    padding: '2px 4px', borderRadius: '4px', textAlign: 'right', fontSize: '0.75rem',
-                  }}
-                />
-                px
-              </span>
+
+            <div className="paint-dock-group grow">
+              <div className="slider-label" style={{ marginBottom: 0 }}>
+                <span>Pincel</span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: '2px' }}>
+                  <input
+                    type="number"
+                    className="paint-num"
+                    min={1}
+                    max={100}
+                    step={1}
+                    value={brushSize}
+                    onChange={(e) => {
+                      const v = parseInt(e.target.value, 10);
+                      if (!Number.isFinite(v)) return;
+                      setBrushSize(Math.min(100, Math.max(1, v)));
+                    }}
+                  />
+                  px
+                </span>
+              </div>
+              <div className="paint-dock-controls">
+                <input type="range" min="1" max="100" value={brushSize} onChange={(e) => setBrushSize(parseInt(e.target.value))} style={{ flex: 1, minWidth: '80px' }} />
+                <button className={`btn-ghost ${brushShape === 'circle' ? 'active' : ''}`} onClick={() => setBrushShape('circle')} title="Círculo">
+                  <Circle size={16} fill={brushShape === 'circle' ? 'currentColor' : 'none'} />
+                </button>
+                <button className={`btn-ghost ${brushShape === 'square' ? 'active' : ''}`} onClick={() => setBrushShape('square')} title="Cuadrado">
+                  <Square size={16} fill={brushShape === 'square' ? 'currentColor' : 'none'} />
+                </button>
+              </div>
             </div>
-            <input type="range" min="1" max="100" value={brushSize} onChange={(e) => setBrushSize(parseInt(e.target.value))} />
-          </div>
-          <div className="slider-item" style={{ flex: 1, marginBottom: 0, minWidth: '120px' }}>
-            <div className="slider-label">
-              <span>Opacidad</span>
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: '2px' }}>
-                <input
-                  type="number"
-                  min={1}
-                  max={100}
-                  step={1}
-                  value={paintOpacity}
-                  onChange={(e) => {
-                    const v = parseInt(e.target.value, 10);
-                    if (!Number.isFinite(v)) return;
-                    setPaintOpacity(Math.min(100, Math.max(1, v)));
-                  }}
-                  style={{
-                    width: '48px', background: '#1a1a1a', border: '1px solid #333', color: 'white',
-                    padding: '2px 4px', borderRadius: '4px', textAlign: 'right', fontSize: '0.75rem',
-                  }}
-                />
-                %
-              </span>
+
+            <div className="paint-dock-group" style={{ width: '120px' }}>
+              <div className="slider-label" style={{ marginBottom: 0 }}>
+                <span>Opacidad</span>
+                <span>{paintOpacity}%</span>
+              </div>
+              <input
+                type="range"
+                min="1"
+                max="100"
+                value={paintOpacity}
+                onChange={(e) => setPaintOpacity(parseInt(e.target.value, 10))}
+                title="Opacidad del pincel (píxeles semitransparentes)"
+              />
             </div>
-            <input
-              type="range"
-              min="1"
-              max="100"
-              value={paintOpacity}
-              onChange={(e) => setPaintOpacity(parseInt(e.target.value, 10))}
-              title="Opacidad del pincel (píxeles semitransparentes)"
-            />
+
+            <div className="paint-dock-group" style={{ width: '140px' }}>
+              <div className="slider-label" style={{ marginBottom: 0 }}>
+                <span><Search size={12} /> Zoom</span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: '2px' }}>
+                  <input
+                    type="number"
+                    className="paint-num"
+                    min={0.5}
+                    max={8}
+                    step={0.1}
+                    value={Number(zoom.toFixed(1))}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      if (!Number.isFinite(v)) return;
+                      setZoom(Math.min(8, Math.max(0.5, v)));
+                    }}
+                  />
+                  x
+                </span>
+              </div>
+              <input type="range" min="0.5" max="8" step="0.1" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
+            </div>
+
+            <div className="paint-dock-actions">
+              <button
+                className="btn btn-outline"
+                onClick={undo}
+                disabled={historyLen === 0}
+                title="Ctrl+Z — deshace el último trazo (solo este sprite)"
+              >
+                <RotateCcw size={16} /> Deshacer
+              </button>
+              <button className="btn btn-outline" onClick={handleReset}>Reiniciar</button>
+              <button className="btn btn-primary" style={{ paddingLeft: '20px', paddingRight: '20px' }} onClick={handleSave}>Guardar</button>
+            </div>
           </div>
-          <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
-            <button className={`btn-ghost ${brushShape === 'circle' ? 'active' : ''}`} onClick={() => setBrushShape('circle')} title="Círculo">
-              <Circle size={16} fill={brushShape === 'circle' ? 'currentColor' : 'none'} />
-            </button>
-            <button className={`btn-ghost ${brushShape === 'square' ? 'active' : ''}`} onClick={() => setBrushShape('square')} title="Cuadrado">
-              <Square size={16} fill={brushShape === 'square' ? 'currentColor' : 'none'} />
-            </button>
-            <button
-              className={`btn-ghost ${paintBehind ? 'active' : ''}`}
-              onClick={() => setPaintBehind(v => !v)}
-              title="Pintar solo en espacios vacíos (detrás del sprite)"
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: '4px',
-                fontSize: '0.7rem',
-                padding: '4px 8px',
-                borderColor: paintBehind ? 'var(--accent)' : undefined,
-                color: paintBehind ? 'var(--accent)' : undefined,
-              }}
-            >
-              <Layers size={14} />
-              Detrás
-            </button>
-          </div>
-          <div style={{ display: 'flex', gap: '12px' }}>
-            <button
-              className="btn btn-outline"
-              onClick={undo}
-              disabled={historyLen === 0}
-              title="Ctrl+Z — deshace el último trazo (solo este sprite)"
-            >
-              <RotateCcw size={16} /> Deshacer
-            </button>
-            <button className="btn btn-outline" onClick={handleReset}>Reiniciar</button>
-            <button className="btn btn-primary" style={{ paddingLeft: '24px', paddingRight: '24px' }} onClick={handleSave}>Guardar Cambios</button>
+
+          <div className="paint-dock-row">
+            <div className="paint-dock-group">
+              <span className="paint-dock-label">Modo</span>
+              <div className="paint-dock-controls">
+                <button
+                  type="button"
+                  className={`paint-toggle ${paintBehind ? 'active' : ''}`}
+                  onClick={() => setPaintBehind(v => !v)}
+                  title="Pintar solo en espacios vacíos (detrás del sprite)"
+                >
+                  <Layers size={14} />
+                  Detrás
+                </button>
+                <button
+                  type="button"
+                  className={`paint-toggle ${gridLock ? 'active' : ''}`}
+                  onClick={() => setGridLock(v => !v)}
+                  title="Tras el primer clic, el pincel queda anclado a una malla del tamaño del pincel"
+                >
+                  <Grid size={14} />
+                  {gridLock && gridOrigin ? `Grilla ${gridOrigin.size}px` : 'Grilla'}
+                </button>
+                <button
+                  type="button"
+                  className={`paint-toggle ${showPixelGrid ? 'active' : ''}`}
+                  onClick={() => setShowPixelGrid(v => !v)}
+                  title="Malla de 1 px del lienzo (se ve a zoom 4× o más)"
+                >
+                  Px
+                </button>
+              </div>
+            </div>
+
+            <div className="paint-dock-group">
+              <span className="paint-dock-label">Dither</span>
+              <div className="paint-seg" role="group" aria-label="Patrón de dither">
+                {DITHER_OPTIONS.map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    className={ditherPattern === opt.id ? 'active' : ''}
+                    title={opt.title}
+                    onClick={() => setDitherPattern(opt.id)}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
         </div>
       </div>
