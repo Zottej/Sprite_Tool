@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
 import { 
   Trash2, Plus, Archive, CheckSquare, Square, 
   Target, FolderSync, Save, AlertTriangle, Eraser, RotateCcw, Search, MapPin, Pencil, MoreHorizontal, FlipHorizontal, FlipVertical, Droplets, Grid, Circle, Maximize, Layers, Play, Pause, Film, PaintBucket, Scissors, Type, Crop, Brush, ChevronLeft, ChevronRight,
-  ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Pipette, Stamp, Lock
+  ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Pipette, Stamp, Lock, Columns2, FolderOpen, Rows3, Hash, ChevronDown, Maximize2
 } from 'lucide-react';
 import JSZip from 'jszip';
 import { canvasToBc7Dds, spriteNameToDds } from './ddsExport';
@@ -28,7 +28,10 @@ import {
 // showOpenFilePicker de forma intermitente.
 const WORKING_PICKER_ID = 'joa-working-folder';
 const OPEN_FILES_PICKER_ID = 'joa-open-images';
+const OPEN_PROJECT_PICKER_ID = 'joa-open-project';
 const SAVE_FILE_PICKER_ID = 'joa-save-file';
+const JOA_PROJECT_KIND = 'joa-sprite-project';
+const JOA_PROJECT_VERSION = 1;
 
 const isProbablyImageFile = (file: File) => {
   if (file.type && file.type.startsWith('image/')) return true;
@@ -65,6 +68,39 @@ const pickImageFiles = async (
   } catch (err: any) {
     if (err?.name === 'AbortError') return [];
     console.warn('showOpenFilePicker falló, se usa el selector clásico:', err);
+    return null;
+  }
+};
+
+/** Abre el selector de proyecto JOA (.zip / .joa). null = fallback <input>; [] = canceló. */
+const pickProjectFile = async (
+  startIn?: FileSystemHandle | null
+): Promise<File[] | null> => {
+  if (!('showOpenFilePicker' in window)) return null;
+  const base = {
+    id: OPEN_PROJECT_PICKER_ID,
+    multiple: false,
+    types: [{
+      description: 'Proyecto JOA',
+      accept: { 'application/zip': ['.zip', '.joa'] },
+    }],
+  };
+  const readHandles = async (options: Record<string, unknown>) => {
+    const handles = await (window as any).showOpenFilePicker(options);
+    return Promise.all(handles.map((handle: FileSystemFileHandle) => handle.getFile()));
+  };
+  try {
+    if (startIn) {
+      try {
+        return await readHandles({ ...base, startIn });
+      } catch (err: any) {
+        if (err?.name === 'AbortError') return [];
+      }
+    }
+    return await readHandles(base);
+  } catch (err: any) {
+    if (err?.name === 'AbortError') return [];
+    console.warn('showOpenFilePicker (proyecto) falló, se usa el selector clásico:', err);
     return null;
   }
 };
@@ -248,7 +284,7 @@ const useModalWheelControls = (opts: {
   zoomRef.current = zoom;
   const brushRef = useRef(brushSize);
   brushRef.current = brushSize;
-  const pendingAnchorRef = useRef<{
+  const lastPointerRef = useRef<{
     clientX: number;
     clientY: number;
     relX: number;
@@ -261,6 +297,31 @@ const useModalWheelControls = (opts: {
     const first = workspace.firstElementChild;
     return first instanceof HTMLElement ? first : null;
   };
+
+  const capturePointerOnContent = (clientX: number, clientY: number) => {
+    const workspace = workspaceRef?.current;
+    if (!workspace) return;
+    const content = resolveContent(workspace);
+    if (!content) return;
+    const cRect = content.getBoundingClientRect();
+    if (cRect.width <= 1 || cRect.height <= 1) return;
+    lastPointerRef.current = {
+      clientX,
+      clientY,
+      relX: (clientX - cRect.left) / cRect.width,
+      relY: (clientY - cRect.top) / cRect.height,
+    };
+  };
+
+  useEffect(() => {
+    const workspace = workspaceRef?.current;
+    if (!workspace) return;
+    const onMove = (e: PointerEvent) => {
+      capturePointerOnContent(e.clientX, e.clientY);
+    };
+    workspace.addEventListener('pointermove', onMove);
+    return () => workspace.removeEventListener('pointermove', onMove);
+  }, [workspaceRef, contentRef]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -282,23 +343,7 @@ const useModalWheelControls = (opts: {
       const clamped = Math.min(zoomMax, Math.max(zoomMin, next));
       if (clamped === oldZoom) return;
 
-      const workspace = workspaceRef?.current;
-      if (workspace) {
-        const content = resolveContent(workspace);
-        if (content) {
-          const cRect = content.getBoundingClientRect();
-          if (cRect.width > 1 && cRect.height > 1) {
-            // Fracción del contenido bajo el cursor (soporta margin:auto / centrado).
-            pendingAnchorRef.current = {
-              clientX: e.clientX,
-              clientY: e.clientY,
-              relX: (e.clientX - cRect.left) / cRect.width,
-              relY: (e.clientY - cRect.top) / cRect.height,
-            };
-          }
-        }
-      }
-
+      capturePointerOnContent(e.clientX, e.clientY);
       setZoom(clamped);
     };
     window.addEventListener('wheel', onWheel, { passive: false, capture: true });
@@ -309,20 +354,33 @@ const useModalWheelControls = (opts: {
   ]);
 
   useLayoutEffect(() => {
-    const anchor = pendingAnchorRef.current;
     const workspace = workspaceRef?.current;
-    if (!anchor || !workspace) return;
-    pendingAnchorRef.current = null;
+    const anchor = lastPointerRef.current;
+    if (!workspace || !anchor) return;
 
     const content = resolveContent(workspace);
     if (!content) return;
 
-    const cRect = content.getBoundingClientRect();
-    const targetX = anchor.relX * cRect.width;
-    const targetY = anchor.relY * cRect.height;
-    // Mover el scroll para que el mismo punto del contenido quede bajo el cursor.
-    workspace.scrollLeft -= (anchor.clientX - targetX) - cRect.left;
-    workspace.scrollTop -= (anchor.clientY - targetY) - cRect.top;
+    // 2 pases: el segundo corrige el salto cuando aparecen las barras de scroll.
+    for (let pass = 0; pass < 2; pass++) {
+      const cRect = content.getBoundingClientRect();
+      if (cRect.width <= 1 || cRect.height <= 1) return;
+      const errX = (cRect.left + anchor.relX * cRect.width) - anchor.clientX;
+      const errY = (cRect.top + anchor.relY * cRect.height) - anchor.clientY;
+      if (Math.abs(errX) < 0.5 && Math.abs(errY) < 0.5) break;
+      workspace.scrollLeft += errX;
+      workspace.scrollTop += errY;
+    }
+
+    const after = content.getBoundingClientRect();
+    if (after.width > 1 && after.height > 1) {
+      lastPointerRef.current = {
+        clientX: anchor.clientX,
+        clientY: anchor.clientY,
+        relX: (anchor.clientX - after.left) / after.width,
+        relY: (anchor.clientY - after.top) / after.height,
+      };
+    }
   }, [zoom, workspaceRef, contentRef]);
 };
 
@@ -332,7 +390,7 @@ const mimeForSaveExt = (ext: string) => {
   if (e === 'ico') return 'image/x-icon';
   if (e === 'jpg' || e === 'jpeg') return 'image/jpeg';
   if (e === 'webp') return 'image/webp';
-  if (e === 'zip') return 'application/zip';
+  if (e === 'zip' || e === 'joa') return 'application/zip';
   return 'application/octet-stream';
 };
 
@@ -592,6 +650,12 @@ interface SpriteData {
   effectMaskBrush?: string | null;
   handDrawn?: number;
   pencilDrawn?: number;
+  /** Columna de comparación en la grilla principal. Ausente = Sin grupo. */
+  columnId?: string;
+  /** Fila compartida de comparación. Ausente = Sin fila. */
+  rowId?: string;
+  /** Dato numérico de interfaz (overlay). No se pinta ni se exporta con el sprite. */
+  compareValue?: string;
 }
 
 const getSpriteFilter = (sprite: SpriteData, isExport = false) => {
@@ -1399,6 +1463,241 @@ const generateId = () => {
   try { return crypto.randomUUID(); } catch (e) { return Math.random().toString(36).substring(2, 15) + Date.now().toString(36); }
 };
 
+const DEFAULT_SPRITE_COLUMN_ID = 'ungrouped';
+const DEFAULT_SPRITE_ROW_ID = 'row-default';
+const SPRITE_COLUMNS_KEY = 'joa-sprite-columns';
+const SPRITE_ROWS_KEY = 'joa-sprite-rows';
+const COLUMN_VIEW_KEY = 'joa-column-view';
+const QUADRANT_VIEW_KEY = 'joa-quadrant-view';
+const COLLAPSED_COLUMNS_KEY = 'joa-collapsed-columns';
+const COLLAPSED_ROWS_KEY = 'joa-collapsed-rows';
+const ROW_LABEL_WIDTH_KEY = 'joa-row-label-width';
+const ROW_LABELS_COLLAPSED_KEY = 'joa-row-labels-collapsed';
+const ROW_LABEL_WIDTH_MIN = 72;
+const ROW_LABEL_WIDTH_MAX = 420;
+const ROW_LABEL_WIDTH_DEFAULT = 148;
+const ROW_LABEL_WIDTH_COLLAPSED = 42;
+const COMPARE_NUMBER_SIZE_KEY = 'joa-compare-number-size';
+const COMPARE_NUMBER_SIZE_MIN = 12;
+const COMPARE_NUMBER_SIZE_MAX = 160;
+
+type SpriteColumn = { id: string; name: string };
+type SpriteRow = { id: string; name: string };
+
+const normalizeSpriteColumns = (saved: unknown): SpriteColumn[] => {
+  if (!Array.isArray(saved)) return [];
+  return saved.flatMap((raw) => {
+    if (!raw || typeof raw !== 'object') return [];
+    const c = raw as { id?: unknown; name?: unknown };
+    if (typeof c.id !== 'string' || c.id === DEFAULT_SPRITE_COLUMN_ID || typeof c.name !== 'string' || !c.name.trim()) return [];
+    return [{ id: c.id, name: c.name.trim() }];
+  });
+};
+
+const normalizeSpriteRows = (saved: unknown): SpriteRow[] => {
+  const fallback: SpriteRow[] = [{ id: DEFAULT_SPRITE_ROW_ID, name: 'Sin fila' }];
+  if (!Array.isArray(saved)) return fallback;
+  const rows = saved.flatMap((raw) => {
+    if (!raw || typeof raw !== 'object') return [];
+    const r = raw as { id?: unknown; name?: unknown };
+    if (typeof r.id !== 'string' || typeof r.name !== 'string' || !r.name.trim()) return [];
+    return [{ id: r.id, name: r.name.trim() }];
+  });
+  if (rows.length === 0) return fallback;
+  const def = rows.find((r) => r.id === DEFAULT_SPRITE_ROW_ID);
+  const rest = rows.filter((r) => r.id !== DEFAULT_SPRITE_ROW_ID);
+  return [{ id: DEFAULT_SPRITE_ROW_ID, name: def?.name || 'Sin fila' }, ...rest];
+};
+
+const loadSpriteColumns = (): SpriteColumn[] => normalizeSpriteColumns(loadPref<SpriteColumn[]>(SPRITE_COLUMNS_KEY, []));
+const loadSpriteRows = (): SpriteRow[] => normalizeSpriteRows(loadPref<SpriteRow[]>(SPRITE_ROWS_KEY, []));
+
+const normalizeIdList = (saved: unknown): string[] => {
+  if (!Array.isArray(saved)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of saved) {
+    if (typeof raw !== 'string' || !raw || seen.has(raw)) continue;
+    seen.add(raw);
+    out.push(raw);
+  }
+  return out;
+};
+
+const toggleIdInList = (ids: string[], id: string) =>
+  ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id];
+
+const isJoaProjectFileName = (name: string) =>
+  /\.(zip|joa)$/i.test(name);
+
+const imageToPngBlob = async (img: HTMLImageElement): Promise<Blob> => {
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, img.naturalWidth || img.width);
+  canvas.height = Math.max(1, img.naturalHeight || img.height);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('No se pudo crear el canvas para guardar el proyecto.');
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(img, 0, 0);
+  return canvasToPngBlob(canvas);
+};
+
+const loadImageFromBlob = (blob: Blob): Promise<HTMLImageElement> =>
+  new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(image);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('No se pudo leer una imagen del proyecto.'));
+    };
+    image.src = url;
+  });
+
+type JoaProjectSpriteMeta = Omit<SpriteData, 'img' | 'originalImg'> & {
+  image: string;
+  originalImage?: string;
+};
+
+type JoaProjectFile = {
+  version: number;
+  kind: typeof JOA_PROJECT_KIND;
+  savedAt: string;
+  columnView: boolean;
+  columns: SpriteColumn[];
+  rows?: SpriteRow[];
+  collapsedColumns?: string[];
+  collapsedRows?: string[];
+  rowLabelWidth?: number;
+  rowLabelsCollapsed?: boolean;
+  referenceId: string | null;
+  sprites: JoaProjectSpriteMeta[];
+};
+
+const spriteToProjectMeta = (s: SpriteData, hasSeparateOriginal: boolean): JoaProjectSpriteMeta => {
+  const { img: _img, originalImg: _orig, ...meta } = s;
+  return {
+    ...meta,
+    image: `images/${s.id}.png`,
+    originalImage: hasSeparateOriginal ? `images/${s.id}.original.png` : undefined,
+  };
+};
+
+const normalizeZipPath = (name: string) =>
+  String(name || '').replace(/\\/g, '/').replace(/^\.?\//, '');
+
+const isSafeZipPath = (name: string) => {
+  const parts = normalizeZipPath(name).split('/');
+  return parts.length > 0 && parts.every((part) => part.length > 0 && part !== '.' && part !== '..');
+};
+
+const findZipEntry = (zip: JSZip, path: string) => {
+  const want = normalizeZipPath(path).toLowerCase();
+  if (!want || !isSafeZipPath(want)) return null;
+  return Object.values(zip.files).find((f) => !f.dir && normalizeZipPath(f.name).toLowerCase() === want) || null;
+};
+
+const parseJoaProjectJson = (raw: unknown): JoaProjectFile => {
+  if (!raw || typeof raw !== 'object') throw new Error('project.json inválido.');
+  const o = raw as Record<string, unknown>;
+  if (o.kind !== JOA_PROJECT_KIND) {
+    throw new Error('El archivo no es un proyecto de JOA Sprite Padder.');
+  }
+  if (typeof o.version !== 'number' || o.version < 1) {
+    throw new Error('Versión de proyecto no reconocida.');
+  }
+  if (!Array.isArray(o.sprites)) throw new Error('El proyecto no tiene sprites.');
+  return {
+    version: o.version,
+    kind: JOA_PROJECT_KIND,
+    savedAt: typeof o.savedAt === 'string' ? o.savedAt : '',
+    columnView: o.columnView === true,
+    columns: normalizeSpriteColumns(o.columns),
+    rows: normalizeSpriteRows(o.rows),
+    collapsedColumns: normalizeIdList(o.collapsedColumns),
+    collapsedRows: normalizeIdList(o.collapsedRows),
+    rowLabelWidth: clampNum(o.rowLabelWidth, ROW_LABEL_WIDTH_MIN, ROW_LABEL_WIDTH_MAX, ROW_LABEL_WIDTH_DEFAULT),
+    rowLabelsCollapsed: o.rowLabelsCollapsed === true,
+    referenceId: typeof o.referenceId === 'string' ? o.referenceId : null,
+    sprites: o.sprites as JoaProjectSpriteMeta[],
+  };
+};
+
+type LoadedJoaProject = {
+  sprites: SpriteData[];
+  columns: SpriteColumn[];
+  rows: SpriteRow[];
+  collapsedColumns: string[];
+  collapsedRows: string[];
+  rowLabelWidth: number;
+  rowLabelsCollapsed: boolean;
+  columnView: boolean;
+  referenceId: string | null;
+};
+
+const loadJoaProjectFromBlob = async (blob: Blob): Promise<LoadedJoaProject> => {
+  const zip = await JSZip.loadAsync(await blob.arrayBuffer());
+  const jsonEntry = findZipEntry(zip, 'project.json');
+  if (!jsonEntry) throw new Error('El archivo no es un proyecto JOA (falta project.json).');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await jsonEntry.async('string'));
+  } catch {
+    throw new Error('No se pudo leer project.json.');
+  }
+  const project = parseJoaProjectJson(parsed);
+  const sprites: SpriteData[] = [];
+  for (const meta of project.sprites) {
+    if (!meta || typeof meta !== 'object' || typeof meta.id !== 'string') continue;
+    const imagePath = typeof meta.image === 'string' ? meta.image : `images/${meta.id}.png`;
+    if (!isSafeZipPath(imagePath)) throw new Error('Ruta de imagen inválida en el proyecto.');
+    const imgEntry = findZipEntry(zip, imagePath);
+    if (!imgEntry) throw new Error(`Falta la imagen de ${meta.name || meta.id}.`);
+    const img = await loadImageFromBlob(await imgEntry.async('blob'));
+    let originalImg = img;
+    if (typeof meta.originalImage === 'string' && isSafeZipPath(meta.originalImage)) {
+      const origEntry = findZipEntry(zip, meta.originalImage);
+      if (origEntry) originalImg = await loadImageFromBlob(await origEntry.async('blob'));
+    }
+    const { image: _image, originalImage: _originalImage, ...rest } = meta;
+    const padding = meta.padding && typeof meta.padding === 'object'
+      ? {
+          top: Number(meta.padding.top) || 0,
+          bottom: Number(meta.padding.bottom) || 0,
+          left: Number(meta.padding.left) || 0,
+          right: Number(meta.padding.right) || 0,
+        }
+      : { top: 0, bottom: 0, left: 0, right: 0 };
+    const anchor = meta.anchor && typeof meta.anchor === 'object'
+      ? { x: Number(meta.anchor.x) || 0, y: Number(meta.anchor.y) || 0 }
+      : { x: Math.floor(img.width / 2), y: Math.floor(img.height / 2) };
+    sprites.push({
+      ...(rest as Omit<SpriteData, 'img' | 'originalImg' | 'padding' | 'anchor'>),
+      id: meta.id,
+      name: typeof meta.name === 'string' && meta.name.trim() ? meta.name : `${meta.id}.png`,
+      img,
+      originalImg,
+      padding,
+      anchor,
+    });
+  }
+  if (sprites.length === 0) throw new Error('El proyecto no contiene sprites válidos.');
+  const ids = new Set(sprites.map((s) => s.id));
+  return {
+    sprites,
+    columns: project.columns,
+    rows: project.rows || normalizeSpriteRows([]),
+    collapsedColumns: project.collapsedColumns || [],
+    collapsedRows: project.collapsedRows || [],
+    rowLabelWidth: project.rowLabelWidth ?? ROW_LABEL_WIDTH_DEFAULT,
+    rowLabelsCollapsed: project.rowLabelsCollapsed === true,
+    columnView: project.columnView,
+    referenceId: project.referenceId && ids.has(project.referenceId) ? project.referenceId : null,
+  };
+};
+
 
 // --- Sprite Module Component ---
 interface SpriteModuleProps {
@@ -1422,9 +1721,10 @@ interface SpriteModuleProps {
   onUpdateSprite: (id: string, updates: Partial<SpriteData>) => void;
   isReference?: boolean;
   isWhiteBg?: boolean;
+  quadrantView?: boolean;
 }
 
-const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggleSelect, onRemove, onSetAnchor, onSetReference, onOpenEraser, onOpenReplace, onOpenCopyRect, onOpenPixelEditor, onOpenTransform, onOpenTagging, onOpenPaint, onOpenBucket, onOpenStretch, onOpenComposite, onExport, onUpdateSprite, isReference, isWhiteBg }) => {
+const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggleSelect, onRemove, onSetAnchor, onSetReference, onOpenEraser, onOpenReplace, onOpenCopyRect, onOpenPixelEditor, onOpenTransform, onOpenTagging, onOpenPaint, onOpenBucket, onOpenStretch, onOpenComposite, onExport, onUpdateSprite, isReference, isWhiteBg, quadrantView }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
@@ -1468,6 +1768,18 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
 
   const [isDragging, setIsDragging] = useState(false);
   const [showTools, setShowTools] = useState(false);
+  const [compareDraft, setCompareDraft] = useState(sprite.compareValue ?? '');
+
+  useEffect(() => {
+    setCompareDraft(sprite.compareValue ?? '');
+  }, [sprite.id, sprite.compareValue]);
+
+  const commitCompareValue = () => {
+    const next = compareDraft.trim();
+    const prev = (sprite.compareValue ?? '').trim();
+    if (next === prev) return;
+    onUpdateSprite(sprite.id, { compareValue: next || undefined });
+  };
 
   useEffect(() => {
     if (!showTools) return;
@@ -1545,7 +1857,7 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
   };
 
   return (
-    <div className={`sprite-module ${isSelected ? 'selected' : ''} ${isReference ? 'reference' : ''} ${showTools ? 'tools-open' : ''}`} 
+    <div className={`sprite-module ${isSelected ? 'selected' : ''} ${isReference ? 'reference' : ''} ${showTools ? 'tools-open' : ''} ${quadrantView ? 'is-quadrant' : ''}`} 
          onClick={(e) => {
            if (e.shiftKey || e.ctrlKey || e.metaKey) {
              onToggleSelect(sprite.id, true);
@@ -1709,6 +2021,35 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
             </div>
           );
         })()}
+        <div
+          className="sprite-compare-value"
+          onClick={(e) => e.stopPropagation()}
+          onPointerDown={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <input
+            value={compareDraft}
+            placeholder="—"
+            inputMode="decimal"
+            spellCheck={false}
+            draggable={false}
+            title="Número de comparación (solo interfaz, no se guarda en la imagen)"
+            onChange={(e) => setCompareDraft(e.target.value)}
+            onBlur={commitCompareValue}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.currentTarget.blur();
+              } else if (e.key === 'Escape') {
+                setCompareDraft(sprite.compareValue ?? '');
+                e.currentTarget.blur();
+              }
+            }}
+            onDragStart={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+            }}
+          />
+        </div>
       </div>
 
       <div className="module-footer">
@@ -1750,7 +2091,7 @@ const PixelEditorModal: React.FC<PixelEditorModalProps> = ({ sprite, onSave, onC
     return normalizeHexColor(saved, loadLastColor('#ffffff')) || '#ffffff';
   });
   const [brushSize, setBrushSize] = useState(() => Math.round(clampNum(loadPref('joa-pixel-editor-brush', 1), 1, 32, 1)));
-  const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-pixel-editor-scroll', sprite.name, [zoom]);
+  const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-pixel-editor-scroll', sprite.name);
   useModalWheelControls({
     zoom, setZoom, zoomMin: 0.1, zoomMax: 32, zoomStep: 0.1,
     brushSize, setBrushSize, brushMin: 1, brushMax: 32,
@@ -2166,7 +2507,7 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
   const [isDrawing, setIsDrawing] = useState(false);
   const [mousePos, setMousePos] = useState<{ x: number, y: number } | null>(null);
   const lastPos = useRef<{ x: number, y: number } | null>(null);
-  const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-eraser-scroll', sprite.name, [zoom]);
+  const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-eraser-scroll', sprite.name);
   useModalWheelControls({ zoom, setZoom, brushSize, setBrushSize, workspaceRef });
 
   useEffect(() => {
@@ -2448,7 +2789,7 @@ const ReplaceBrushModal: React.FC<ReplaceBrushModalProps> = ({ sprite, sprites, 
   const historyRef = useRef<ImageData[]>([]);
   const strokeSavedRef = useRef(false);
   const isDrawingRef = useRef(false);
-  const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-replace-scroll', sprite.name, [zoom]);
+  const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-replace-scroll', sprite.name);
   useModalWheelControls({ zoom, setZoom, brushSize, setBrushSize, workspaceRef });
 
   useEffect(() => {
@@ -3169,7 +3510,7 @@ const CopyRectModal: React.FC<CopyRectModalProps> = ({ sprite, sprites, onSave, 
   const { workspaceRef, onWorkspaceScroll } = useRememberedScroll(
     phase === 'select' ? 'joa-copy-rect-src-scroll' : 'joa-copy-rect-dst-scroll',
     (phase === 'select' ? source?.name : sprite.name) || sprite.name,
-    [zoom, phase]
+    [phase]
   );
   useModalWheelControls({ zoom, setZoom, workspaceRef });
 
@@ -4445,7 +4786,7 @@ const loadBucketPrefs = (): BucketPrefs => {
 const BucketModal: React.FC<BucketModalProps> = ({ sprite, onSave, onClose, isWhiteBg }) => {
   const [zoom, setZoom] = useState(() => loadBucketPrefs().zoom);
   const [replaceColor, setReplaceColor] = useState(() => loadBucketPrefs().replaceColor);
-  const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-bucket-scroll', sprite.name, [zoom]);
+  const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-bucket-scroll', sprite.name);
   useModalWheelControls({ zoom, setZoom, workspaceRef });
   const [mode, setMode] = useState<BucketMode>(() => loadBucketPrefs().mode);
   const [tolerance, setTolerance] = useState(() => loadBucketPrefs().tolerance);
@@ -4947,8 +5288,9 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
   const [zoom, setZoom] = useState(() => loadPaintPrefs().zoom);
   const [colorDraft, setColorDraft] = useState(() => loadPaintPrefs().paintColor);
   const [mousePos, setMousePos] = useState<{ x: number, y: number } | null>(null);
-  const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-paint-scroll', sprite.name, [zoom]);
-  useModalWheelControls({ zoom, setZoom, brushSize, setBrushSize, workspaceRef });
+  const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-paint-scroll', sprite.name);
+  const paintStageRef = useRef<HTMLDivElement>(null);
+  useModalWheelControls({ zoom, setZoom, brushSize, setBrushSize, workspaceRef, contentRef: paintStageRef });
   const [historyLen, setHistoryLen] = useState(0);
   const lastPos = useRef<{ x: number, y: number } | null>(null);
   /** Historial local del lienzo de este modal (no toca el undo global ni otros sprites). */
@@ -5346,7 +5688,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-content" onClick={e => e.stopPropagation()}>
+      <div className="modal-content paint-modal" onClick={e => e.stopPropagation()}>
         <div className="modal-header">
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0 }}>
             <Pencil size={18} color="var(--accent)" />
@@ -5357,16 +5699,26 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
         </div>
         <div
           ref={workspaceRef}
-          className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`}
+          className={`eraser-workspace paint-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`}
           style={{ overflow: 'auto' }}
           onScroll={onWorkspaceScroll}
         >
-           <div style={{
-             width: sprite.img.width * zoom,
-             height: sprite.img.height * zoom,
-             margin: 'auto',
-             position: 'relative'
-           }}>
+           <div
+             className="zoom-sizer"
+             style={{
+               width: sprite.img.width * zoom + 80,
+               height: sprite.img.height * zoom + 80,
+             }}
+           >
+           <div
+             ref={paintStageRef}
+             style={{
+               width: sprite.img.width * zoom,
+               height: sprite.img.height * zoom,
+               position: 'relative',
+               flex: '0 0 auto',
+             }}
+           >
              {showPixelGrid && zoom >= 4 && (
                <div
                  style={{
@@ -5468,6 +5820,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
                );
              })()}
              </div>
+           </div>
            </div>
         </div>
         <div className="paint-dock">
@@ -6285,6 +6638,26 @@ const App: React.FC = () => {
   const [selection, setSelection] = useState<string[]>([]);
   const [referenceId, setReferenceId] = useState<string | null>(null);
   const [gridZoom, setGridZoom] = useState(() => clampNum(loadPref('joa-grid-zoom', 1), 0.4, 3, 1));
+  const [columnView, setColumnView] = useState(() => loadPref<boolean>(COLUMN_VIEW_KEY, false) === true);
+  const [quadrantView, setQuadrantView] = useState(() => loadPref<boolean>(QUADRANT_VIEW_KEY, false) === true);
+  const [spriteColumns, setSpriteColumns] = useState<SpriteColumn[]>(() => loadSpriteColumns());
+  const [spriteRows, setSpriteRows] = useState<SpriteRow[]>(() => loadSpriteRows());
+  const [collapsedColumnIds, setCollapsedColumnIds] = useState<string[]>(() => normalizeIdList(loadPref(COLLAPSED_COLUMNS_KEY, [])));
+  const [collapsedRowIds, setCollapsedRowIds] = useState<string[]>(() => normalizeIdList(loadPref(COLLAPSED_ROWS_KEY, [])));
+  const [rowLabelWidth, setRowLabelWidth] = useState(() =>
+    Math.round(clampNum(loadPref(ROW_LABEL_WIDTH_KEY, ROW_LABEL_WIDTH_DEFAULT), ROW_LABEL_WIDTH_MIN, ROW_LABEL_WIDTH_MAX, ROW_LABEL_WIDTH_DEFAULT))
+  );
+  const [rowLabelsCollapsed, setRowLabelsCollapsed] = useState(() => loadPref<boolean>(ROW_LABELS_COLLAPSED_KEY, false) === true);
+  const [isResizingRowLabels, setIsResizingRowLabels] = useState(false);
+  const rowLabelResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+  const [compareNumberSize, setCompareNumberSize] = useState(() =>
+    Math.round(clampNum(loadPref(COMPARE_NUMBER_SIZE_KEY, 32), COMPARE_NUMBER_SIZE_MIN, COMPARE_NUMBER_SIZE_MAX, 32))
+  );
+  const [columnDragOverId, setColumnDragOverId] = useState<string | null>(null);
+  const [columnPanning, setColumnPanning] = useState(false);
+  const columnViewportRef = useRef<HTMLDivElement>(null);
+  const columnBoardRef = useRef<HTMLDivElement>(null);
+  const columnPanRef = useRef<{ x: number; y: number; sl: number; st: number } | null>(null);
   const [eraserTargetId, setEraserTargetId] = useState<string | null>(null);
   const [replaceTargetId, setReplaceTargetId] = useState<string | null>(null);
   const [copyRectTargetId, setCopyRectTargetId] = useState<string | null>(null);
@@ -6302,13 +6675,18 @@ const App: React.FC = () => {
     taggingTargetId || effectMaskTargetId || paintTargetId || bucketTargetId ||
     stretchTargetId || compositeTarget || showAnimationModal
   );
+  const quadrantBoard = columnView && quadrantView;
+  const boardZoomMin = quadrantBoard ? 0.15 : columnView ? 0.25 : 0.5;
+  const boardZoomMax = quadrantBoard ? 4 : columnView ? 3 : 2;
   useModalWheelControls({
     zoom: gridZoom,
     setZoom: setGridZoom,
-    zoomMin: 0.5,
-    zoomMax: 2,
+    zoomMin: boardZoomMin,
+    zoomMax: boardZoomMax,
     zoomStep: 0.1,
     enabled: !anyModalOpen,
+    workspaceRef: columnView ? columnViewportRef : undefined,
+    contentRef: columnView ? columnBoardRef : undefined,
   });
 
   const CONTROLS_MIN = 240;
@@ -6383,6 +6761,42 @@ const App: React.FC = () => {
   }, [gridZoom]);
 
   useEffect(() => {
+    savePref(COLUMN_VIEW_KEY, columnView);
+  }, [columnView]);
+
+  useEffect(() => {
+    savePref(QUADRANT_VIEW_KEY, quadrantView);
+  }, [quadrantView]);
+
+  useEffect(() => {
+    savePref(SPRITE_COLUMNS_KEY, spriteColumns);
+  }, [spriteColumns]);
+
+  useEffect(() => {
+    savePref(SPRITE_ROWS_KEY, spriteRows);
+  }, [spriteRows]);
+
+  useEffect(() => {
+    savePref(COLLAPSED_COLUMNS_KEY, collapsedColumnIds);
+  }, [collapsedColumnIds]);
+
+  useEffect(() => {
+    savePref(COLLAPSED_ROWS_KEY, collapsedRowIds);
+  }, [collapsedRowIds]);
+
+  useEffect(() => {
+    savePref(ROW_LABEL_WIDTH_KEY, rowLabelWidth);
+  }, [rowLabelWidth]);
+
+  useEffect(() => {
+    savePref(ROW_LABELS_COLLAPSED_KEY, rowLabelsCollapsed);
+  }, [rowLabelsCollapsed]);
+
+  useEffect(() => {
+    savePref(COMPARE_NUMBER_SIZE_KEY, compareNumberSize);
+  }, [compareNumberSize]);
+
+  useEffect(() => {
     if (!isResizingControls) return;
     const onMove = (e: MouseEvent) => {
       const start = controlsResizeRef.current;
@@ -6405,6 +6819,30 @@ const App: React.FC = () => {
       window.removeEventListener('mouseup', onUp);
     };
   }, [isResizingControls]);
+
+  useEffect(() => {
+    if (!isResizingRowLabels) return;
+    const onMove = (e: MouseEvent) => {
+      const start = rowLabelResizeRef.current;
+      if (!start) return;
+      const next = Math.round(Math.min(ROW_LABEL_WIDTH_MAX, Math.max(ROW_LABEL_WIDTH_MIN, start.startWidth + (e.clientX - start.startX))));
+      setRowLabelWidth(next);
+    };
+    const onUp = () => {
+      rowLabelResizeRef.current = null;
+      setIsResizingRowLabels(false);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [isResizingRowLabels]);
   const [targets, setTargets] = useState({ top: 100, bottom: 100, left: 100, right: 100 });
   const [contentNudgeStep, setContentNudgeStep] = useState(() => Math.round(clampNum(loadPref('joa-content-nudge-step', 1), 1, 512, 1)));
   useEffect(() => {
@@ -6419,6 +6857,236 @@ const App: React.FC = () => {
   const [highlightedYs, setHighlightedYs] = useState<number[]>([]);
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
   const [draggedSpriteId, setDraggedSpriteId] = useState<string | null>(null);
+  const [draggedColumnId, setDraggedColumnId] = useState<string | null>(null);
+  const [draggedRowId, setDraggedRowId] = useState<string | null>(null);
+  const [rowDragOverId, setRowDragOverId] = useState<string | null>(null);
+  const [cellDragOverKey, setCellDragOverKey] = useState<string | null>(null);
+
+  const getSpriteColumnId = (s: SpriteData) => {
+    const id = s.columnId;
+    if (id && id !== DEFAULT_SPRITE_COLUMN_ID && spriteColumns.some((c) => c.id === id)) return id;
+    return DEFAULT_SPRITE_COLUMN_ID;
+  };
+
+  const getSpriteRowId = (s: SpriteData) => {
+    const id = s.rowId;
+    if (id && id !== DEFAULT_SPRITE_ROW_ID && spriteRows.some((r) => r.id === id)) return id;
+    return DEFAULT_SPRITE_ROW_ID;
+  };
+
+  const compareCellKey = (columnId: string, rowId: string) => `${columnId}::${rowId}`;
+
+  const visibleSpriteColumns: SpriteColumn[] = [
+    { id: DEFAULT_SPRITE_COLUMN_ID, name: 'Sin grupo' },
+    ...spriteColumns,
+  ];
+
+  const moveSpriteToCell = (spriteId: string, columnId: string, rowId: string, beforeId?: string | null) => {
+    const item = sprites.find((s) => s.id === spriteId);
+    if (!item) return;
+    const without = sprites.filter((s) => s.id !== spriteId);
+    const moved: SpriteData = {
+      ...item,
+      columnId: columnId === DEFAULT_SPRITE_COLUMN_ID ? undefined : columnId,
+      rowId: rowId === DEFAULT_SPRITE_ROW_ID ? undefined : rowId,
+    };
+    let insertAt = without.length;
+    if (beforeId) {
+      const idx = without.findIndex((s) => s.id === beforeId);
+      if (idx >= 0) insertAt = idx;
+    } else {
+      let last = -1;
+      without.forEach((s, i) => {
+        if (getSpriteColumnId(s) === columnId && getSpriteRowId(s) === rowId) last = i;
+      });
+      insertAt = last + 1;
+    }
+    commitSprites([...without.slice(0, insertAt), moved, ...without.slice(insertAt)]);
+  };
+
+  const addSpriteColumn = () => {
+    const n = spriteColumns.length + 1;
+    setSpriteColumns((cols) => [...cols, { id: generateId(), name: `Columna ${n}` }]);
+  };
+
+  const renameSpriteColumn = (id: string, name: string) => {
+    setSpriteColumns((cols) => cols.map((c) => (c.id === id ? { ...c, name } : c)));
+  };
+
+  const removeSpriteColumn = (id: string) => {
+    if (id === DEFAULT_SPRITE_COLUMN_ID) return;
+    setSpriteColumns((cols) => cols.filter((c) => c.id !== id));
+    setCollapsedColumnIds((ids) => ids.filter((x) => x !== id));
+    const affected = sprites.some((s) => s.columnId === id);
+    if (affected) {
+      commitSprites(sprites.map((s) => (s.columnId === id ? { ...s, columnId: undefined } : s)));
+    }
+  };
+
+  const moveColumn = (columnId: string, beforeId: string) => {
+    if (columnId === DEFAULT_SPRITE_COLUMN_ID || columnId === beforeId) return;
+    setSpriteColumns((cols) => {
+      const item = cols.find((c) => c.id === columnId);
+      if (!item) return cols;
+      const without = cols.filter((c) => c.id !== columnId);
+      if (beforeId === DEFAULT_SPRITE_COLUMN_ID) return [item, ...without];
+      const idx = without.findIndex((c) => c.id === beforeId);
+      if (idx < 0) return [...without, item];
+      return [...without.slice(0, idx), item, ...without.slice(idx)];
+    });
+  };
+
+  const addSpriteRow = () => {
+    const n = spriteRows.length + 1;
+    setSpriteRows((rows) => [...rows, { id: generateId(), name: `Fila ${n}` }]);
+  };
+
+  const renameSpriteRow = (id: string, name: string) => {
+    setSpriteRows((rows) => rows.map((r) => (r.id === id ? { ...r, name } : r)));
+  };
+
+  const removeSpriteRow = (id: string) => {
+    if (id === DEFAULT_SPRITE_ROW_ID) return;
+    setSpriteRows((rows) => rows.filter((r) => r.id !== id));
+    setCollapsedRowIds((ids) => ids.filter((x) => x !== id));
+    const affected = sprites.some((s) => s.rowId === id);
+    if (affected) {
+      commitSprites(sprites.map((s) => (s.rowId === id ? { ...s, rowId: undefined } : s)));
+    }
+  };
+
+  const moveRow = (rowId: string, beforeId: string) => {
+    if (rowId === DEFAULT_SPRITE_ROW_ID || rowId === beforeId) return;
+    setSpriteRows((rows) => {
+      const def = rows.find((r) => r.id === DEFAULT_SPRITE_ROW_ID) || { id: DEFAULT_SPRITE_ROW_ID, name: 'Sin fila' };
+      const item = rows.find((r) => r.id === rowId);
+      if (!item) return rows;
+      const rest = rows.filter((r) => r.id !== DEFAULT_SPRITE_ROW_ID && r.id !== rowId);
+      if (beforeId === DEFAULT_SPRITE_ROW_ID) return [def, item, ...rest];
+      const idx = rest.findIndex((r) => r.id === beforeId);
+      if (idx < 0) return [def, ...rest, item];
+      return [def, ...rest.slice(0, idx), item, ...rest.slice(idx)];
+    });
+  };
+
+  const isColumnCollapsed = (id: string) => collapsedColumnIds.includes(id);
+  const isRowCollapsed = (id: string) => collapsedRowIds.includes(id);
+  const toggleColumnCollapsed = (id: string) => setCollapsedColumnIds((ids) => toggleIdInList(ids, id));
+  const toggleRowCollapsed = (id: string) => setCollapsedRowIds((ids) => toggleIdInList(ids, id));
+  const allColumnsCollapsed = visibleSpriteColumns.length > 0 && visibleSpriteColumns.every((c) => isColumnCollapsed(c.id));
+  const allRowsCollapsed = spriteRows.length > 0 && spriteRows.every((r) => isRowCollapsed(r.id));
+
+  const isColumnPanTarget = (el: EventTarget | null) => {
+    if (!(el instanceof HTMLElement)) return false;
+    if (el.closest('.sprite-module')) return false;
+    if (el.closest('button, input, textarea, a, .sprite-column-header, .column-row-label, .column-board-corner, .row-label-resize-handle')) return false;
+    return true;
+  };
+
+  const beginRowLabelResize = (e: React.MouseEvent) => {
+    if (rowLabelsCollapsed) return;
+    e.preventDefault();
+    e.stopPropagation();
+    rowLabelResizeRef.current = { startX: e.clientX, startWidth: rowLabelWidth };
+    setIsResizingRowLabels(true);
+  };
+
+  const renderRowLabelResizeHandle = () => rowLabelsCollapsed ? null : (
+    <div
+      className="row-label-resize-handle"
+      title="Arrastrar para cambiar el ancho de los nombres · Doble clic para restablecer"
+      onPointerDown={(e) => e.stopPropagation()}
+      onMouseDown={beginRowLabelResize}
+      onDoubleClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setRowLabelWidth(ROW_LABEL_WIDTH_DEFAULT);
+      }}
+    />
+  );
+
+  const renderSpriteCard = (s: SpriteData, dropColumnId?: string, dropRowId?: string) => (
+    <div
+      key={s.id}
+      draggable
+      onDragStart={(e) => {
+        if ((e.target as HTMLElement).closest('input, textarea, button')) {
+          e.preventDefault();
+          return;
+        }
+        setDraggedSpriteId(s.id);
+        e.dataTransfer.effectAllowed = 'move';
+      }}
+      onDragOver={(e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!draggedSpriteId || draggedSpriteId === s.id) return;
+        if (columnView && dropColumnId) {
+          moveSpriteToCell(draggedSpriteId, dropColumnId, dropRowId || DEFAULT_SPRITE_ROW_ID, s.id);
+        } else {
+          const oldIndex = sprites.findIndex((sp: SpriteData) => sp.id === draggedSpriteId);
+          const newIndex = sprites.findIndex((sp: SpriteData) => sp.id === s.id);
+          if (oldIndex === -1 || newIndex === -1) return;
+          const newSprites = [...sprites];
+          const [moved] = newSprites.splice(oldIndex, 1);
+          newSprites.splice(newIndex, 0, moved);
+          commitSprites(newSprites);
+        }
+        setDraggedSpriteId(null);
+        setColumnDragOverId(null);
+        setCellDragOverKey(null);
+      }}
+      onDragEnd={() => {
+        setDraggedSpriteId(null);
+        setColumnDragOverId(null);
+        setCellDragOverKey(null);
+      }}
+      style={{
+        opacity: draggedSpriteId === s.id ? 0.4 : 1,
+        cursor: draggedSpriteId === s.id ? 'grabbing' : 'grab',
+        transition: 'opacity 0.2s ease',
+        position: 'relative',
+      }}
+    >
+      <SpriteModule
+        sprite={s}
+        isSelected={selection.includes(s.id)}
+        isReference={referenceId === s.id}
+        onToggleSelect={toggleSelect}
+        onSetReference={(id) => setReferenceId(id)}
+        onRemove={(id) => {
+          const next = sprites.filter((x: SpriteData) => x.id !== id);
+          commitSprites(next);
+          if (referenceId === id) setReferenceId(null);
+        }}
+        onSetAnchor={(id, x, y) => {
+          const next = sprites.map((item: SpriteData) => item.id === id ? { ...item, anchor: { x, y } } : item);
+          commitSprites(next);
+        }}
+        onOpenEraser={(id) => setEraserTargetId(id)}
+        onOpenReplace={(id) => setReplaceTargetId(id)}
+        onOpenCopyRect={(id) => setCopyRectTargetId(id)}
+        onOpenPixelEditor={(id) => setPixelEditorTargetId(id)}
+        onOpenTransform={(id) => setTransformTargetId(id)}
+        onOpenTagging={(id) => setTaggingTargetId(id)}
+        onOpenPaint={(id) => setPaintTargetId(id)}
+        onOpenBucket={(id) => setBucketTargetId(id)}
+        onOpenStretch={(id) => setStretchTargetId(id)}
+        onOpenComposite={(id, size) => setCompositeTarget({ id, size: size || 8192 })}
+        onExport={handleExportSprite}
+        isWhiteBg={isWhiteBg}
+        quadrantView={quadrantBoard}
+        onUpdateSprite={(id, updates) => {
+          const next = sprites.map((item: SpriteData) => item.id === id ? { ...item, ...updates } : item);
+          commitSprites(next);
+        }}
+      />
+    </div>
+  );
 
   const linkedFolderName = workingFolder?.name || dirHandle?.name || null;
   const hasLinkedFolder = !!(workingFolder || dirHandle);
@@ -6478,6 +7146,135 @@ const App: React.FC = () => {
       commitSprites(merged);
       setSelection(newSprites.map((s: SpriteData) => s.id));
     }
+  };
+
+  const closeSpriteEditors = () => {
+    setEraserTargetId(null);
+    setReplaceTargetId(null);
+    setCopyRectTargetId(null);
+    setPixelEditorTargetId(null);
+    setTransformTargetId(null);
+    setTaggingTargetId(null);
+    setEffectMaskTargetId(null);
+    setPaintTargetId(null);
+    setBucketTargetId(null);
+    setStretchTargetId(null);
+    setCompositeTarget(null);
+    setShowAnimationModal(false);
+  };
+
+  const applyLoadedProject = (loaded: LoadedJoaProject) => {
+    closeSpriteEditors();
+    setSpriteColumns(loaded.columns);
+    setSpriteRows(loaded.rows);
+    setCollapsedColumnIds(loaded.collapsedColumns);
+    setCollapsedRowIds(loaded.collapsedRows);
+    setRowLabelWidth(loaded.rowLabelWidth);
+    setRowLabelsCollapsed(loaded.rowLabelsCollapsed);
+    setColumnView(loaded.columnView);
+    setReferenceId(loaded.referenceId);
+    setSelection([]);
+    setSprites(loaded.sprites);
+    setHistory([loaded.sprites.map((s) => ({ ...s, padding: { ...s.padding } }))]);
+    setHistoryIndex(0);
+  };
+
+  const openProjectFile = async (file: File) => {
+    if (!file) return;
+    if (sprites.length > 0) {
+      const ok = window.confirm('Abrir el proyecto reemplaza los sprites, columnas y filas actuales. ¿Continuar?');
+      if (!ok) return;
+    }
+    setIsSaving(true);
+    try {
+      applyLoadedProject(await loadJoaProjectFromBlob(file));
+    } catch (err) {
+      console.error(err);
+      alert(err instanceof Error ? err.message : 'No se pudo abrir el proyecto.');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const saveProject = async () => {
+    if (sprites.length === 0) return;
+    const suggestedName = 'JOA_proyecto.joa';
+    const dest = await openSaveDestination(suggestedName, [
+      { name: 'Proyecto JOA', extensions: ['joa', 'zip'] },
+    ]);
+    if (!dest) return;
+    setIsSaving(true);
+    try {
+      const zip = new JSZip();
+      const metas: JoaProjectSpriteMeta[] = [];
+      for (const s of sprites) {
+        const separate = !!(s.originalImg && s.originalImg !== s.img);
+        zip.file(`images/${s.id}.png`, await imageToPngBlob(s.img));
+        if (separate && s.originalImg) {
+          zip.file(`images/${s.id}.original.png`, await imageToPngBlob(s.originalImg));
+        }
+        metas.push(spriteToProjectMeta(s, separate));
+      }
+      const project: JoaProjectFile = {
+        version: JOA_PROJECT_VERSION,
+        kind: JOA_PROJECT_KIND,
+        savedAt: new Date().toISOString(),
+        columnView,
+        columns: spriteColumns,
+        rows: spriteRows,
+        collapsedColumns: collapsedColumnIds,
+        collapsedRows: collapsedRowIds,
+        rowLabelWidth,
+        rowLabelsCollapsed,
+        referenceId,
+        sprites: metas,
+      };
+      zip.file('project.json', JSON.stringify(project, null, 2));
+      const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+      const result = await writeBlobWithFallback(dest, blob, suggestedName);
+      if (result === 'failed') alert('No se pudo guardar el proyecto.');
+    } catch (err) {
+      console.error(err);
+      alert(err instanceof Error ? err.message : 'No se pudo guardar el proyecto.');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const openProjectPicker = async () => {
+    const desktop = getDesktop();
+    if (desktop) {
+      try {
+        const items = await desktop.pickOpenFiles({
+          title: 'Abrir proyecto JOA',
+          multiple: false,
+          filters: [{ name: 'Proyecto JOA', extensions: ['joa', 'zip'] }],
+        });
+        if (items.length === 0) return;
+        await openProjectFile(filesFromDesktopOpen(items)[0]);
+      } catch (err) {
+        console.error(err);
+      }
+      return;
+    }
+
+    const files = await pickProjectFile(dirHandle);
+    if (files === null) {
+      document.getElementById('project-up')?.click();
+      return;
+    }
+    if (files[0]) await openProjectFile(files[0]);
+  };
+
+  const handleDroppedFiles = (rawFiles: FileList | File[]) => {
+    const files = Array.from(rawFiles);
+    const projectFiles = files.filter((f) => isJoaProjectFileName(f.name));
+    const imageFiles = files.filter((f) => isProbablyImageFile(f));
+    if (projectFiles.length > 0 && imageFiles.length === 0) {
+      void openProjectFile(projectFiles[0]);
+      return;
+    }
+    void handleFiles(files);
   };
 
   const openImportFiles = async () => {
@@ -7770,7 +8567,7 @@ const App: React.FC = () => {
   const selectedWithMask = sprites.filter(s => selection.includes(s.id) && hasActiveEffectMask(s));
 
   return (
-    <div className="layout">
+    <div className={`layout${quadrantBoard ? ' is-quadrant-board' : ''}`}>
       {/* TOP BAR */}
       <header className="top-bar">
         <div className="logo-group">
@@ -7789,16 +8586,101 @@ const App: React.FC = () => {
               Visualización
               <input
                 type="range"
-                min="0.5"
-                max="2"
-                step="0.1"
+                min={boardZoomMin}
+                max={boardZoomMax}
+                step={0.05}
                 value={gridZoom}
                 onChange={(e) => setGridZoom(parseFloat(e.target.value))}
                 style={{ width: '110px', cursor: 'pointer' }}
-                title={`${gridZoom.toFixed(1)}x — Shift + rueda para zoom`}
+                title={columnView
+                  ? `${gridZoom.toFixed(2)}x — Shift + rueda sobre el tablero para zoom al cursor. Arrastrá el fondo para moverte.`
+                  : `${gridZoom.toFixed(1)}x — Shift + rueda para zoom`}
               />
-              <span style={{ minWidth: '2.2em', color: 'var(--text-main)', fontWeight: 600 }}>{gridZoom.toFixed(1)}x</span>
+              <span style={{ minWidth: '2.2em', color: 'var(--text-main)', fontWeight: 600 }}>{gridZoom.toFixed(columnView ? 2 : 1)}x</span>
             </label>
+            <button
+              type="button"
+              className={`btn-ghost ${columnView ? 'active' : ''}`}
+              onClick={() => setColumnView((v) => !v)}
+              title="Tabla de comparación: columnas compartidas por las mismas filas"
+              style={{
+                marginLeft: '8px',
+                width: 'auto',
+                padding: '4px 8px',
+                gap: '6px',
+                fontSize: '0.7rem',
+                fontWeight: 600,
+                border: '1px solid var(--border)',
+                borderColor: columnView ? 'var(--accent)' : undefined,
+                color: columnView ? 'var(--accent)' : undefined,
+              }}
+            >
+              <Columns2 size={14} />
+              Columnas
+            </button>
+            {columnView && (
+              <button
+                type="button"
+                className={`btn-ghost ${quadrantView ? 'active' : ''}`}
+                onClick={() => {
+                  setQuadrantView((v) => {
+                    const next = !v;
+                    if (next) setControlsVisible(false);
+                    else setGridZoom((z) => Math.min(3, Math.max(0.25, z)));
+                    return next;
+                  });
+                }}
+                title="Oculta nombres, herramientas y paneles: solo cuadrantes alineados para comparar"
+                style={{
+                  marginLeft: '6px',
+                  width: 'auto',
+                  padding: '4px 8px',
+                  gap: '6px',
+                  fontSize: '0.7rem',
+                  fontWeight: 600,
+                  border: '1px solid var(--border)',
+                  borderColor: quadrantView ? 'var(--accent)' : undefined,
+                  color: quadrantView ? 'var(--accent)' : undefined,
+                }}
+              >
+                <Maximize2 size={14} />
+                Cuadrantes
+              </button>
+            )}
+            <label style={{ marginLeft: '10px', fontSize: '0.7rem', display: 'inline-flex', alignItems: 'center', gap: '8px', fontWeight: 'normal', color: 'var(--text-muted)', userSelect: 'none' }} title="Tamaño del número de cada sprite">
+              <Hash size={14} />
+              Números
+              <input
+                type="range"
+                min={COMPARE_NUMBER_SIZE_MIN}
+                max={COMPARE_NUMBER_SIZE_MAX}
+                step={1}
+                value={compareNumberSize}
+                onChange={(e) => setCompareNumberSize(parseInt(e.target.value, 10))}
+                style={{ width: '90px', cursor: 'pointer' }}
+              />
+              <span style={{ minWidth: '2.4em', color: 'var(--text-main)', fontWeight: 600 }}>{compareNumberSize}px</span>
+            </label>
+            <button
+              type="button"
+              className={`btn-ghost ${controlsVisible ? 'active' : ''}`}
+              onClick={() => setControlsVisible((v) => !v)}
+              title={controlsVisible ? 'Contraer el panel de opciones' : 'Expandir el panel de opciones'}
+              style={{
+                marginLeft: '6px',
+                width: 'auto',
+                padding: '4px 8px',
+                gap: '6px',
+                fontSize: '0.7rem',
+                fontWeight: 600,
+                border: '1px solid var(--border)',
+                borderColor: controlsVisible ? 'var(--accent)' : undefined,
+                color: controlsVisible ? 'var(--accent)' : undefined,
+              }}
+            >
+              {controlsVisible ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
+              Opciones
+            </button>
           </h1>
         </div>
         <div className="top-actions">
@@ -7817,6 +8699,12 @@ const App: React.FC = () => {
              <Trash2 size={16} /> Eliminar
            </button>
            <div style={{ height: '24px', width: '1px', background: 'var(--border)', margin: '0 8px' }} />
+           <button className="btn btn-outline" onClick={openProjectPicker} disabled={isSaving} title="Abre un .joa o .zip con columnas e imágenes">
+             <FolderOpen size={16} /> Abrir proyecto
+           </button>
+           <button className="btn btn-outline" onClick={saveProject} disabled={sprites.length === 0 || isSaving} title="Guarda sprites, columnas y originales en un solo archivo">
+             <Save size={16} /> Guardar proyecto
+           </button>
            <button className="btn btn-primary" onClick={openImportFiles}>
              <Plus size={16} /> Importar Lote
            </button>
@@ -7828,6 +8716,7 @@ const App: React.FC = () => {
            </button>
            <input type="file" id="grid-up" hidden multiple accept="image/*" onChange={(e) => { if (e.target.files) handleFiles(e.target.files); e.target.value = ''; }} />
            <input type="file" id="slice-up" hidden accept="image/*" onChange={(e) => { if (e.target.files && e.target.files[0]) handleSliceFile(e.target.files[0]); e.target.value = ''; }} />
+           <input type="file" id="project-up" hidden accept=".joa,.zip,application/zip" onChange={(e) => { if (e.target.files && e.target.files[0]) openProjectFile(e.target.files[0]); e.target.value = ''; }} />
            <div style={{ height: '24px', width: '1px', background: 'var(--border)', margin: '0 8px' }} />
            <button className="btn btn-outline" onClick={() => setBatchExportFormat('png')} disabled={sprites.length === 0 || isSaving}>
              <Archive size={16} /> Exportar PNG
@@ -7870,7 +8759,41 @@ const App: React.FC = () => {
             ))}
           </div>
         )}
-        <div className="grid-container" style={{ position: 'relative', flex: 1 }} onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); handleFiles(e.dataTransfer.files); }}>
+        <div
+          ref={columnViewportRef}
+          className={`grid-container${columnView ? ' column-board-viewport' : ''}${columnPanning ? ' is-panning' : ''}`}
+          style={{ position: 'relative', flex: 1, '--compare-num-size': `${compareNumberSize}px` } as React.CSSProperties}
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => {
+            if (draggedSpriteId) return;
+            e.preventDefault();
+            handleDroppedFiles(e.dataTransfer.files);
+          }}
+          onPointerDown={(e) => {
+            if (!columnView || e.button !== 0 || draggedSpriteId || isResizingRowLabels) return;
+            if (!isColumnPanTarget(e.target)) return;
+            const el = columnViewportRef.current;
+            if (!el) return;
+            columnPanRef.current = { x: e.clientX, y: e.clientY, sl: el.scrollLeft, st: el.scrollTop };
+            setColumnPanning(true);
+            el.setPointerCapture(e.pointerId);
+          }}
+          onPointerMove={(e) => {
+            const pan = columnPanRef.current;
+            const el = columnViewportRef.current;
+            if (!pan || !el) return;
+            el.scrollLeft = pan.sl - (e.clientX - pan.x);
+            el.scrollTop = pan.st - (e.clientY - pan.y);
+          }}
+          onPointerUp={() => {
+            columnPanRef.current = null;
+            setColumnPanning(false);
+          }}
+          onPointerCancel={() => {
+            columnPanRef.current = null;
+            setColumnPanning(false);
+          }}
+        >
           {showGridlines && <div className="grid-overlay" />}
           {showGridlines && highlightedYs.map((y, idx) => (
             <div key={idx} className="active-guide-line" style={{ top: y }} 
@@ -7885,98 +8808,275 @@ const App: React.FC = () => {
                   <FolderSync size={48} color="#6b66ff" />
                   <h2 style={{ marginTop: '16px' }}>Sincronización Directa de Archivos</h2>
                   <p>Carga tus sprites y reemplaza los originales en tu disco con un solo clic.</p>
+                  <p style={{ marginTop: '8px', opacity: 0.75 }}>También podés abrir un proyecto .joa para recuperar columnas e imágenes.</p>
                </label>
+            </div>
+          ) : columnView ? (
+            <div className="column-board-sizer">
+              <div
+                ref={columnBoardRef}
+                className={`column-board${rowLabelsCollapsed ? ' is-gutter-collapsed' : ''}${isResizingRowLabels ? ' is-resizing-labels' : ''}${quadrantBoard ? ' is-quadrant' : ''}`}
+                style={{
+                  '--sprite-col-w': `${Math.max(quadrantBoard ? 56 : 180, 280 * gridZoom)}px`,
+                  '--sprite-row-label-w': `${rowLabelsCollapsed ? ROW_LABEL_WIDTH_COLLAPSED : rowLabelWidth}px`,
+                  gridTemplateColumns: `${rowLabelsCollapsed ? ROW_LABEL_WIDTH_COLLAPSED : rowLabelWidth}px ${visibleSpriteColumns.map((c) => isColumnCollapsed(c.id) ? '42px' : 'var(--sprite-col-w)').join(' ')}${quadrantBoard ? '' : ' min-content'}`,
+                } as React.CSSProperties}
+              >
+                <div className={`column-board-corner${rowLabelsCollapsed ? ' is-gutter-collapsed' : ''}`}>
+                  <button
+                    type="button"
+                    className="btn-ghost collapse-toggle"
+                    title={rowLabelsCollapsed ? 'Expandir nombres de filas' : 'Contraer nombres de filas'}
+                    onClick={() => setRowLabelsCollapsed((v) => !v)}
+                  >
+                    {rowLabelsCollapsed ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
+                  </button>
+                  {!rowLabelsCollapsed && (
+                    <>
+                      <button
+                        type="button"
+                        className="btn-ghost collapse-toggle"
+                        title={allColumnsCollapsed ? 'Expandir todas las columnas' : 'Contraer todas las columnas'}
+                        onClick={() => setCollapsedColumnIds(allColumnsCollapsed ? [] : visibleSpriteColumns.map((c) => c.id))}
+                      >
+                        <Columns2 size={14} />
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-ghost collapse-toggle"
+                        title={allRowsCollapsed ? 'Expandir todas las filas' : 'Contraer todas las filas'}
+                        onClick={() => setCollapsedRowIds(allRowsCollapsed ? [] : spriteRows.map((r) => r.id))}
+                      >
+                        <Rows3 size={14} />
+                      </button>
+                    </>
+                  )}
+                  {renderRowLabelResizeHandle()}
+                </div>
+                {visibleSpriteColumns.map((col) => {
+                  const isDefault = col.id === DEFAULT_SPRITE_COLUMN_ID;
+                  const count = sprites.filter((s) => getSpriteColumnId(s) === col.id).length;
+                  const colCollapsed = isColumnCollapsed(col.id);
+                  return (
+                    <div
+                      key={`head-${col.id}`}
+                      className={`sprite-column-header column-board-head${columnDragOverId === col.id ? ' drag-over' : ''}${colCollapsed ? ' is-collapsed' : ''}`}
+                      draggable={!isDefault}
+                      title={isDefault ? undefined : 'Arrastrá para reordenar columnas'}
+                      onDragStart={(e) => {
+                        if (isDefault) return;
+                        if ((e.target as HTMLElement).closest('input, button')) {
+                          e.preventDefault();
+                          return;
+                        }
+                        setDraggedColumnId(col.id);
+                        e.dataTransfer.effectAllowed = 'move';
+                      }}
+                      onDragOver={(e) => {
+                        if (!draggedColumnId) return;
+                        e.preventDefault();
+                        e.stopPropagation();
+                        e.dataTransfer.dropEffect = 'move';
+                        setColumnDragOverId(col.id);
+                      }}
+                      onDragLeave={(e) => {
+                        if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+                        setColumnDragOverId((id) => (id === col.id ? null : id));
+                      }}
+                      onDrop={(e) => {
+                        if (!draggedColumnId) return;
+                        e.preventDefault();
+                        e.stopPropagation();
+                        moveColumn(draggedColumnId, col.id);
+                        setDraggedColumnId(null);
+                        setColumnDragOverId(null);
+                      }}
+                      onDragEnd={() => {
+                        setDraggedColumnId(null);
+                        setColumnDragOverId(null);
+                      }}
+                    >
+                      <button
+                        type="button"
+                        className="btn-ghost collapse-toggle"
+                        title={colCollapsed ? 'Expandir columna' : 'Contraer columna'}
+                        onClick={() => toggleColumnCollapsed(col.id)}
+                      >
+                        {colCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                      </button>
+                      {colCollapsed || isDefault ? (
+                        <span className="sprite-column-title">{col.name}</span>
+                      ) : (
+                        <input
+                          value={col.name}
+                          onChange={(e) => renameSpriteColumn(col.id, e.target.value)}
+                          onPointerDown={(e) => e.stopPropagation()}
+                          draggable={false}
+                        />
+                      )}
+                      <span className="sprite-column-count">{count}</span>
+                      {!isDefault && !colCollapsed && (
+                        <button
+                          type="button"
+                          className="btn-ghost"
+                          title="Borrar columna (los sprites vuelven a Sin grupo)"
+                          onClick={() => removeSpriteColumn(col.id)}
+                          style={{ width: 28, height: 28, color: '#ff6b6b' }}
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+                {!quadrantBoard && (
+                <button type="button" className="sprite-column-add is-header" onClick={addSpriteColumn}>
+                  <Plus size={16} />
+                  Nueva columna
+                </button>
+                )}
+
+                {spriteRows.map((row) => {
+                  const isDefaultRow = row.id === DEFAULT_SPRITE_ROW_ID;
+                  const rowCount = sprites.filter((s) => getSpriteRowId(s) === row.id).length;
+                  const rowCollapsed = isRowCollapsed(row.id);
+                  return (
+                    <React.Fragment key={row.id}>
+                      <div
+                        className={`column-row-label${rowDragOverId === row.id ? ' drag-over' : ''}${rowCollapsed ? ' is-collapsed' : ''}${rowLabelsCollapsed ? ' is-gutter-collapsed' : ''}`}
+                        draggable={!isDefaultRow}
+                        title={isDefaultRow ? undefined : 'Arrastrá para reordenar filas'}
+                        onDragStart={(e) => {
+                          if (isDefaultRow) return;
+                          if ((e.target as HTMLElement).closest('input, button')) {
+                            e.preventDefault();
+                            return;
+                          }
+                          setDraggedRowId(row.id);
+                          e.dataTransfer.effectAllowed = 'move';
+                        }}
+                        onDragOver={(e) => {
+                          if (!draggedRowId) return;
+                          e.preventDefault();
+                          e.stopPropagation();
+                          e.dataTransfer.dropEffect = 'move';
+                          setRowDragOverId(row.id);
+                        }}
+                        onDragLeave={(e) => {
+                          if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+                          setRowDragOverId((id) => (id === row.id ? null : id));
+                        }}
+                        onDrop={(e) => {
+                          if (!draggedRowId) return;
+                          e.preventDefault();
+                          e.stopPropagation();
+                          moveRow(draggedRowId, row.id);
+                          setDraggedRowId(null);
+                          setRowDragOverId(null);
+                        }}
+                        onDragEnd={() => {
+                          setDraggedRowId(null);
+                          setRowDragOverId(null);
+                        }}
+                      >
+                        <button
+                          type="button"
+                          className="btn-ghost collapse-toggle"
+                          title={rowCollapsed ? 'Expandir fila' : 'Contraer fila'}
+                          onClick={() => toggleRowCollapsed(row.id)}
+                        >
+                          {rowCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                        </button>
+                        {rowLabelsCollapsed ? null : rowCollapsed ? (
+                          <span className="sprite-column-title">{row.name}</span>
+                        ) : (
+                          <input
+                            value={row.name}
+                            onChange={(e) => renameSpriteRow(row.id, e.target.value)}
+                            onPointerDown={(e) => e.stopPropagation()}
+                            draggable={false}
+                          />
+                        )}
+                        {!rowLabelsCollapsed && <span className="sprite-column-count">{rowCount}</span>}
+                        {!isDefaultRow && !rowCollapsed && !rowLabelsCollapsed && (
+                          <button
+                            type="button"
+                            className="btn-ghost"
+                            title="Borrar fila (los sprites vuelven a Sin fila)"
+                            onClick={() => removeSpriteRow(row.id)}
+                            style={{ width: 28, height: 28, color: '#ff6b6b' }}
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        )}
+                        {renderRowLabelResizeHandle()}
+                      </div>
+                      {visibleSpriteColumns.map((col) => {
+                        const cellSprites = sprites.filter(
+                          (s) => getSpriteColumnId(s) === col.id && getSpriteRowId(s) === row.id
+                        );
+                        const key = compareCellKey(col.id, row.id);
+                        const colCollapsed = isColumnCollapsed(col.id);
+                        const cellCollapsed = rowCollapsed || colCollapsed;
+                        return (
+                          <div
+                            key={key}
+                            className={`sprite-cell${cellSprites.length === 0 ? ' is-empty' : ''}${cellDragOverKey === key ? ' drag-over' : ''}${rowDragOverId === row.id ? ' row-active' : ''}${rowCollapsed ? ' is-collapsed-row' : ''}${colCollapsed ? ' is-collapsed-col' : ''}`}
+                            onDragOver={(e) => {
+                              if (!draggedSpriteId) return;
+                              e.preventDefault();
+                              e.stopPropagation();
+                              e.dataTransfer.dropEffect = 'move';
+                              setCellDragOverKey(key);
+                            }}
+                            onDragLeave={(e) => {
+                              if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+                              setCellDragOverKey((k) => (k === key ? null : k));
+                            }}
+                            onDrop={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              if (draggedSpriteId) moveSpriteToCell(draggedSpriteId, col.id, row.id);
+                              setDraggedSpriteId(null);
+                              setCellDragOverKey(null);
+                            }}
+                          >
+                            {!cellCollapsed && cellSprites.map((s) => renderSpriteCard(s, col.id, row.id))}
+                            {cellCollapsed && cellSprites.length > 0 && (
+                              <div className="sprite-cell-hint">{cellSprites.length}</div>
+                            )}
+                            {!cellCollapsed && cellSprites.length === 0 && draggedSpriteId && (
+                              <div className="sprite-cell-hint">Soltá acá</div>
+                            )}
+                          </div>
+                        );
+                      })}
+                      {!quadrantBoard && <div className={`column-board-row-end${rowCollapsed ? ' is-collapsed-row' : ''}`} />}
+                    </React.Fragment>
+                  );
+                })}
+
+                {!quadrantBoard && (
+                  <button type="button" className="column-row-add" onClick={addSpriteRow}>
+                    <Rows3 size={18} />
+                    Nueva fila
+                  </button>
+                )}
+              </div>
             </div>
           ) : (
             <div className="sprite-grid" style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${280 * gridZoom}px, 1fr))` }}>
-              {sprites.map((s: SpriteData) => (
-                <div 
-                  key={s.id}
-                  draggable
-                  onDragStart={(e) => {
-                    setDraggedSpriteId(s.id);
-                    e.dataTransfer.effectAllowed = 'move';
-                  }}
-                  onDragOver={(e) => {
-                    e.preventDefault();
-                    e.dataTransfer.dropEffect = 'move';
-                  }}
-                  onDrop={(e) => {
-                    e.preventDefault();
-                    if (!draggedSpriteId || draggedSpriteId === s.id) return;
-                    
-                    const oldIndex = sprites.findIndex((sp: SpriteData) => sp.id === draggedSpriteId);
-                    const newIndex = sprites.findIndex((sp: SpriteData) => sp.id === s.id);
-                    if (oldIndex === -1 || newIndex === -1) return;
-                    
-                    const newSprites = [...sprites];
-                    const [moved] = newSprites.splice(oldIndex, 1);
-                    newSprites.splice(newIndex, 0, moved);
-                    
-                    commitSprites(newSprites);
-                    setDraggedSpriteId(null);
-                  }}
-                  onDragEnd={() => setDraggedSpriteId(null)}
-                  style={{
-                    opacity: draggedSpriteId === s.id ? 0.4 : 1,
-                    cursor: draggedSpriteId === s.id ? 'grabbing' : 'grab',
-                    transition: 'opacity 0.2s ease',
-                    position: 'relative'
-                  }}
-                >
-                <SpriteModule key={s.id} sprite={s} 
-                  isSelected={selection.includes(s.id)}
-                  isReference={referenceId === s.id}
-                  onToggleSelect={toggleSelect} 
-                  onSetReference={(id) => setReferenceId(id)}
-                  onRemove={(id) => {
-                    const next = sprites.filter((x: SpriteData) => x.id !== id);
-                    commitSprites(next);
-                    if (referenceId === id) setReferenceId(null);
-                  }} 
-                  onSetAnchor={(id, x, y) => {
-                    const next = sprites.map((item: SpriteData) => item.id === id ? { ...item, anchor: { x, y } } : item);
-                    commitSprites(next);
-                  }}
-                  onOpenEraser={(id) => setEraserTargetId(id)}
-                  onOpenReplace={(id) => setReplaceTargetId(id)}
-                  onOpenCopyRect={(id) => setCopyRectTargetId(id)}
-                  onOpenPixelEditor={(id) => setPixelEditorTargetId(id)}
-                  onOpenTransform={(id) => setTransformTargetId(id)}
-                  onOpenTagging={(id) => setTaggingTargetId(id)}
-                  onOpenPaint={(id) => setPaintTargetId(id)}
-                  onOpenBucket={(id) => setBucketTargetId(id)}
-                  onOpenStretch={(id) => setStretchTargetId(id)}
-                  onOpenComposite={(id, size) => setCompositeTarget({ id, size: size || 8192 })}
-                  onExport={handleExportSprite}
-                  isWhiteBg={isWhiteBg}
-                  onUpdateSprite={(id, updates) => {
-                    const next = sprites.map((s: SpriteData) => s.id === id ? { ...s, ...updates } : s);
-                    commitSprites(next);
-                  }}
-                />
-                </div>
-              ))}
+              {sprites.map((s: SpriteData) => renderSpriteCard(s))}
             </div>
           )}
         </div>
 
         {/* RIGHT CONTROLS */}
-        {!controlsVisible && (
-          <button
-            type="button"
-            className="controls-panel-show-tab"
-            onClick={() => setControlsVisible(true)}
-            title="Mostrar panel de opciones"
-          >
-            <ChevronLeft size={14} />
-            Opciones
-          </button>
-        )}
         <aside
-          className={`controls-panel${controlsVisible ? '' : ' is-hidden'}${isResizingControls ? ' is-resizing' : ''}`}
-          style={{ '--controls-width': `${controlsWidth}px`, width: controlsVisible ? controlsWidth : 0 } as React.CSSProperties}
-          aria-hidden={!controlsVisible}
+          className={`controls-panel${controlsVisible ? '' : ' is-collapsed'}${isResizingControls ? ' is-resizing' : ''}`}
+          style={{ '--controls-width': `${controlsWidth}px`, width: controlsVisible ? controlsWidth : 40, cursor: controlsVisible ? undefined : 'pointer' } as React.CSSProperties}
+          aria-expanded={controlsVisible}
+          onClick={() => { if (!controlsVisible) setControlsVisible(true); }}
         >
           <div
             className="controls-resize-handle"
@@ -7992,12 +9092,12 @@ const App: React.FC = () => {
             <span>Opciones</span>
             <button
               type="button"
-              className="btn-ghost"
-              title="Ocultar panel"
-              onClick={() => setControlsVisible(false)}
-              style={{ padding: '4px 6px' }}
+              className="controls-collapse-btn"
+              title={controlsVisible ? 'Contraer panel' : 'Expandir panel'}
+              onClick={() => setControlsVisible((v) => !v)}
             >
-              <ChevronRight size={16} />
+              {controlsVisible ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
+              {controlsVisible ? 'Contraer' : null}
             </button>
           </div>
           <div className="card">

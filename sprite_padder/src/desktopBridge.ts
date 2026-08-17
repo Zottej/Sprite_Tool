@@ -60,7 +60,7 @@ const guessMime = (name: string): string => {
   if (lower.endsWith('.gif')) return 'image/gif';
   if (lower.endsWith('.bmp')) return 'image/bmp';
   if (lower.endsWith('.dds')) return 'application/octet-stream';
-  if (lower.endsWith('.zip')) return 'application/zip';
+  if (lower.endsWith('.zip') || lower.endsWith('.joa')) return 'application/zip';
   if (lower.endsWith('.ico')) return 'image/x-icon';
   return 'application/octet-stream';
 };
