@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { 
   Trash2, Plus, Archive, CheckSquare, Square, 
   Target, FolderSync, Save, AlertTriangle, Eraser, RotateCcw, Search, MapPin, Pencil, MoreHorizontal, FlipHorizontal, FlipVertical, Droplets, Grid, Circle, Maximize, Layers, Play, Pause, Film, PaintBucket, Scissors, Type, Crop, Brush, ChevronLeft, ChevronRight,
@@ -298,11 +299,13 @@ const useModalWheelControls = (opts: {
   zoomRef.current = zoom;
   const brushRef = useRef(brushSize);
   brushRef.current = brushSize;
-  const lastPointerRef = useRef<{
+  const pendingAnchorRef = useRef<{
     clientX: number;
     clientY: number;
-    relX: number;
-    relY: number;
+    localX: number;
+    localY: number;
+    oldZoom: number;
+    newZoom: number;
   } | null>(null);
 
   const resolveContent = (workspace: HTMLElement) => {
@@ -312,38 +315,15 @@ const useModalWheelControls = (opts: {
     return first instanceof HTMLElement ? first : null;
   };
 
-  const capturePointerOnContent = (clientX: number, clientY: number) => {
-    const workspace = workspaceRef?.current;
-    if (!workspace) return;
-    const content = resolveContent(workspace);
-    if (!content) return;
-    const cRect = content.getBoundingClientRect();
-    if (cRect.width <= 1 || cRect.height <= 1) return;
-    lastPointerRef.current = {
-      clientX,
-      clientY,
-      relX: (clientX - cRect.left) / cRect.width,
-      relY: (clientY - cRect.top) / cRect.height,
-    };
-  };
-
-  useEffect(() => {
-    const workspace = workspaceRef?.current;
-    if (!workspace) return;
-    const onMove = (e: PointerEvent) => {
-      capturePointerOnContent(e.clientX, e.clientY);
-    };
-    workspace.addEventListener('pointermove', onMove);
-    return () => workspace.removeEventListener('pointermove', onMove);
-  }, [workspaceRef, contentRef]);
-
   useEffect(() => {
     if (!enabled) return;
     const onWheel = (e: WheelEvent) => {
       if (!e.shiftKey && !e.altKey) return;
       e.preventDefault();
       e.stopPropagation();
-      const dir = e.deltaY > 0 ? -1 : 1;
+      // En Windows, Shift+rueda suele reportar el gesto en deltaX.
+      const axis = Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+      const dir = axis > 0 ? -1 : 1;
 
       if (e.altKey && setBrushSize) {
         const cur = brushRef.current ?? brushMin;
@@ -357,7 +337,21 @@ const useModalWheelControls = (opts: {
       const clamped = Math.min(zoomMax, Math.max(zoomMin, next));
       if (clamped === oldZoom) return;
 
-      capturePointerOnContent(e.clientX, e.clientY);
+      const workspace = workspaceRef?.current;
+      const content = workspace ? resolveContent(workspace) : null;
+      if (workspace && content) {
+        const cRect = content.getBoundingClientRect();
+        if (cRect.width > 1 && cRect.height > 1) {
+          pendingAnchorRef.current = {
+            clientX: e.clientX,
+            clientY: e.clientY,
+            localX: e.clientX - cRect.left,
+            localY: e.clientY - cRect.top,
+            oldZoom,
+            newZoom: clamped,
+          };
+        }
+      }
       setZoom(clamped);
     };
     window.addEventListener('wheel', onWheel, { passive: false, capture: true });
@@ -369,31 +363,24 @@ const useModalWheelControls = (opts: {
 
   useLayoutEffect(() => {
     const workspace = workspaceRef?.current;
-    const anchor = lastPointerRef.current;
+    const anchor = pendingAnchorRef.current;
     if (!workspace || !anchor) return;
+    pendingAnchorRef.current = null;
 
     const content = resolveContent(workspace);
     if (!content) return;
+    const ratio = anchor.newZoom / anchor.oldZoom;
+    if (!Number.isFinite(ratio) || ratio <= 0) return;
 
     // 2 pases: el segundo corrige el salto cuando aparecen las barras de scroll.
     for (let pass = 0; pass < 2; pass++) {
       const cRect = content.getBoundingClientRect();
       if (cRect.width <= 1 || cRect.height <= 1) return;
-      const errX = (cRect.left + anchor.relX * cRect.width) - anchor.clientX;
-      const errY = (cRect.top + anchor.relY * cRect.height) - anchor.clientY;
+      const errX = (cRect.left + anchor.localX * ratio) - anchor.clientX;
+      const errY = (cRect.top + anchor.localY * ratio) - anchor.clientY;
       if (Math.abs(errX) < 0.5 && Math.abs(errY) < 0.5) break;
       workspace.scrollLeft += errX;
       workspace.scrollTop += errY;
-    }
-
-    const after = content.getBoundingClientRect();
-    if (after.width > 1 && after.height > 1) {
-      lastPointerRef.current = {
-        clientX: anchor.clientX,
-        clientY: anchor.clientY,
-        relX: (anchor.clientX - after.left) / after.width,
-        relY: (anchor.clientY - after.top) / after.height,
-      };
     }
   }, [zoom, workspaceRef, contentRef]);
 };
@@ -1896,6 +1883,7 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const quadrantPointerRef = useRef<{ x: number; y: number } | null>(null);
+  const [toolsMenu, setToolsMenu] = useState<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1936,7 +1924,6 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
 
 
   const [isDragging, setIsDragging] = useState(false);
-  const [showTools, setShowTools] = useState(false);
   const [compareDraft, setCompareDraft] = useState(sprite.compareValue ?? '');
 
   useEffect(() => {
@@ -1951,15 +1938,33 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
   };
 
   useEffect(() => {
-    if (!showTools) return;
+    if (!toolsMenu) return;
     const clickOutside = (e: MouseEvent) => {
       if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
-        setShowTools(false);
+        setToolsMenu(null);
       }
     };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setToolsMenu(null);
+    };
     window.addEventListener('mousedown', clickOutside);
-    return () => window.removeEventListener('mousedown', clickOutside);
-  }, [showTools]);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('mousedown', clickOutside);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [toolsMenu]);
+
+  const openToolsMenuAt = (x: number, y: number) => {
+    const w = 230;
+    const h = Math.min(420, window.innerHeight - 16);
+    setToolsMenu({
+      x: Math.max(8, Math.min(x, window.innerWidth - w - 8)),
+      y: Math.max(8, Math.min(y, window.innerHeight - h - 8)),
+    });
+  };
+
+  const closeTools = () => setToolsMenu(null);
 
   useEffect(() => {
     if (!isDragging) return;
@@ -2026,10 +2031,16 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
   };
 
   return (
-    <div className={`sprite-module ${isSelected ? 'selected' : ''} ${isReference ? 'reference' : ''} ${showTools ? 'tools-open' : ''} ${quadrantView ? 'is-quadrant' : ''}`} 
+    <div className={`sprite-module ${isSelected ? 'selected' : ''} ${isReference ? 'reference' : ''} ${toolsMenu ? 'tools-open' : ''} ${quadrantView ? 'is-quadrant' : ''}`} 
          onPointerDown={(e) => {
            if (!quadrantView) return;
            quadrantPointerRef.current = { x: e.clientX, y: e.clientY };
+         }}
+         onContextMenu={(e) => {
+           e.preventDefault();
+           e.stopPropagation();
+           onToggleSelect(sprite.id, e.shiftKey || e.ctrlKey || e.metaKey);
+           openToolsMenuAt(e.clientX, e.clientY);
          }}
          onClick={(e) => {
            if (e.shiftKey || e.ctrlKey || e.metaKey) {
@@ -2056,108 +2067,21 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
           <span className="module-title">{sprite.name}</span>
         </div>
         <div style={{ display: 'flex', gap: '4px', position: 'relative' }}>
-          <button className={`btn-ghost ${showTools ? 'active' : ''}`}
-            onClick={(e) => { e.stopPropagation(); setShowTools(!showTools); }}
+          <button className={`btn-ghost ${toolsMenu ? 'active' : ''}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (toolsMenu) {
+                closeTools();
+                return;
+              }
+              const r = e.currentTarget.getBoundingClientRect();
+              openToolsMenuAt(r.right - 220, r.bottom + 6);
+            }}
             title="Herramientas"
           >
             <MoreHorizontal size={14} />
           </button>
           
-          {showTools && (
-            <div
-              className="tools-dropdown"
-              ref={dropdownRef}
-              onClick={e => e.stopPropagation()}
-              onWheel={e => e.stopPropagation()}
-            >
-              <button type="button" className="dropdown-item" onClick={(e) => { 
-                e.preventDefault();
-                e.stopPropagation(); 
-                onExport(sprite.id, 'png');
-                setShowTools(false);
-              }}>
-                <Save size={12} /> Exportar PNG
-              </button>
-              <button type="button" className="dropdown-item" onClick={(e) => { 
-                e.preventDefault();
-                e.stopPropagation(); 
-                onExport(sprite.id, 'jpg');
-                setShowTools(false);
-              }}>
-                <Save size={12} /> Exportar JPG
-              </button>
-              <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenPaint(sprite.id); setShowTools(false); }}>
-                <Pencil size={12} /> Pintar
-              </button>
-              <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenTagging(sprite.id); setShowTools(false); }}>
-                <MapPin size={12} /> Zonas (Tags)
-              </button>
-              <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenTransform(sprite.id); setShowTools(false); }}>
-                <RotateCcw size={12} /> Transformar
-              </button>
-              <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenEraser(sprite.id); setShowTools(false); }}>
-                <Eraser size={12} /> Goma (Borrador)
-              </button>
-              <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenReplace(sprite.id); setShowTools(false); }}>
-                <Stamp size={12} /> Reemplazar de...
-              </button>
-              <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenCopyRect(sprite.id); setShowTools(false); }}>
-                <Crop size={12} /> Copiar recorte
-              </button>
-              <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenPixelEditor(sprite.id); setShowTools(false); }}>
-                <Grid size={12} /> Editor Pixel Art
-              </button>
-              <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); handleAddText(); setShowTools(false); }}>
-                <Type size={12} /> Añadir Texto
-              </button>
-              <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenBucket(sprite.id); setShowTools(false); }}>
-                <PaintBucket size={12} /> Color Swap (Balde)
-              </button>
-              <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenStretch(sprite.id); setShowTools(false); }}>
-                <Maximize size={12} /> Estirar (Resize)
-              </button>
-              <button className="dropdown-item" onClick={(e) => { 
-                e.stopPropagation(); 
-                const sizeStr = prompt('¿Tamaño del lienzo de trabajo (en píxeles)?', Math.max(8192, sprite.img.width, sprite.img.height).toString());
-                if (sizeStr && !isNaN(parseInt(sizeStr))) {
-                    onOpenComposite(sprite.id, parseInt(sizeStr)); 
-                }
-                setShowTools(false);
-              }}>
-                <Layers size={12} /> Componer (Collage)
-              </button>
-              <button type="button" className="dropdown-item" onClick={(e) => { 
-                e.preventDefault();
-                e.stopPropagation(); 
-                onExport(sprite.id, 'ico');
-                setShowTools(false);
-              }}>
-                <Save size={12} /> Exportar como .ICO
-              </button>
-              <button type="button" className="dropdown-item" onClick={(e) => { 
-                e.preventDefault();
-                e.stopPropagation(); 
-                onExport(sprite.id, 'dds');
-                setShowTools(false);
-              }}>
-                <Layers size={12} /> Exportar como .DDS
-              </button>
-              <div style={{ height: '1px', background: 'var(--border)', margin: '4px 0' }} />
-              <button className="dropdown-item" onClick={(e) => { 
-                e.stopPropagation(); 
-                onUpdateSprite(sprite.id, { flipH: !sprite.flipH });
-              }}>
-                <FlipHorizontal size={12} /> Invertir Horizontal
-              </button>
-              <button className="dropdown-item" onClick={(e) => { 
-                e.stopPropagation(); 
-                onUpdateSprite(sprite.id, { flipV: !sprite.flipV });
-              }}>
-                <FlipVertical size={12} /> Invertir Vertical
-              </button>
-            </div>
-          )}
-
           <button className="btn-ghost" 
             style={{ color: isReference ? '#ffcc00' : undefined }}
             onClick={(e) => { e.stopPropagation(); onSetReference(sprite.id); }}
@@ -2251,6 +2175,86 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
           Full: {(sprite.img.width * (sprite.scale || 1) * (sprite.stretchX || 1) + sprite.padding.left + sprite.padding.right).toFixed(0)}×{(sprite.img.height * (sprite.scale || 1) * (sprite.stretchY || 1) + sprite.padding.top + sprite.padding.bottom).toFixed(0)}
         </span>
       </div>
+      {toolsMenu && createPortal(
+        <div
+          className="tools-dropdown is-context"
+          ref={dropdownRef}
+          style={{ left: toolsMenu.x, top: toolsMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+          onWheel={(e) => e.stopPropagation()}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          {onOpenQuadrantPreview && (
+            <button type="button" className="dropdown-item" onClick={() => { onOpenQuadrantPreview(sprite.id); closeTools(); }}>
+              <Maximize2 size={12} /> Ver en grande
+            </button>
+          )}
+          <button type="button" className="dropdown-item" onClick={() => { onExport(sprite.id, 'png'); closeTools(); }}>
+            <Save size={12} /> Exportar PNG
+          </button>
+          <button type="button" className="dropdown-item" onClick={() => { onExport(sprite.id, 'jpg'); closeTools(); }}>
+            <Save size={12} /> Exportar JPG
+          </button>
+          <button type="button" className="dropdown-item" onClick={() => { onOpenPaint(sprite.id); closeTools(); }}>
+            <Pencil size={12} /> Pintar
+          </button>
+          <button type="button" className="dropdown-item" onClick={() => { onOpenTagging(sprite.id); closeTools(); }}>
+            <MapPin size={12} /> Zonas (Tags)
+          </button>
+          <button type="button" className="dropdown-item" onClick={() => { onOpenTransform(sprite.id); closeTools(); }}>
+            <RotateCcw size={12} /> Transformar
+          </button>
+          <button type="button" className="dropdown-item" onClick={() => { onOpenEraser(sprite.id); closeTools(); }}>
+            <Eraser size={12} /> Goma (Borrador)
+          </button>
+          <button type="button" className="dropdown-item" onClick={() => { onOpenReplace(sprite.id); closeTools(); }}>
+            <Stamp size={12} /> Reemplazar de...
+          </button>
+          <button type="button" className="dropdown-item" onClick={() => { onOpenCopyRect(sprite.id); closeTools(); }}>
+            <Crop size={12} /> Copiar recorte
+          </button>
+          <button type="button" className="dropdown-item" onClick={() => { onOpenPixelEditor(sprite.id); closeTools(); }}>
+            <Grid size={12} /> Editor Pixel Art
+          </button>
+          <button type="button" className="dropdown-item" onClick={() => { handleAddText(); closeTools(); }}>
+            <Type size={12} /> Añadir Texto
+          </button>
+          <button type="button" className="dropdown-item" onClick={() => { onOpenBucket(sprite.id); closeTools(); }}>
+            <PaintBucket size={12} /> Color Swap (Balde)
+          </button>
+          <button type="button" className="dropdown-item" onClick={() => { onOpenStretch(sprite.id); closeTools(); }}>
+            <Maximize size={12} /> Estirar (Resize)
+          </button>
+          <button type="button" className="dropdown-item" onClick={() => {
+            const sizeStr = prompt('¿Tamaño del lienzo de trabajo (en píxeles)?', Math.max(8192, sprite.img.width, sprite.img.height).toString());
+            if (sizeStr && !isNaN(parseInt(sizeStr))) onOpenComposite(sprite.id, parseInt(sizeStr));
+            closeTools();
+          }}>
+            <Layers size={12} /> Componer (Collage)
+          </button>
+          <button type="button" className="dropdown-item" onClick={() => { onExport(sprite.id, 'ico'); closeTools(); }}>
+            <Save size={12} /> Exportar como .ICO
+          </button>
+          <button type="button" className="dropdown-item" onClick={() => { onExport(sprite.id, 'dds'); closeTools(); }}>
+            <Layers size={12} /> Exportar como .DDS
+          </button>
+          <div className="dropdown-sep" />
+          <button type="button" className="dropdown-item" onClick={() => { onUpdateSprite(sprite.id, { flipH: !sprite.flipH }); closeTools(); }}>
+            <FlipHorizontal size={12} /> Invertir Horizontal
+          </button>
+          <button type="button" className="dropdown-item" onClick={() => { onUpdateSprite(sprite.id, { flipV: !sprite.flipV }); closeTools(); }}>
+            <FlipVertical size={12} /> Invertir Vertical
+          </button>
+          <button type="button" className="dropdown-item" onClick={() => { onSetReference(sprite.id); closeTools(); }}>
+            <Target size={12} /> {isReference ? 'Quitar referencia' : 'Usar como referencia'}
+          </button>
+          <div className="dropdown-sep" />
+          <button type="button" className="dropdown-item is-danger" onClick={() => { onRemove(sprite.id); closeTools(); }}>
+            <Trash2 size={12} /> Eliminar
+          </button>
+        </div>,
+        document.body
+      )}
     </div>
   );
 };
@@ -2787,7 +2791,7 @@ const PixelEditorModal: React.FC<PixelEditorModalProps> = ({ sprite, onSave, onC
         ref={workspaceRef}
         onScroll={onWorkspaceScroll}
         style={{
-        flex: 1, overflow: 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center',
+        flex: 1, overflow: 'auto',
         background: isWhiteBg ? '#fff' : 'repeating-conic-gradient(#1a1a1a 0% 25%, #252525 0% 50%) 0 0 / 16px 16px',
       }}>
         <div style={{ position: 'relative', width: W, height: H, imageRendering: 'pixelated', flexShrink: 0 }}>
@@ -2847,9 +2851,12 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
   const [brushSize, setBrushSize] = useState(() => loadEraserPrefs().brushSize);
   const [brushShape, setBrushShape] = useState<'circle' | 'square'>(() => loadEraserPrefs().brushShape);
   const [zoom, setZoom] = useState(() => loadEraserPrefs().zoom);
-  const [isDrawing, setIsDrawing] = useState(false);
   const [mousePos, setMousePos] = useState<{ x: number, y: number } | null>(null);
   const lastPos = useRef<{ x: number, y: number } | null>(null);
+  const historyRef = useRef<ImageData[]>([]);
+  const [historyLen, setHistoryLen] = useState(0);
+  const strokeSavedRef = useRef(false);
+  const isDrawingRef = useRef(false);
   const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-eraser-scroll', sprite.name);
   useModalWheelControls({ zoom, setZoom, brushSize, setBrushSize, workspaceRef });
 
@@ -2866,6 +2873,41 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
     savePref(ERASER_PREFS_KEY, { zoom, brushSize, brushShape });
   }, [zoom, brushSize, brushShape]);
 
+  const pushHistory = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    const snapshot = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const next = [...historyRef.current, snapshot];
+    if (next.length > 40) next.shift();
+    historyRef.current = next;
+    setHistoryLen(next.length);
+  };
+
+  const undo = () => {
+    if (historyRef.current.length === 0) return;
+    const snapshot = historyRef.current[historyRef.current.length - 1];
+    historyRef.current = historyRef.current.slice(0, -1);
+    setHistoryLen(historyRef.current.length);
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.putImageData(snapshot, 0, 0);
+  };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        undo();
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, []);
+
   const erase = (e: React.MouseEvent, forceFirstPoint = false) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -2877,7 +2919,7 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
 
     setMousePos({ x, y });
 
-    if (!isDrawing && !forceFirstPoint) {
+    if (!isDrawingRef.current && !forceFirstPoint) {
       lastPos.current = null;
       return;
     }
@@ -2921,6 +2963,21 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
     lastPos.current = { x: currX, y: currY };
   };
 
+  const beginStroke = (e: React.MouseEvent) => {
+    if (!strokeSavedRef.current) {
+      pushHistory();
+      strokeSavedRef.current = true;
+    }
+    isDrawingRef.current = true;
+    erase(e, true);
+  };
+
+  const endStroke = () => {
+    isDrawingRef.current = false;
+    lastPos.current = null;
+    strokeSavedRef.current = false;
+  };
+
   const handleSave = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -2934,6 +2991,7 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
     if (!confirm('¿Seguro que quieres resetear los cambios de esta imagen?')) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
+    pushHistory();
     const ctx = canvas.getContext('2d')!;
     ctx.globalCompositeOperation = 'source-over';
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -2959,7 +3017,6 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
            <div style={{
              width: sprite.img.width * zoom,
              height: sprite.img.height * zoom,
-             margin: 'auto',
              position: 'relative'
            }}>
              <div style={{ 
@@ -2974,16 +3031,15 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
              }}>
              <canvas 
               ref={canvasRef}
-              onMouseDown={(e) => { setIsDrawing(true); erase(e, true); }}
-              onMouseUp={() => { setIsDrawing(false); lastPos.current = null; }}
+              onMouseDown={beginStroke}
+              onMouseUp={endStroke}
               onMouseMove={(e) => erase(e)}
               onMouseEnter={(e) => {
                 const rect = e.currentTarget.getBoundingClientRect();
                 setMousePos({ x: (e.clientX - rect.left) / zoom, y: (e.clientY - rect.top) / zoom });
               }}
               onMouseLeave={() => {
-                setIsDrawing(false);
-                lastPos.current = null;
+                endStroke();
                 setMousePos(null);
               }}
              />
@@ -3062,6 +3118,9 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
             </div>
           </div>
           <div style={{ display: 'flex', gap: '12px' }}>
+            <button className="btn btn-outline" onClick={undo} disabled={historyLen === 0} title="Ctrl+Z">
+              <RotateCcw size={16} /> Deshacer
+            </button>
             <button className="btn btn-outline" onClick={handleReset}>Reiniciar</button>
             <button className="btn btn-primary" style={{ paddingLeft: '24px', paddingRight: '24px' }} onClick={handleSave}>Guardar Cambios</button>
           </div>
@@ -3579,7 +3638,6 @@ const ReplaceBrushModal: React.FC<ReplaceBrushModalProps> = ({ sprite, sprites, 
           <div style={{
             width: sprite.img.width * zoom,
             height: sprite.img.height * zoom,
-            margin: 'auto',
             position: 'relative',
           }}>
             <div style={{
@@ -4214,7 +4272,6 @@ const CopyRectModal: React.FC<CopyRectModalProps> = ({ sprite, sprites, onSave, 
           <div style={{
             width: viewImg.width * zoom,
             height: viewImg.height * zoom,
-            margin: 'auto',
             position: 'relative',
           }}>
             <div style={{
@@ -4808,7 +4865,6 @@ const EffectMaskModal: React.FC<EffectMaskModalProps> = ({ sprite, onSave, onClo
             <div style={{
               width: sprite.img.width * zoom,
               height: sprite.img.height * zoom,
-              margin: 'auto',
               position: 'relative',
             }}>
               <div style={{
@@ -5023,7 +5079,6 @@ const TaggingModal: React.FC<TaggingModalProps> = ({ sprite, onSave, onClose, is
             <div style={{
               width: sprite.img.width * zoom,
               height: sprite.img.height * zoom,
-              margin: 'auto',
               position: 'relative',
             }}>
               <div style={{
@@ -5410,7 +5465,6 @@ const BucketModal: React.FC<BucketModalProps> = ({ sprite, onSave, onClose, isWh
            <div style={{
              width: sprite.img.width * zoom,
              height: sprite.img.height * zoom,
-             margin: 'auto',
              position: 'relative'
            }}>
              <div style={{ 
@@ -6636,7 +6690,7 @@ const CompositeModal: React.FC<CompositeModalProps> = ({ sprite, onSave, onClose
         </div>
 
         <div className={`eraser-workspace ${isWhiteBg ? 'white-bg' : ''}`} ref={workspaceRef} style={{ overflow: 'auto', position: 'relative', flex: 1, backgroundColor: 'var(--bg-window, #151515)' }}>
-           <div ref={contentRef} className="checker-mini" style={{ position: 'relative', width: `${canvasSize * zoom}px`, height: `${canvasSize * zoom}px`, minWidth: `${canvasSize * zoom}px`, minHeight: `${canvasSize * zoom}px`, flexShrink: 0, margin: '20px auto', boxShadow: '0 0 40px rgba(0,0,0,0.8)', border: '1px solid rgba(255,255,255,0.1)' }}>
+           <div ref={contentRef} className="checker-mini" style={{ position: 'relative', width: `${canvasSize * zoom}px`, height: `${canvasSize * zoom}px`, minWidth: `${canvasSize * zoom}px`, minHeight: `${canvasSize * zoom}px`, flexShrink: 0, margin: '20px', boxShadow: '0 0 40px rgba(0,0,0,0.8)', border: '1px solid rgba(255,255,255,0.1)' }}>
              <canvas 
                ref={canvasRef}
                style={{ width: '100%', height: '100%', cursor: isDragging ? 'grabbing' : 'grab', outline: 'none', display: 'block' }}
@@ -6872,7 +6926,7 @@ const AnimationModal: React.FC<AnimationModalProps> = ({ onClose }) => {
 
         <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
           {/* VISOR PRINCIPAL */}
-          <div ref={workspaceRef} className="eraser-workspace" style={{ flex: 1, overflow: 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: 'var(--bg-window, #151515)', position: 'relative' }}>
+          <div ref={workspaceRef} className="eraser-workspace" style={{ flex: 1, overflow: 'auto', backgroundColor: 'var(--bg-window, #151515)', position: 'relative' }}>
              
              {frames.length === 0 ? (
                 <div className="empty-msg" style={{ opacity: 0.5 }}>Añade frames en la barra lateral para ver la animación</div>
@@ -6883,7 +6937,6 @@ const AnimationModal: React.FC<AnimationModalProps> = ({ onClose }) => {
                                 border: '1px solid rgba(255,255,255,0.1)',
                                 width: previewSize.w * zoom,
                                 height: previewSize.h * zoom,
-                                margin: 'auto',
                                 flexShrink: 0,
                               }}>
                   <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%', imageRendering: 'pixelated' }} />
@@ -7001,6 +7054,7 @@ const App: React.FC = () => {
   const columnViewportRef = useRef<HTMLDivElement>(null);
   const columnBoardRef = useRef<HTMLDivElement>(null);
   const columnPanRef = useRef<{ x: number; y: number; sl: number; st: number } | null>(null);
+  const cellImportTargetRef = useRef<{ columnId: string; rowId: string } | null>(null);
   const [eraserTargetId, setEraserTargetId] = useState<string | null>(null);
   const [replaceTargetId, setReplaceTargetId] = useState<string | null>(null);
   const [copyRectTargetId, setCopyRectTargetId] = useState<string | null>(null);
@@ -7015,6 +7069,7 @@ const App: React.FC = () => {
   const [showAnimationModal, setShowAnimationModal] = useState(false);
   const [quadrantPreviewIds, setQuadrantPreviewIds] = useState<string[]>([]);
   const [quadrantPicking, setQuadrantPicking] = useState(false);
+  const [emptyCellMenu, setEmptyCellMenu] = useState<{ x: number; y: number; columnId: string; rowId: string } | null>(null);
   const anyModalOpen = !!(
     eraserTargetId || replaceTargetId || copyRectTargetId || pixelEditorTargetId || transformTargetId ||
     taggingTargetId || effectMaskTargetId || paintTargetId || bucketTargetId ||
@@ -7117,11 +7172,23 @@ const App: React.FC = () => {
   }, [quadrantView]);
 
   useEffect(() => {
-    if (!quadrantBoard) {
+    if (!columnView) {
       setQuadrantPreviewIds([]);
       setQuadrantPicking(false);
     }
-  }, [quadrantBoard]);
+  }, [columnView]);
+
+  useEffect(() => {
+    if (!emptyCellMenu) return;
+    const close = () => setEmptyCellMenu(null);
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
+    window.addEventListener('mousedown', close);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('mousedown', close);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [emptyCellMenu]);
 
   useEffect(() => {
     savePref(SPRITE_COLUMNS_KEY, spriteColumns);
@@ -7409,6 +7476,7 @@ const App: React.FC = () => {
         setColumnDragOverId(null);
         setCellDragOverKey(null);
       }}
+      onContextMenu={(e) => e.preventDefault()}
       style={{
         opacity: draggedSpriteId === s.id ? 0.4 : 1,
         cursor: draggedSpriteId === s.id ? 'grabbing' : quadrantBoard ? 'zoom-in' : 'grab',
@@ -7444,7 +7512,7 @@ const App: React.FC = () => {
         onExport={handleExportSprite}
         isWhiteBg={isWhiteBg}
         quadrantView={quadrantBoard}
-        onOpenQuadrantPreview={quadrantBoard ? openQuadrantPreview : undefined}
+        onOpenQuadrantPreview={columnView ? openQuadrantPreview : undefined}
         onUpdateSprite={(id, updates) => {
           const next = sprites.map((item: SpriteData) => item.id === id ? { ...item, ...updates } : item);
           commitSprites(next);
@@ -7456,7 +7524,10 @@ const App: React.FC = () => {
   const linkedFolderName = workingFolder?.name || dirHandle?.name || null;
   const hasLinkedFolder = !!(workingFolder || dirHandle);
 
-  const handleFiles = async (rawFiles: FileList | File[]) => {
+  const handleFiles = async (
+    rawFiles: FileList | File[],
+    targetCell?: { columnId: string; rowId: string } | null,
+  ) => {
     const files = Array.from(rawFiles);
     const newSprites: SpriteData[] = [];
     const importErrors: string[] = [];
@@ -7509,7 +7580,9 @@ const App: React.FC = () => {
         hue: 0,
         opacity: 100,
         tintColor: '#000000',
-        tintOpacity: 0
+        tintOpacity: 0,
+        columnId: targetCell && targetCell.columnId !== DEFAULT_SPRITE_COLUMN_ID ? targetCell.columnId : undefined,
+        rowId: targetCell && targetCell.rowId !== DEFAULT_SPRITE_ROW_ID ? targetCell.rowId : undefined,
       });
     }
     if (newSprites.length > 0) {
@@ -7672,6 +7745,33 @@ const App: React.FC = () => {
       return;
     }
     void handleFiles(files);
+  };
+
+  const importIntoCell = async (columnId: string, rowId: string) => {
+    if (quadrantPicking) return;
+    const target = { columnId, rowId };
+    const desktop = getDesktop();
+    if (desktop) {
+      try {
+        const items = await desktop.pickOpenFiles({
+          title: 'Importar sprite',
+          multiple: false,
+        });
+        if (items.length === 0) return;
+        await handleFiles(filesFromDesktopOpen(items), target);
+      } catch (err) {
+        console.error(err);
+      }
+      return;
+    }
+    const files = await pickImageFiles(false, dirHandle);
+    if (files === null) {
+      cellImportTargetRef.current = target;
+      document.getElementById('cell-up')?.click();
+      return;
+    }
+    if (files.length === 0) return;
+    await handleFiles(files, target);
   };
 
   const openImportFiles = async () => {
@@ -9133,6 +9233,12 @@ const App: React.FC = () => {
              <Grid size={16} /> Exportar como Tira
            </button>
            <input type="file" id="grid-up" hidden multiple accept="image/*" onChange={(e) => { if (e.target.files) handleFiles(e.target.files); e.target.value = ''; }} />
+           <input type="file" id="cell-up" hidden accept="image/*" onChange={(e) => {
+             const cell = cellImportTargetRef.current;
+             cellImportTargetRef.current = null;
+             if (e.target.files && cell) void handleFiles(e.target.files, cell);
+             e.target.value = '';
+           }} />
            <input type="file" id="slice-up" hidden accept="image/*" onChange={(e) => { if (e.target.files && e.target.files[0]) handleSliceFile(e.target.files[0]); e.target.value = ''; }} />
            <input type="file" id="project-up" hidden accept=".joa,.zip,application/zip" onChange={(e) => { if (e.target.files && e.target.files[0]) openProjectFile(e.target.files[0]); e.target.value = ''; }} />
            <div style={{ height: '24px', width: '1px', background: 'var(--border)', margin: '0 8px' }} />
@@ -9444,10 +9550,10 @@ const App: React.FC = () => {
                             key={key}
                             className={`sprite-cell${cellSprites.length === 0 ? ' is-empty' : ''}${cellDragOverKey === key ? ' drag-over' : ''}${rowDragOverId === row.id ? ' row-active' : ''}${rowCollapsed ? ' is-collapsed-row' : ''}${colCollapsed ? ' is-collapsed-col' : ''}`}
                             onDragOver={(e) => {
-                              if (!draggedSpriteId) return;
+                              if (!draggedSpriteId && !Array.from(e.dataTransfer.types).includes('Files')) return;
                               e.preventDefault();
                               e.stopPropagation();
-                              e.dataTransfer.dropEffect = 'move';
+                              e.dataTransfer.dropEffect = draggedSpriteId ? 'move' : 'copy';
                               setCellDragOverKey(key);
                             }}
                             onDragLeave={(e) => {
@@ -9457,9 +9563,24 @@ const App: React.FC = () => {
                             onDrop={(e) => {
                               e.preventDefault();
                               e.stopPropagation();
-                              if (draggedSpriteId) moveSpriteToCell(draggedSpriteId, col.id, row.id);
+                              if (draggedSpriteId) {
+                                moveSpriteToCell(draggedSpriteId, col.id, row.id);
+                              } else if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                                void handleFiles(e.dataTransfer.files, { columnId: col.id, rowId: row.id });
+                              }
                               setDraggedSpriteId(null);
                               setCellDragOverKey(null);
+                            }}
+                            onContextMenu={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              if (cellCollapsed || cellSprites.length > 0 || quadrantPicking) return;
+                              setEmptyCellMenu({
+                                x: Math.max(8, Math.min(e.clientX, window.innerWidth - 200)),
+                                y: Math.max(8, Math.min(e.clientY, window.innerHeight - 80)),
+                                columnId: col.id,
+                                rowId: row.id,
+                              });
                             }}
                           >
                             {!cellCollapsed && cellSprites.map((s) => renderSpriteCard(s, col.id, row.id))}
@@ -9468,6 +9589,20 @@ const App: React.FC = () => {
                             )}
                             {!cellCollapsed && cellSprites.length === 0 && draggedSpriteId && (
                               <div className="sprite-cell-hint">Soltá acá</div>
+                            )}
+                            {!cellCollapsed && cellSprites.length === 0 && !draggedSpriteId && !quadrantPicking && (
+                              <button
+                                type="button"
+                                className="sprite-cell-import"
+                                title="Importar sprite a este cuadrante"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void importIntoCell(col.id, row.id);
+                                }}
+                              >
+                                <Plus size={18} />
+                                <span>Importar</span>
+                              </button>
                             )}
                           </div>
                         );
@@ -10117,6 +10252,28 @@ const App: React.FC = () => {
             </div>
           </div>
         </div>
+      )}
+
+      {emptyCellMenu && createPortal(
+        <div
+          className="tools-dropdown is-context"
+          style={{ left: emptyCellMenu.x, top: emptyCellMenu.y }}
+          onMouseDown={(e) => e.stopPropagation()}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <button
+            type="button"
+            className="dropdown-item"
+            onClick={() => {
+              const cell = emptyCellMenu;
+              setEmptyCellMenu(null);
+              void importIntoCell(cell.columnId, cell.rowId);
+            }}
+          >
+            <Plus size={12} /> Importar sprite
+          </button>
+        </div>,
+        document.body
       )}
 
       {quadrantPreviewSprites.length > 0 && (
