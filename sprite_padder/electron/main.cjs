@@ -165,9 +165,43 @@ ipcMain.handle('desktop:pickSaveFile', async (_event, options = {}) => {
 ipcMain.handle('desktop:writeFile', async (_event, filePath, data) => {
   if (!filePath) throw new Error('Ruta de archivo vacía.');
   const buffer = Buffer.from(data);
+  if (buffer.byteLength === 0) throw new Error('No se puede escribir un archivo vacío.');
   await fsp.mkdir(path.dirname(filePath), { recursive: true });
   await fsp.writeFile(filePath, buffer);
   return true;
+});
+
+const desktopWriteStreams = new Map();
+
+ipcMain.handle('desktop:writeFileBegin', async (_event, filePath) => {
+  if (!filePath) throw new Error('Ruta de archivo vacía.');
+  await fsp.mkdir(path.dirname(filePath), { recursive: true });
+  const stream = fs.createWriteStream(filePath);
+  desktopWriteStreams.set(filePath, stream);
+  return new Promise((resolve, reject) => {
+    stream.once('error', reject);
+    stream.once('open', () => resolve(true));
+  });
+});
+
+ipcMain.handle('desktop:writeFileChunk', async (_event, filePath, data) => {
+  const stream = desktopWriteStreams.get(filePath);
+  if (!stream) throw new Error('No hay escritura activa para ese archivo.');
+  const buffer = Buffer.from(data);
+  if (buffer.byteLength === 0) return true;
+  return new Promise((resolve, reject) => {
+    stream.write(buffer, (err) => (err ? reject(err) : resolve(true)));
+  });
+});
+
+ipcMain.handle('desktop:writeFileEnd', async (_event, filePath) => {
+  const stream = desktopWriteStreams.get(filePath);
+  if (!stream) throw new Error('No hay escritura activa para ese archivo.');
+  desktopWriteStreams.delete(filePath);
+  return new Promise((resolve, reject) => {
+    stream.end(() => resolve(true));
+    stream.once('error', reject);
+  });
 });
 
 ipcMain.handle('desktop:writeFilesToFolder', async (_event, folderPath, files) => {

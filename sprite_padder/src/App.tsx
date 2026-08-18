@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
 import { 
   Trash2, Plus, Archive, CheckSquare, Square, 
   Target, FolderSync, Save, AlertTriangle, Eraser, RotateCcw, Search, MapPin, Pencil, MoreHorizontal, FlipHorizontal, FlipVertical, Droplets, Grid, Circle, Maximize, Layers, Play, Pause, Film, PaintBucket, Scissors, Type, Crop, Brush, ChevronLeft, ChevronRight,
-  ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Pipette, Stamp, Lock, Columns2, FolderOpen, Rows3, Hash, ChevronDown, Maximize2
+  ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Pipette, Stamp, Lock, Columns2, FolderOpen, Rows3, Hash, ChevronDown, Maximize2, X
 } from 'lucide-react';
 import JSZip from 'jszip';
 import { canvasToBc7Dds, spriteNameToDds } from './ddsExport';
@@ -10,6 +10,7 @@ import {
   arrayBufferFromBlob,
   filesFromDesktopOpen,
   getDesktop,
+  writeDesktopFileBytes,
   type DesktopFolder,
 } from './desktopBridge';
 import {
@@ -36,6 +37,19 @@ const JOA_PROJECT_VERSION = 1;
 const isProbablyImageFile = (file: File) => {
   if (file.type && file.type.startsWith('image/')) return true;
   return /\.(png|jpe?g|webp|gif|bmp|ico|svg|avif)$/i.test(file.name);
+};
+
+const isLikelyJpegFile = (file: File) => {
+  const t = (file.type || '').toLowerCase();
+  if (t === 'image/jpeg' || t === 'image/jpg') return true;
+  return /\.jpe?g$/i.test(file.name);
+};
+
+const shouldNormalizeOnImport = (file: File) => {
+  if (isLikelyJpegFile(file)) return true;
+  const t = (file.type || '').toLowerCase();
+  if (t === 'image/webp') return true;
+  return /\.webp$/i.test(file.name);
 };
 
 /** Abre el selector de imágenes. null = usar fallback <input>; [] = canceló. */
@@ -450,15 +464,43 @@ const forceDownloadBlob = (blob: Blob, suggestedName: string): boolean => {
   }
 };
 
-/** PNG desde canvas con fallback a dataURL si toBlob falla. */
-const canvasToPngBlob = async (canvas: HTMLCanvasElement): Promise<Blob> => {
+const JOA_JPEG_QUALITY = 0.92;
+
+/** Convierte data URL a Blob sin fetch (fetch falla con data URLs largas, típico al exportar JPG). */
+const dataUrlToBlob = (dataUrl: string): Blob => {
+  const comma = dataUrl.indexOf(',');
+  if (comma < 0) throw new Error('Data URL inválida.');
+  const header = dataUrl.slice(0, comma);
+  const base64 = dataUrl.slice(comma + 1);
+  const mimeMatch = /^data:([^;,]+)/i.exec(header);
+  const mime = mimeMatch?.[1] || 'application/octet-stream';
+  let binary: string;
+  try {
+    binary = atob(base64);
+  } catch {
+    throw new Error('No se pudo decodificar la imagen generada.');
+  }
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+};
+
+const canvasToImageBlob = async (
+  canvas: HTMLCanvasElement,
+  mimeType: 'image/png' | 'image/jpeg',
+  quality = JOA_JPEG_QUALITY,
+): Promise<Blob> => {
   const fromToBlob = await new Promise<Blob | null>((resolve) => {
     try {
       if (typeof canvas.toBlob !== 'function') {
         resolve(null);
         return;
       }
-      canvas.toBlob((b) => resolve(b), 'image/png');
+      if (mimeType === 'image/jpeg') {
+        canvas.toBlob((b) => resolve(b), mimeType, quality);
+      } else {
+        canvas.toBlob((b) => resolve(b), mimeType);
+      }
     } catch {
       resolve(null);
     }
@@ -467,20 +509,29 @@ const canvasToPngBlob = async (canvas: HTMLCanvasElement): Promise<Blob> => {
 
   let dataUrl: string;
   try {
-    dataUrl = canvas.toDataURL('image/png');
+    dataUrl = mimeType === 'image/jpeg'
+      ? canvas.toDataURL(mimeType, quality)
+      : canvas.toDataURL(mimeType);
   } catch {
-    throw new Error('No se pudo generar el PNG (canvas demasiado grande o bloqueado por el navegador).');
+    throw new Error('No se pudo generar la imagen (canvas demasiado grande o bloqueado por el navegador).');
   }
-  if (!dataUrl || !dataUrl.startsWith('data:image/png')) {
-    throw new Error('No se pudo generar el PNG.');
+  const prefix = mimeType === 'image/jpeg' ? 'data:image/jpeg' : 'data:image/png';
+  if (!dataUrl || !dataUrl.startsWith(prefix)) {
+    throw new Error('No se pudo generar la imagen.');
   }
-  const res = await fetch(dataUrl);
-  const blob = await res.blob();
+  const blob = dataUrlToBlob(dataUrl);
   if (!blob || blob.size === 0) {
-    throw new Error('El PNG generado quedó vacío.');
+    throw new Error('La imagen generada quedó vacía.');
   }
   return blob;
 };
+
+/** PNG desde canvas con fallback a dataURL si toBlob falla. */
+const canvasToPngBlob = (canvas: HTMLCanvasElement): Promise<Blob> =>
+  canvasToImageBlob(canvas, 'image/png');
+
+const canvasToJpegBlob = (canvas: HTMLCanvasElement, quality = JOA_JPEG_QUALITY): Promise<Blob> =>
+  canvasToImageBlob(canvas, 'image/jpeg', quality);
 
 type SaveDestination = {
   kind: 'desktop' | 'picker' | 'download';
@@ -491,6 +542,21 @@ const downloadDestination = (suggestedName: string): SaveDestination => ({
   kind: 'download',
   write: async (blob) => forceDownloadBlob(blob, suggestedName),
 });
+
+const PICKER_WRITE_CHUNK_BYTES = 64 * 1024 * 1024;
+const MIN_ZIP_BYTES = 22;
+
+const blobToUint8Array = async (blob: Blob): Promise<Uint8Array> =>
+  blob instanceof Uint8Array ? blob : new Uint8Array(await blob.arrayBuffer());
+
+const writeBytesToWritable = async (writable: FileSystemWritableFileStream, data: Uint8Array) => {
+  for (let offset = 0; offset < data.byteLength; offset += PICKER_WRITE_CHUNK_BYTES) {
+    const end = Math.min(offset + PICKER_WRITE_CHUNK_BYTES, data.byteLength);
+    const chunk = data.subarray(offset, end);
+    await writable.write(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength) as ArrayBuffer);
+  }
+  await writable.close();
+};
 
 /**
  * Abre el diálogo de guardar YA (hace falta el gesto del click).
@@ -512,8 +578,9 @@ const openSaveDestination = async (
       return {
         kind: 'desktop',
         write: async (blob) => {
-          await desktop.writeFile(filePath, await arrayBufferFromBlob(blob));
-          return true;
+          const data = await blobToUint8Array(blob);
+          if (data.byteLength === 0) throw new Error('El archivo generado quedó vacío.');
+          return writeDesktopFileBytes(filePath, data);
         },
       };
     } catch (err) {
@@ -532,9 +599,10 @@ const openSaveDestination = async (
       return {
         kind: 'picker',
         write: async (blob) => {
+          const data = await blobToUint8Array(blob);
+          if (data.byteLength === 0) throw new Error('El archivo generado quedó vacío.');
           const writable = await handle.createWritable();
-          await writable.write(blob);
-          await writable.close();
+          await writeBytesToWritable(writable, data);
           return true;
         },
       };
@@ -553,6 +621,10 @@ const writeBlobWithFallback = async (
   blob: Blob,
   suggestedName: string
 ): Promise<'saved' | 'downloaded' | 'failed'> => {
+  if (!blob || blob.size === 0) {
+    console.error('Intento de guardar un archivo vacío.');
+    return 'failed';
+  }
   try {
     const ok = await dest.write(blob);
     if (ok) return dest.kind === 'download' ? 'downloaded' : 'saved';
@@ -1429,13 +1501,17 @@ const applyPosterizeToCanvas = (canvas: HTMLCanvasElement, sprite: SpriteData) =
   ctx.putImageData(idata, 0, 0);
 };
 
-const renderSpriteToCanvas = (sprite: SpriteData, isExport = true): HTMLCanvasElement => {
+const getSpriteFrameSize = (sprite: SpriteData) => {
   const scX = (sprite.scale || 1) * (sprite.stretchX || 1);
   const scY = (sprite.scale || 1) * (sprite.stretchY || 1);
-  const sw = sprite.img.width * scX;
-  const sh = sprite.img.height * scY;
-  const totalW = Math.max(1, sw + sprite.padding.left + sprite.padding.right);
-  const totalH = Math.max(1, sh + sprite.padding.top + sprite.padding.bottom);
+  return {
+    w: Math.max(1, sprite.img.width * scX + sprite.padding.left + sprite.padding.right),
+    h: Math.max(1, sprite.img.height * scY + sprite.padding.top + sprite.padding.bottom),
+  };
+};
+
+const renderSpriteToCanvas = (sprite: SpriteData, isExport = true): HTMLCanvasElement => {
+  const { w: totalW, h: totalH } = getSpriteFrameSize(sprite);
   const canvas = document.createElement('canvas');
   canvas.width = totalW;
   canvas.height = totalH;
@@ -1530,15 +1606,69 @@ const toggleIdInList = (ids: string[], id: string) =>
 const isJoaProjectFileName = (name: string) =>
   /\.(zip|joa)$/i.test(name);
 
-const imageToPngBlob = async (img: HTMLImageElement): Promise<Blob> => {
+const ensureImageDecoded = async (img: HTMLImageElement) => {
+  if (typeof img.decode === 'function') {
+    try {
+      await img.decode();
+    } catch {
+      /* algunos JPG progresivos fallan decode() pero igual se pueden dibujar */
+    }
+  }
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+  if (!w || !h) throw new Error('La imagen no tiene dimensiones válidas.');
+};
+
+const drawImageToCanvas = async (img: HTMLImageElement): Promise<HTMLCanvasElement> => {
+  await ensureImageDecoded(img);
+  const w = Math.max(1, img.naturalWidth || img.width);
+  const h = Math.max(1, img.naturalHeight || img.height);
   const canvas = document.createElement('canvas');
-  canvas.width = Math.max(1, img.naturalWidth || img.width);
-  canvas.height = Math.max(1, img.naturalHeight || img.height);
+  canvas.width = w;
+  canvas.height = h;
   const ctx = canvas.getContext('2d');
-  if (!ctx) throw new Error('No se pudo crear el canvas para guardar el proyecto.');
+  if (!ctx) throw new Error('No se pudo crear el canvas.');
   ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(img, 0, 0);
-  return canvasToPngBlob(canvas);
+  try {
+    ctx.drawImage(img, 0, 0, w, h);
+  } catch {
+    if (typeof createImageBitmap !== 'function') {
+      throw new Error('No se pudo dibujar la imagen en el canvas.');
+    }
+    const bitmap = await createImageBitmap(img);
+    try {
+      ctx.drawImage(bitmap, 0, 0, w, h);
+    } finally {
+      bitmap.close?.();
+    }
+  }
+  return canvas;
+};
+
+/** Siempre PNG: los JPG/WebP se reconvierten al guardar el proyecto. */
+const imageToProjectPngBlob = async (img: HTMLImageElement): Promise<Blob> => {
+  const canvas = await drawImageToCanvas(img);
+  const blob = await canvasToPngBlob(canvas);
+  if (!blob.size) throw new Error('La conversión a PNG quedó vacía.');
+  return blob;
+};
+
+const loadImageFromFileReader = (file: File): Promise<HTMLImageElement> =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('No se pudo leer el archivo.'));
+    reader.onload = (e) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error('No se pudo decodificar la imagen.'));
+      image.src = e.target?.result as string;
+    };
+    reader.readAsDataURL(file);
+  });
+
+/** JPG/WebP en memoria como data URL larga suele romper la exportación; re-codificar a PNG al importar. */
+const normalizeImportedImage = async (img: HTMLImageElement): Promise<HTMLImageElement> => {
+  return loadImageFromBlob(await imageToProjectPngBlob(img));
 };
 
 const loadImageFromBlob = (blob: Blob): Promise<HTMLImageElement> =>
@@ -1576,12 +1706,17 @@ type JoaProjectFile = {
   sprites: JoaProjectSpriteMeta[];
 };
 
-const spriteToProjectMeta = (s: SpriteData, hasSeparateOriginal: boolean): JoaProjectSpriteMeta => {
+const spriteToProjectMeta = (
+  s: SpriteData,
+  hasSeparateOriginal: boolean,
+  imagePath: string,
+  originalImagePath?: string,
+): JoaProjectSpriteMeta => {
   const { img: _img, originalImg: _orig, ...meta } = s;
   return {
     ...meta,
-    image: `images/${s.id}.png`,
-    originalImage: hasSeparateOriginal ? `images/${s.id}.original.png` : undefined,
+    image: imagePath,
+    originalImage: hasSeparateOriginal && originalImagePath ? originalImagePath : undefined,
   };
 };
 
@@ -1597,6 +1732,28 @@ const findZipEntry = (zip: JSZip, path: string) => {
   const want = normalizeZipPath(path).toLowerCase();
   if (!want || !isSafeZipPath(want)) return null;
   return Object.values(zip.files).find((f) => !f.dir && normalizeZipPath(f.name).toLowerCase() === want) || null;
+};
+
+const resolveProjectImageEntry = (
+  zip: JSZip,
+  meta: JoaProjectSpriteMeta,
+  kind: 'main' | 'original',
+) => {
+  const primary = kind === 'main'
+    ? (typeof meta.image === 'string' ? meta.image : `images/${meta.id}.png`)
+    : meta.originalImage;
+  if (!primary || !isSafeZipPath(primary)) return null;
+  const hit = findZipEntry(zip, primary);
+  if (hit) return hit;
+  const id = meta.id;
+  const fallbacks = kind === 'main'
+    ? [`images/${id}.jpg`, `images/${id}.jpeg`, `images/${id}.png`]
+    : [`images/${id}.original.jpg`, `images/${id}.original.jpeg`, `images/${id}.original.png`];
+  for (const path of fallbacks) {
+    const entry = findZipEntry(zip, path);
+    if (entry) return entry;
+  }
+  return null;
 };
 
 const parseJoaProjectJson = (raw: unknown): JoaProjectFile => {
@@ -1638,7 +1795,19 @@ type LoadedJoaProject = {
 };
 
 const loadJoaProjectFromBlob = async (blob: Blob): Promise<LoadedJoaProject> => {
-  const zip = await JSZip.loadAsync(await blob.arrayBuffer());
+  if (!blob || blob.size === 0) {
+    throw new Error('El archivo está vacío (0 bytes). El guardado falló: volvé a guardar el proyecto.');
+  }
+  if (blob.size < MIN_ZIP_BYTES) {
+    throw new Error('El archivo es demasiado pequeño para ser un proyecto JOA válido.');
+  }
+  let zip: JSZip;
+  try {
+    zip = await JSZip.loadAsync(await blob.arrayBuffer());
+  } catch (err) {
+    console.error(err);
+    throw new Error('No se pudo leer el ZIP. Puede estar corrupto o incompleto — guardá una copia nueva del proyecto.');
+  }
   const jsonEntry = findZipEntry(zip, 'project.json');
   if (!jsonEntry) throw new Error('El archivo no es un proyecto JOA (falta project.json).');
   let parsed: unknown;
@@ -1651,14 +1820,12 @@ const loadJoaProjectFromBlob = async (blob: Blob): Promise<LoadedJoaProject> => 
   const sprites: SpriteData[] = [];
   for (const meta of project.sprites) {
     if (!meta || typeof meta !== 'object' || typeof meta.id !== 'string') continue;
-    const imagePath = typeof meta.image === 'string' ? meta.image : `images/${meta.id}.png`;
-    if (!isSafeZipPath(imagePath)) throw new Error('Ruta de imagen inválida en el proyecto.');
-    const imgEntry = findZipEntry(zip, imagePath);
+    const imgEntry = resolveProjectImageEntry(zip, meta, 'main');
     if (!imgEntry) throw new Error(`Falta la imagen de ${meta.name || meta.id}.`);
     const img = await loadImageFromBlob(await imgEntry.async('blob'));
     let originalImg = img;
     if (typeof meta.originalImage === 'string' && isSafeZipPath(meta.originalImage)) {
-      const origEntry = findZipEntry(zip, meta.originalImage);
+      const origEntry = resolveProjectImageEntry(zip, meta, 'original');
       if (origEntry) originalImg = await loadImageFromBlob(await origEntry.async('blob'));
     }
     const { image: _image, originalImage: _originalImage, ...rest } = meta;
@@ -1717,16 +1884,18 @@ interface SpriteModuleProps {
   onOpenBucket: (id: string) => void;
   onOpenStretch: (id: string) => void;
   onOpenComposite: (id: string, size?: number) => void;
-  onExport: (id: string, format?: 'png' | 'ico' | 'dds') => void;
+  onExport: (id: string, format?: 'png' | 'jpg' | 'ico' | 'dds') => void;
   onUpdateSprite: (id: string, updates: Partial<SpriteData>) => void;
   isReference?: boolean;
   isWhiteBg?: boolean;
   quadrantView?: boolean;
+  onOpenQuadrantPreview?: (id: string) => void;
 }
 
-const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggleSelect, onRemove, onSetAnchor, onSetReference, onOpenEraser, onOpenReplace, onOpenCopyRect, onOpenPixelEditor, onOpenTransform, onOpenTagging, onOpenPaint, onOpenBucket, onOpenStretch, onOpenComposite, onExport, onUpdateSprite, isReference, isWhiteBg, quadrantView }) => {
+const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggleSelect, onRemove, onSetAnchor, onSetReference, onOpenEraser, onOpenReplace, onOpenCopyRect, onOpenPixelEditor, onOpenTransform, onOpenTagging, onOpenPaint, onOpenBucket, onOpenStretch, onOpenComposite, onExport, onUpdateSprite, isReference, isWhiteBg, quadrantView, onOpenQuadrantPreview }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const quadrantPointerRef = useRef<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1858,12 +2027,28 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
 
   return (
     <div className={`sprite-module ${isSelected ? 'selected' : ''} ${isReference ? 'reference' : ''} ${showTools ? 'tools-open' : ''} ${quadrantView ? 'is-quadrant' : ''}`} 
+         onPointerDown={(e) => {
+           if (!quadrantView) return;
+           quadrantPointerRef.current = { x: e.clientX, y: e.clientY };
+         }}
          onClick={(e) => {
            if (e.shiftKey || e.ctrlKey || e.metaKey) {
              onToggleSelect(sprite.id, true);
-           } else {
-             onToggleSelect(sprite.id, false);
+             return;
            }
+           if (quadrantView && onOpenQuadrantPreview) {
+             const start = quadrantPointerRef.current;
+             quadrantPointerRef.current = null;
+             const moved = start
+               ? Math.hypot(e.clientX - start.x, e.clientY - start.y) > 8
+               : false;
+             if (!moved) {
+               onToggleSelect(sprite.id, false);
+               onOpenQuadrantPreview(sprite.id);
+               return;
+             }
+           }
+           onToggleSelect(sprite.id, false);
          }}>
       <div className="module-header">
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -1891,7 +2076,15 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
                 onExport(sprite.id, 'png');
                 setShowTools(false);
               }}>
-                <Save size={12} /> Exportar Sprite
+                <Save size={12} /> Exportar PNG
+              </button>
+              <button type="button" className="dropdown-item" onClick={(e) => { 
+                e.preventDefault();
+                e.stopPropagation(); 
+                onExport(sprite.id, 'jpg');
+                setShowTools(false);
+              }}>
+                <Save size={12} /> Exportar JPG
               </button>
               <button className="dropdown-item" onClick={(e) => { e.stopPropagation(); onOpenPaint(sprite.id); setShowTools(false); }}>
                 <Pencil size={12} /> Pintar
@@ -2057,6 +2250,156 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
         <span className="badge badge-accent">
           Full: {(sprite.img.width * (sprite.scale || 1) * (sprite.stretchX || 1) + sprite.padding.left + sprite.padding.right).toFixed(0)}×{(sprite.img.height * (sprite.scale || 1) * (sprite.stretchY || 1) + sprite.padding.top + sprite.padding.bottom).toFixed(0)}
         </span>
+      </div>
+    </div>
+  );
+};
+
+const QuadrantPreviewPane: React.FC<{
+  sprite: SpriteData;
+  fit: number;
+  isWhiteBg?: boolean;
+  compareNumberSize: number;
+  onRemove?: () => void;
+}> = ({ sprite, fit, isWhiteBg, compareNumberSize, onRemove }) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !sprite.img) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const { w, h } = getSpriteFrameSize(sprite);
+    canvas.width = w * window.devicePixelRatio;
+    canvas.height = h * window.devicePixelRatio;
+    canvas.style.width = `${Math.max(1, Math.floor(w * fit))}px`;
+    canvas.style.height = `${Math.max(1, Math.floor(h * fit))}px`;
+    canvas.style.imageRendering = 'pixelated';
+    ctx.setTransform(window.devicePixelRatio, 0, 0, window.devicePixelRatio, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    renderSpriteToContext(ctx, sprite, false);
+  }, [sprite, fit]);
+
+  const compareLabel = (sprite.compareValue ?? '').trim();
+
+  return (
+    <div className="quadrant-preview-pane">
+      <div className="quadrant-preview-pane-name">
+        <span>{sprite.name}</span>
+        {onRemove && (
+          <button type="button" className="btn-ghost" title="Quitar" onClick={onRemove}>
+            <X size={14} />
+          </button>
+        )}
+      </div>
+      <div className={`quadrant-preview-canvas checker-mini ${isWhiteBg ? 'white-bg' : ''}`}>
+        <canvas ref={canvasRef} />
+        {compareLabel && (
+          <div
+            className="sprite-compare-value"
+            style={{ '--compare-num-size': `${Math.max(compareNumberSize, 40)}px` } as React.CSSProperties}
+          >
+            <span>{compareLabel}</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const QuadrantPreviewOverlay: React.FC<{
+  sprites: SpriteData[];
+  picking: boolean;
+  isWhiteBg?: boolean;
+  compareNumberSize: number;
+  onClose: () => void;
+  onStartPick: () => void;
+  onCancelPick: () => void;
+  onRemove: (id: string) => void;
+}> = ({ sprites, picking, isWhiteBg, compareNumberSize, onClose, onStartPick, onCancelPick, onRemove }) => {
+  const [fit, setFit] = useState(1);
+  const pair = sprites.length > 1;
+
+  useEffect(() => {
+    const update = () => {
+      if (sprites.length === 0) return;
+      const chromeH = 64;
+      const gap = pair ? 24 : 0;
+      const availableW = Math.max(160, window.innerWidth - 24);
+      const availableH = Math.max(160, window.innerHeight - chromeH);
+      const maxW = pair ? Math.floor((availableW - gap) / 2) : availableW;
+      const maxH = availableH;
+      const sizes = sprites.map(getSpriteFrameSize);
+      const next = Math.min(...sizes.map((s) => Math.min(maxW / s.w, maxH / s.h)));
+      setFit(Number.isFinite(next) && next > 0 ? next : 1);
+    };
+    update();
+    window.addEventListener('resize', update);
+    return () => window.removeEventListener('resize', update);
+  }, [sprites, pair]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      if (picking) onCancelPick();
+      else onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [picking, onClose, onCancelPick]);
+
+  const title = pair
+    ? `${sprites[0].name}  vs  ${sprites[1].name}`
+    : sprites[0]?.name || 'Vista grande';
+
+  return (
+    <div
+      className={`quadrant-preview-overlay${pair ? ' is-pair' : ''}${picking ? ' is-picking' : ''}`}
+      role="dialog"
+      aria-label={picking ? 'Elegir sprite para comparar' : 'Vista grande del cuadrante'}
+      onClick={picking ? undefined : onClose}
+    >
+      <div className="quadrant-preview-stage" onClick={(e) => e.stopPropagation()} onWheel={(e) => e.stopPropagation()}>
+        <div className="quadrant-preview-bar">
+          <span className="quadrant-preview-title">
+            {picking ? 'Click un sprite de la grilla para comparar' : title}
+          </span>
+          <div className="quadrant-preview-bar-actions">
+            {picking ? (
+              <button type="button" className="btn btn-outline" onClick={onCancelPick}>
+                Cancelar
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="btn btn-outline"
+                onClick={onStartPick}
+                title="Ver la grilla y elegir otro sprite"
+              >
+                <Columns2 size={14} />
+                {pair ? 'Cambiar' : 'Comparar'}
+              </button>
+            )}
+            <button type="button" className="btn-ghost" onClick={onClose} title="Cerrar (Esc)">
+              <X size={18} />
+            </button>
+          </div>
+        </div>
+        {!picking && (
+          <div className={`quadrant-preview-pair${pair ? ' is-pair' : ''}`}>
+            {sprites.map((sprite, idx) => (
+              <QuadrantPreviewPane
+                key={sprite.id}
+                sprite={sprite}
+                fit={fit}
+                isWhiteBg={isWhiteBg}
+                compareNumberSize={compareNumberSize}
+                onRemove={pair && idx === 1 ? () => onRemove(sprite.id) : undefined}
+              />
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -6670,12 +7013,17 @@ const App: React.FC = () => {
   const [stretchTargetId, setStretchTargetId] = useState<string | null>(null);
   const [compositeTarget, setCompositeTarget] = useState<{ id: string, size: number } | null>(null);
   const [showAnimationModal, setShowAnimationModal] = useState(false);
+  const [quadrantPreviewIds, setQuadrantPreviewIds] = useState<string[]>([]);
+  const [quadrantPicking, setQuadrantPicking] = useState(false);
   const anyModalOpen = !!(
     eraserTargetId || replaceTargetId || copyRectTargetId || pixelEditorTargetId || transformTargetId ||
     taggingTargetId || effectMaskTargetId || paintTargetId || bucketTargetId ||
-    stretchTargetId || compositeTarget || showAnimationModal
+    stretchTargetId || compositeTarget || showAnimationModal || (quadrantPreviewIds.length > 0 && !quadrantPicking)
   );
   const quadrantBoard = columnView && quadrantView;
+  const quadrantPreviewSprites = quadrantPreviewIds
+    .map((id) => sprites.find((s) => s.id === id))
+    .filter((s): s is SpriteData => !!s);
   const boardZoomMin = quadrantBoard ? 0.15 : columnView ? 0.25 : 0.5;
   const boardZoomMax = quadrantBoard ? 4 : columnView ? 3 : 2;
   useModalWheelControls({
@@ -6769,6 +7117,13 @@ const App: React.FC = () => {
   }, [quadrantView]);
 
   useEffect(() => {
+    if (!quadrantBoard) {
+      setQuadrantPreviewIds([]);
+      setQuadrantPicking(false);
+    }
+  }, [quadrantBoard]);
+
+  useEffect(() => {
     savePref(SPRITE_COLUMNS_KEY, spriteColumns);
   }, [spriteColumns]);
 
@@ -6851,7 +7206,7 @@ const App: React.FC = () => {
   const [dirHandle, setDirHandle] = useState<FileSystemDirectoryHandle | null>(null);
   const [workingFolder, setWorkingFolder] = useState<DesktopFolder | null>(null);
   const [isSaving, setIsSaving] = useState(false);
-  const [batchExportFormat, setBatchExportFormat] = useState<'png' | 'dds' | null>(null);
+  const [batchExportFormat, setBatchExportFormat] = useState<'png' | 'jpg' | 'dds' | null>(null);
   const [showGridlines, setShowGridlines] = useState(false);
   const [isWhiteBg, setIsWhiteBg] = useState(false);
   const [highlightedYs, setHighlightedYs] = useState<number[]>([]);
@@ -7005,6 +7360,15 @@ const App: React.FC = () => {
     />
   );
 
+  const openQuadrantPreview = (id: string) => {
+    setQuadrantPreviewIds((prev) => {
+      if (prev.length === 0) return [id];
+      if (prev[0] === id) return prev;
+      return [prev[0], id];
+    });
+    setQuadrantPicking(false);
+  };
+
   const renderSpriteCard = (s: SpriteData, dropColumnId?: string, dropRowId?: string) => (
     <div
       key={s.id}
@@ -7047,7 +7411,7 @@ const App: React.FC = () => {
       }}
       style={{
         opacity: draggedSpriteId === s.id ? 0.4 : 1,
-        cursor: draggedSpriteId === s.id ? 'grabbing' : 'grab',
+        cursor: draggedSpriteId === s.id ? 'grabbing' : quadrantBoard ? 'zoom-in' : 'grab',
         transition: 'opacity 0.2s ease',
         position: 'relative',
       }}
@@ -7080,6 +7444,7 @@ const App: React.FC = () => {
         onExport={handleExportSprite}
         isWhiteBg={isWhiteBg}
         quadrantView={quadrantBoard}
+        onOpenQuadrantPreview={quadrantBoard ? openQuadrantPreview : undefined}
         onUpdateSprite={(id, updates) => {
           const next = sprites.map((item: SpriteData) => item.id === id ? { ...item, ...updates } : item);
           commitSprites(next);
@@ -7094,19 +7459,25 @@ const App: React.FC = () => {
   const handleFiles = async (rawFiles: FileList | File[]) => {
     const files = Array.from(rawFiles);
     const newSprites: SpriteData[] = [];
+    const importErrors: string[] = [];
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       if (!file || !isProbablyImageFile(file)) continue;
-      const img = await new Promise<HTMLImageElement>((res, rej) => {
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          const image = new Image();
-          image.onload = () => res(image);
-          image.onerror = rej;
-          image.src = e.target?.result as string;
-        };
-        reader.readAsDataURL(file);
-      });
+      let img: HTMLImageElement;
+      try {
+        img = await loadImageFromFileReader(file);
+        if (isLikelyJpegFile(file) || shouldNormalizeOnImport(file)) {
+          img = await normalizeImportedImage(img);
+        } else {
+          await ensureImageDecoded(img);
+        }
+      } catch (err) {
+        console.error(`Import ${file.name}:`, err);
+        importErrors.push(file.name);
+        continue;
+      }
+      const imgW = img.naturalWidth || img.width;
+      const imgH = img.naturalHeight || img.height;
       let finalName = file.name;
       let counter = 1;
       const baseName = file.name.replace(/\.[^/.]+$/, "");
@@ -7130,7 +7501,7 @@ const App: React.FC = () => {
         flipV: false,
         regions: [],
         padding: { top: 0, bottom: 0, left: 0, right: 0 },
-        anchor: { x: Math.floor(img.width / 2), y: Math.floor(img.height / 2) },
+        anchor: { x: Math.floor(imgW / 2), y: Math.floor(imgH / 2) },
         pixelation: 1,
         brightness: 100,
         contrast: 100,
@@ -7145,6 +7516,11 @@ const App: React.FC = () => {
       const merged = [...sprites, ...newSprites];
       commitSprites(merged);
       setSelection(newSprites.map((s: SpriteData) => s.id));
+    }
+    if (importErrors.length > 0) {
+      alert(`No se pudieron importar: ${importErrors.join(', ')}`);
+    } else if (files.length > 0 && newSprites.length === 0) {
+      alert('No se pudo importar ninguna imagen. Probá PNG/JPG/WEBP o arrastrá los archivos a la grilla.');
     }
   };
 
@@ -7161,6 +7537,8 @@ const App: React.FC = () => {
     setStretchTargetId(null);
     setCompositeTarget(null);
     setShowAnimationModal(false);
+    setQuadrantPreviewIds([]);
+    setQuadrantPicking(false);
   };
 
   const applyLoadedProject = (loaded: LoadedJoaProject) => {
@@ -7181,6 +7559,10 @@ const App: React.FC = () => {
 
   const openProjectFile = async (file: File) => {
     if (!file) return;
+    if (file.size === 0) {
+      alert('El archivo está vacío (0 bytes). El guardado falló: volvé a guardar el proyecto desde la app.');
+      return;
+    }
     if (sprites.length > 0) {
       const ok = window.confirm('Abrir el proyecto reemplaza los sprites, columnas y filas actuales. ¿Continuar?');
       if (!ok) return;
@@ -7207,13 +7589,19 @@ const App: React.FC = () => {
     try {
       const zip = new JSZip();
       const metas: JoaProjectSpriteMeta[] = [];
+      const pngOpts = { compression: 'STORE' as const };
       for (const s of sprites) {
         const separate = !!(s.originalImg && s.originalImg !== s.img);
-        zip.file(`images/${s.id}.png`, await imageToPngBlob(s.img));
+        const mainPng = await imageToProjectPngBlob(s.img);
+        const mainPath = `images/${s.id}.png`;
+        zip.file(mainPath, await mainPng.arrayBuffer(), pngOpts);
+        let originalPath: string | undefined;
         if (separate && s.originalImg) {
-          zip.file(`images/${s.id}.original.png`, await imageToPngBlob(s.originalImg));
+          const origPng = await imageToProjectPngBlob(s.originalImg);
+          originalPath = `images/${s.id}.original.png`;
+          zip.file(originalPath, await origPng.arrayBuffer(), pngOpts);
         }
-        metas.push(spriteToProjectMeta(s, separate));
+        metas.push(spriteToProjectMeta(s, separate, mainPath, originalPath));
       }
       const project: JoaProjectFile = {
         version: JOA_PROJECT_VERSION,
@@ -7230,7 +7618,16 @@ const App: React.FC = () => {
         sprites: metas,
       };
       zip.file('project.json', JSON.stringify(project, null, 2));
-      const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+      const zipData = await zip.generateAsync({
+        type: 'uint8array',
+        compression: 'DEFLATE',
+        compressionOptions: { level: 1 },
+        streamFiles: true,
+      });
+      if (!zipData || zipData.byteLength < MIN_ZIP_BYTES) {
+        throw new Error('El proyecto generado quedó vacío. Si hay muchos sprites, probá de nuevo o exportá por partes.');
+      }
+      const blob = new Blob([zipData.slice() as BlobPart], { type: 'application/zip' });
       const result = await writeBlobWithFallback(dest, blob, suggestedName);
       if (result === 'failed') alert('No se pudo guardar el proyecto.');
     } catch (err) {
@@ -7487,14 +7884,18 @@ const App: React.FC = () => {
         const files: { name: string; data: ArrayBuffer }[] = [];
         for (const s of sprites) {
           const canvas = renderSpriteToCanvas(s, true);
-          const blob = await new Promise<Blob>(res => canvas.toBlob(res as any, 'image/png'));
-          files.push({ name: s.name, data: await arrayBufferFromBlob(blob) });
+          const blob = await canvasToPngBlob(canvas);
+          if (!blob.size) throw new Error(`No se pudo generar PNG de «${s.name}».`);
+          files.push({
+            name: sanitizeExportFileName(s.name, '.png'),
+            data: await arrayBufferFromBlob(blob),
+          });
         }
         await desktop.writeFilesToFolder(folder.path, files);
-        alert('¡Todos los archivos originales han sido reemplazados con éxito!');
+        alert('Se sobrescribieron los originales como PNG.');
       } catch (err) {
         console.error('Overwrite failed:', err);
-        alert('Error al sobrescribir archivos.');
+        alert(err instanceof Error ? err.message : 'Error al sobrescribir archivos.');
       } finally {
         setIsSaving(false);
       }
@@ -7510,14 +7911,15 @@ const App: React.FC = () => {
     try {
       for (const s of sprites) {
         const canvas = renderSpriteToCanvas(s, true);
-
-        const blob = await new Promise<Blob>(res => canvas.toBlob(res as any, 'image/png'));
-        const fileHandle = await dirHandle.getFileHandle(s.name, { create: true });
+        const blob = await canvasToPngBlob(canvas);
+        if (!blob.size) throw new Error(`No se pudo generar PNG de «${s.name}».`);
+        const fileName = sanitizeExportFileName(s.name, '.png');
+        const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
         const writable = await fileHandle.createWritable();
         await writable.write(blob);
         await writable.close();
       }
-      alert('¡Todos los archivos originales han sido reemplazados con éxito!');
+      alert('Se sobrescribieron los originales como PNG.');
     } catch (err) {
       console.error('Overwrite failed:', err);
       alert('Error al sobrescribir. Asegúrate de dar permisos de escritura.');
@@ -8255,7 +8657,7 @@ const App: React.FC = () => {
     commitSprites(next);
   };
 
-  const handleExportSprite = async (id: string, format: 'png' | 'ico' | 'dds' = 'png') => {
+  const handleExportSprite = async (id: string, format: 'png' | 'jpg' | 'ico' | 'dds' = 'png') => {
     const s = sprites.find((x: SpriteData) => x.id === id);
     if (!s) {
       alert('No se encontró el sprite a exportar.');
@@ -8266,11 +8668,16 @@ const App: React.FC = () => {
       return;
     }
 
-    const finalExt = format === 'ico' ? '.ico' : format === 'dds' ? '.dds' : '.png';
+    const finalExt =
+      format === 'ico' ? '.ico'
+      : format === 'dds' ? '.dds'
+      : format === 'jpg' ? '.jpg'
+      : '.png';
     const defaultName = sanitizeExportFileName(s.name, finalExt);
     const filters =
       format === 'ico' ? [{ name: 'Icon File', extensions: ['ico'] }]
       : format === 'dds' ? [{ name: 'DDS Texture (BC7)', extensions: ['dds'] }]
+      : format === 'jpg' ? [{ name: 'JPEG Image', extensions: ['jpg', 'jpeg'] }]
       : [{ name: 'PNG Image', extensions: ['png'] }];
 
     // El diálogo tiene que abrirse con el gesto del click, antes de generar el archivo.
@@ -8298,6 +8705,9 @@ const App: React.FC = () => {
           throw new Error('La conversión DDS BC7 devolvió un archivo vacío.');
         }
         blob = new Blob([dds], { type: 'application/octet-stream' });
+      } else if (format === 'jpg') {
+        blob = await canvasToJpegBlob(canvas);
+        if (!blob.size) throw new Error('La exportación JPG quedó vacía.');
       } else {
         const pngBlob = await canvasToPngBlob(canvas);
 
@@ -8402,7 +8812,7 @@ const App: React.FC = () => {
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      alert(`Error al exportar${format === 'dds' ? ' DDS BC7' : format === 'ico' ? ' ICO' : ' Sprite'}:\n${msg}`);
+      alert(`Error al exportar${format === 'dds' ? ' DDS BC7' : format === 'ico' ? ' ICO' : format === 'jpg' ? ' JPG' : ' PNG'}:\n${msg}`);
     } finally {
       setIsSaving(false);
     }
@@ -8477,8 +8887,9 @@ const App: React.FC = () => {
   };
 
   const spriteNameToPng = (name: string) => name.replace(/\.[^.]+$/i, '') + '.png';
+  const spriteNameToJpg = (name: string) => name.replace(/\.[^.]+$/i, '') + '.jpg';
 
-  const exportBatch = async (format: 'png' | 'dds', destination: 'zip' | 'folder') => {
+  const exportBatch = async (format: 'png' | 'jpg' | 'dds', destination: 'zip' | 'folder') => {
     if (sprites.length === 0) return;
     setBatchExportFormat(null);
     setIsSaving(true);
@@ -8514,14 +8925,21 @@ const App: React.FC = () => {
 
       for (const s of sprites) {
         const canvas = renderSpriteToCanvas(s, true);
-        const fileName = format === 'dds' ? spriteNameToDds(s.name) : spriteNameToPng(s.name);
+        const fileName =
+          format === 'dds' ? spriteNameToDds(s.name)
+          : format === 'jpg' ? spriteNameToJpg(s.name)
+          : spriteNameToPng(s.name);
         let content: Blob | ArrayBuffer;
 
         if (format === 'dds') {
           content = await canvasToBc7Dds(canvas);
+        } else if (format === 'jpg') {
+          const jpeg = await canvasToJpegBlob(canvas);
+          if (!jpeg.size) throw new Error(`No se pudo generar ${fileName}.`);
+          content = jpeg;
         } else {
-          const png = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
-          if (!png) throw new Error(`No se pudo generar ${fileName}.`);
+          const png = await canvasToPngBlob(canvas);
+          if (!png.size) throw new Error(`No se pudo generar ${fileName}.`);
           content = png;
         }
 
@@ -8720,6 +9138,9 @@ const App: React.FC = () => {
            <div style={{ height: '24px', width: '1px', background: 'var(--border)', margin: '0 8px' }} />
            <button className="btn btn-outline" onClick={() => setBatchExportFormat('png')} disabled={sprites.length === 0 || isSaving}>
              <Archive size={16} /> Exportar PNG
+           </button>
+           <button className="btn btn-outline" onClick={() => setBatchExportFormat('jpg')} disabled={sprites.length === 0 || isSaving}>
+             <Archive size={16} /> Exportar JPG
            </button>
            <button className="btn btn-outline" onClick={() => setBatchExportFormat('dds')} disabled={sprites.length === 0 || isSaving} title="Exporta BC7 DDS reales con mipmaps completos, alfa straight y recorte de verde del juego">
              <Layers size={16} /> {isSaving ? 'Exportando…' : 'Exportar DDS'}
@@ -9159,7 +9580,7 @@ const App: React.FC = () => {
             {hasLinkedFolder && (
               <p style={{ fontSize: '0.6rem', color: 'var(--text-muted)', marginTop: '8px', textAlign: 'center' }}>
                 <AlertTriangle size={10} style={{ marginRight: '4px' }} /> 
-                Esto reemplazará los archivos en tu disco inmediatamente.
+                Guarda PNG en la carpeta. Si el original era JPG, se crea un .png (el .jpg no se borra).
               </p>
             )}
           </div>
@@ -9696,6 +10117,22 @@ const App: React.FC = () => {
             </div>
           </div>
         </div>
+      )}
+
+      {quadrantPreviewSprites.length > 0 && (
+        <QuadrantPreviewOverlay
+          sprites={quadrantPreviewSprites}
+          picking={quadrantPicking}
+          isWhiteBg={isWhiteBg}
+          compareNumberSize={compareNumberSize}
+          onClose={() => {
+            setQuadrantPreviewIds([]);
+            setQuadrantPicking(false);
+          }}
+          onStartPick={() => setQuadrantPicking(true)}
+          onCancelPick={() => setQuadrantPicking(false)}
+          onRemove={(id) => setQuadrantPreviewIds((ids) => ids.filter((x) => x !== id))}
+        />
       )}
 
       {eraserTargetId && (

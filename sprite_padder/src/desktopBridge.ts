@@ -23,6 +23,9 @@ export type DesktopApi = {
     filters?: { name: string; extensions: string[] }[];
   }) => Promise<string | null>;
   writeFile: (filePath: string, data: ArrayBuffer | Uint8Array) => Promise<boolean>;
+  writeFileBegin: (filePath: string) => Promise<boolean>;
+  writeFileChunk: (filePath: string, data: ArrayBuffer | Uint8Array) => Promise<boolean>;
+  writeFileEnd: (filePath: string) => Promise<boolean>;
   writeFilesToFolder: (
     folderPath: string,
     files: { name: string; data: ArrayBuffer | Uint8Array }[]
@@ -40,6 +43,28 @@ export const getDesktop = (): DesktopApi | null =>
   typeof window !== 'undefined' && window.joaDesktop?.isDesktop ? window.joaDesktop : null;
 
 export const isDesktopApp = (): boolean => !!getDesktop();
+
+export const DESKTOP_WRITE_CHUNK_BYTES = 16 * 1024 * 1024;
+
+export const writeDesktopFileBytes = async (filePath: string, data: Uint8Array): Promise<boolean> => {
+  const desktop = getDesktop();
+  if (!desktop) return false;
+  if (data.byteLength === 0) return false;
+  if (data.byteLength <= DESKTOP_WRITE_CHUNK_BYTES) {
+    return desktop.writeFile(filePath, data);
+  }
+  await desktop.writeFileBegin(filePath);
+  try {
+    for (let offset = 0; offset < data.byteLength; offset += DESKTOP_WRITE_CHUNK_BYTES) {
+      const chunk = data.subarray(offset, Math.min(offset + DESKTOP_WRITE_CHUNK_BYTES, data.byteLength));
+      await desktop.writeFileChunk(filePath, chunk);
+    }
+    return await desktop.writeFileEnd(filePath);
+  } catch (err) {
+    try { await desktop.writeFileEnd(filePath); } catch { /* ignore */ }
+    throw err;
+  }
+};
 
 export const arrayBufferFromBlob = async (blob: Blob | ArrayBuffer | Uint8Array): Promise<ArrayBuffer> => {
   if (blob instanceof ArrayBuffer) return blob;

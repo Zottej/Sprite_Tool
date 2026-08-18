@@ -587,6 +587,7 @@ body {
   border: none;
   border-radius: 0;
   background: transparent;
+  cursor: zoom-in;
 }
 
 .column-board.is-quadrant .sprite-module:hover {
@@ -725,7 +726,8 @@ body {
   pointer-events: auto;
 }
 
-.sprite-compare-value input {
+.sprite-compare-value input,
+.sprite-compare-value span {
   width: auto;
   max-width: 100%;
   min-width: 1.15em;
@@ -1479,4 +1481,130 @@ input[type="range"] { accent-color: var(--accent); height: 4px; }
 
 .dropdown-item:hover svg {
   color: var(--accent);
+}
+
+.quadrant-preview-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1400;
+  background: rgba(0, 0, 0, 0.88);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 12px;
+  pointer-events: auto;
+  backdrop-filter: blur(8px);
+}
+
+.quadrant-preview-overlay.is-picking {
+  background: rgba(0, 0, 0, 0.18);
+  backdrop-filter: none;
+  align-items: flex-start;
+  pointer-events: none;
+}
+
+.quadrant-preview-stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  cursor: default;
+  width: min(100vw - 16px, 100%);
+  max-width: 100%;
+  pointer-events: auto;
+}
+
+.quadrant-preview-overlay.is-picking .quadrant-preview-stage {
+  width: auto;
+  max-width: min(720px, calc(100vw - 24px));
+  background: #101014;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 8px 12px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  margin-top: 10px;
+}
+
+.quadrant-preview-bar {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 2px;
+}
+
+.quadrant-preview-bar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.quadrant-preview-bar-actions .btn {
+  height: 32px;
+  padding: 0 10px;
+  font-size: 0.75rem;
+}
+
+.quadrant-preview-title {
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: var(--text-main);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quadrant-preview-pair {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 24px;
+}
+
+.quadrant-preview-pane {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.quadrant-preview-pane-name {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  max-width: 100%;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.quadrant-preview-pane-name span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quadrant-preview-canvas {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.4);
+}
+
+.quadrant-preview-canvas canvas {
+  display: block;
+  image-rendering: pixelated;
+}
+
+.quadrant-preview-hint {
+  margin: 0;
+  font-size: 0.7rem;
+  color: var(--text-muted);
 }
