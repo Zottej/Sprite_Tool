@@ -385,35 +385,40 @@ const useModalWheelControls = (opts: {
   }, [zoom, workspaceRef, contentRef]);
 };
 
-const mimeForSaveExt = (ext: string) => {
-  const e = ext.replace(/^\./, '').toLowerCase();
-  if (e === 'png') return 'image/png';
-  if (e === 'ico') return 'image/x-icon';
-  if (e === 'jpg' || e === 'jpeg') return 'image/jpeg';
-  if (e === 'webp') return 'image/webp';
-  if (e === 'zip' || e === 'joa') return 'application/zip';
-  return 'application/octet-stream';
+const KNOWN_MIME_EXTENSIONS: Record<string, string[]> = {
+  'image/png': ['.png'],
+  'image/jpeg': ['.jpg', '.jpeg'],
+  'image/webp': ['.webp'],
+  'image/x-icon': ['.ico'],
+  'application/zip': ['.zip'],
+};
+
+const toSaveDotExt = (ext: string) => {
+  const clean = String(ext || '').replace(/^\./, '').toLowerCase();
+  return clean ? `.${clean}` : '';
 };
 
 const pickerTypesForSave = (
   suggestedName: string,
   filters?: { name: string; extensions: string[] }[]
 ) => {
+  const makeType = (description: string, rawExts: string[]) => {
+    const dots = rawExts.map(toSaveDotExt).filter(Boolean);
+    const accept: Record<string, string[]> = {
+      'application/octet-stream': dots.length ? dots : ['.bin'],
+    };
+    for (const [mime, known] of Object.entries(KNOWN_MIME_EXTENSIONS)) {
+      const overlap = dots.filter((d) => known.includes(d));
+      if (overlap.length) accept[mime] = overlap;
+    }
+    return { description, accept };
+  };
+
   if (filters && filters.length > 0) {
-    return filters.map((f) => ({
-      description: f.name,
-      accept: {
-        [mimeForSaveExt(f.extensions[0] || '')]: f.extensions.map(
-          (ext) => `.${String(ext).replace(/^\./, '')}`
-        ),
-      },
-    }));
+    return filters.map((f) => makeType(f.name, f.extensions));
   }
-  const ext = suggestedName.includes('.') ? '.' + suggestedName.split('.').pop()! : '';
-  return [{
-    description: suggestedName,
-    accept: { [mimeForSaveExt(ext)]: ext ? [ext] : [] },
-  }];
+  const ext = suggestedName.includes('.') ? suggestedName.split('.').pop()! : 'bin';
+  return [makeType('Archivo', [ext])];
 };
 
 /** Nombre de archivo seguro para guardar/descargar. */
@@ -525,6 +530,11 @@ type SaveDestination = {
   write: (blob: Blob) => Promise<boolean>;
 };
 
+const alertSaveFailed = (err: unknown, fallback = 'No se pudo guardar el archivo.') => {
+  const msg = err instanceof Error ? err.message : (typeof err === 'string' && err ? err : fallback);
+  alert(msg);
+};
+
 const downloadDestination = (suggestedName: string): SaveDestination => ({
   kind: 'download',
   write: async (blob) => forceDownloadBlob(blob, suggestedName),
@@ -545,10 +555,19 @@ const writeBytesToWritable = async (writable: FileSystemWritableFileStream, data
   await writable.close();
 };
 
+const pickerFromHandle = (handle: FileSystemFileHandle): SaveDestination => ({
+  kind: 'picker',
+  write: async (blob) => {
+    const data = await blobToUint8Array(blob);
+    if (data.byteLength === 0) throw new Error('El archivo generado quedó vacío.');
+    const writable = await handle.createWritable();
+    await writeBytesToWritable(writable, data);
+    return true;
+  },
+});
+
 /**
- * Abre el diálogo de guardar YA (hace falta el gesto del click).
- * Si el picker falla por cualquier motivo (salvo cancelar), cae a descarga.
- * Nunca lanza: cancela → null; error → destino de descarga.
+ * Abre el diálogo nativo de Guardar como (un paso: carpeta + nombre + archivos existentes).
  */
 const openSaveDestination = async (
   suggestedName: string,
@@ -567,7 +586,9 @@ const openSaveDestination = async (
         write: async (blob) => {
           const data = await blobToUint8Array(blob);
           if (data.byteLength === 0) throw new Error('El archivo generado quedó vacío.');
-          return writeDesktopFileBytes(filePath, data);
+          const ok = await writeDesktopFileBytes(filePath, data);
+          if (!ok) throw new Error(`No se pudo escribir el archivo:\n${filePath}`);
+          return true;
         },
       };
     } catch (err) {
@@ -583,16 +604,7 @@ const openSaveDestination = async (
         suggestedName,
         types: pickerTypesForSave(suggestedName, filters),
       });
-      return {
-        kind: 'picker',
-        write: async (blob) => {
-          const data = await blobToUint8Array(blob);
-          if (data.byteLength === 0) throw new Error('El archivo generado quedó vacío.');
-          const writable = await handle.createWritable();
-          await writeBytesToWritable(writable, data);
-          return true;
-        },
-      };
+      return pickerFromHandle(handle);
     } catch (err: any) {
       if (err?.name === 'AbortError') return null;
       console.error('showSaveFilePicker falló, se usa descarga:', err);
@@ -602,29 +614,37 @@ const openSaveDestination = async (
   return downloadDestination(suggestedName);
 };
 
-/** Escribe el blob; si falla el destino elegido, fuerza descarga. */
+/** Escribe el blob; si falla el destino elegido, fuerza descarga y avisa. */
 const writeBlobWithFallback = async (
   dest: SaveDestination,
   blob: Blob,
   suggestedName: string
 ): Promise<'saved' | 'downloaded' | 'failed'> => {
   if (!blob || blob.size === 0) {
-    console.error('Intento de guardar un archivo vacío.');
+    alertSaveFailed('El archivo generado quedó vacío. No se guardó nada.');
     return 'failed';
   }
   try {
     const ok = await dest.write(blob);
     if (ok) return dest.kind === 'download' ? 'downloaded' : 'saved';
+    throw new Error('La escritura devolvió un resultado vacío.');
   } catch (err) {
     console.error('Escritura principal falló:', err);
+    if (dest.kind !== 'download') {
+      if (forceDownloadBlob(blob, suggestedName)) {
+        alert(
+          `No se pudo escribir en la ubicación elegida:\n${err instanceof Error ? err.message : String(err)}\n\n` +
+          `Se descargó una copia como «${suggestedName}». Revisá la carpeta Descargas.`
+        );
+        return 'downloaded';
+      }
+    }
+    alertSaveFailed(err);
+    return 'failed';
   }
-  if (dest.kind !== 'download') {
-    if (forceDownloadBlob(blob, suggestedName)) return 'downloaded';
-  }
-  return 'failed';
 };
 
-/** Guarda un blob: en desktop usa diálogo nativo; en web File System Access / download. */
+/** Guarda un blob: en desktop usa diálogo nativo; en web carpeta / download. */
 const saveBlobToDisk = async (
   blob: Blob,
   suggestedName: string,
@@ -1872,6 +1892,7 @@ interface SpriteModuleProps {
   onOpenStretch: (id: string) => void;
   onOpenComposite: (id: string, size?: number) => void;
   onExport: (id: string, format?: 'png' | 'jpg' | 'ico' | 'dds') => void;
+  onFocusResolution?: (id: string) => void;
   onUpdateSprite: (id: string, updates: Partial<SpriteData>) => void;
   isReference?: boolean;
   isWhiteBg?: boolean;
@@ -1879,10 +1900,12 @@ interface SpriteModuleProps {
   onOpenQuadrantPreview?: (id: string) => void;
 }
 
-const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggleSelect, onRemove, onSetAnchor, onSetReference, onOpenEraser, onOpenReplace, onOpenCopyRect, onOpenPixelEditor, onOpenTransform, onOpenTagging, onOpenPaint, onOpenBucket, onOpenStretch, onOpenComposite, onExport, onUpdateSprite, isReference, isWhiteBg, quadrantView, onOpenQuadrantPreview }) => {
+const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggleSelect, onRemove, onSetAnchor, onSetReference, onOpenEraser, onOpenReplace, onOpenCopyRect, onOpenPixelEditor, onOpenTransform, onOpenTagging, onOpenPaint, onOpenBucket, onOpenStretch, onOpenComposite, onExport, onFocusResolution, onUpdateSprite, isReference, isWhiteBg, quadrantView, onOpenQuadrantPreview }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const quadrantPointerRef = useRef<{ x: number; y: number } | null>(null);
+  const leftClickTimerRef = useRef<number | null>(null);
+  const rightClickTimerRef = useRef<number | null>(null);
   const [toolsMenu, setToolsMenu] = useState<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
@@ -1966,6 +1989,11 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
 
   const closeTools = () => setToolsMenu(null);
 
+  useEffect(() => () => {
+    if (leftClickTimerRef.current) window.clearTimeout(leftClickTimerRef.current);
+    if (rightClickTimerRef.current) window.clearTimeout(rightClickTimerRef.current);
+  }, []);
+
   useEffect(() => {
     if (!isDragging) return;
 
@@ -2039,14 +2067,38 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
          onContextMenu={(e) => {
            e.preventDefault();
            e.stopPropagation();
-           onToggleSelect(sprite.id, e.shiftKey || e.ctrlKey || e.metaKey);
-           openToolsMenuAt(e.clientX, e.clientY);
+           if ((e.target as HTMLElement).closest('input, textarea, button')) return;
+           closeTools();
+           // Segundo clic derecho antes de abrir el menú = mismo Exportar PNG del menú.
+           if (rightClickTimerRef.current) {
+             window.clearTimeout(rightClickTimerRef.current);
+             rightClickTimerRef.current = null;
+             onExport(sprite.id, 'png');
+             return;
+           }
+           const { clientX, clientY, shiftKey, ctrlKey, metaKey } = e;
+           rightClickTimerRef.current = window.setTimeout(() => {
+             rightClickTimerRef.current = null;
+             onToggleSelect(sprite.id, shiftKey || ctrlKey || metaKey);
+             openToolsMenuAt(clientX, clientY);
+           }, 500);
+         }}
+         onDoubleClick={(e) => {
+           if ((e.target as HTMLElement).closest('input, textarea, button')) return;
+           e.preventDefault();
+           e.stopPropagation();
+           if (leftClickTimerRef.current) {
+             window.clearTimeout(leftClickTimerRef.current);
+             leftClickTimerRef.current = null;
+           }
+           onFocusResolution?.(sprite.id);
          }}
          onClick={(e) => {
            if (e.shiftKey || e.ctrlKey || e.metaKey) {
              onToggleSelect(sprite.id, true);
              return;
            }
+           if (e.detail > 1) return;
            if (quadrantView && onOpenQuadrantPreview) {
              const start = quadrantPointerRef.current;
              quadrantPointerRef.current = null;
@@ -2054,8 +2106,12 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
                ? Math.hypot(e.clientX - start.x, e.clientY - start.y) > 8
                : false;
              if (!moved) {
-               onToggleSelect(sprite.id, false);
-               onOpenQuadrantPreview(sprite.id);
+               if (leftClickTimerRef.current) window.clearTimeout(leftClickTimerRef.current);
+               leftClickTimerRef.current = window.setTimeout(() => {
+                 leftClickTimerRef.current = null;
+                 onToggleSelect(sprite.id, false);
+                 onOpenQuadrantPreview(sprite.id);
+               }, 280);
                return;
              }
            }
@@ -2316,13 +2372,19 @@ const QuadrantPreviewOverlay: React.FC<{
   picking: boolean;
   isWhiteBg?: boolean;
   compareNumberSize: number;
+  neighbors: { prev: string | null; next: string | null; up: string | null; down: string | null };
+  onBrowse: (id: string) => void;
   onClose: () => void;
   onStartPick: () => void;
   onCancelPick: () => void;
   onRemove: (id: string) => void;
-}> = ({ sprites, picking, isWhiteBg, compareNumberSize, onClose, onStartPick, onCancelPick, onRemove }) => {
+}> = ({
+  sprites, picking, isWhiteBg, compareNumberSize, neighbors,
+  onBrowse, onClose, onStartPick, onCancelPick, onRemove,
+}) => {
   const [fit, setFit] = useState(1);
   const pair = sprites.length > 1;
+  const canBrowse = !picking && !!(neighbors.prev || neighbors.next);
 
   useEffect(() => {
     const update = () => {
@@ -2344,14 +2406,28 @@ const QuadrantPreviewOverlay: React.FC<{
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        if (picking) onCancelPick();
+        else onClose();
+        return;
+      }
+      if (picking) return;
+      const target = e.target as HTMLElement | null;
+      if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+      const go =
+        e.key === 'ArrowLeft' ? neighbors.prev
+        : e.key === 'ArrowRight' ? neighbors.next
+        : e.key === 'ArrowUp' ? neighbors.up
+        : e.key === 'ArrowDown' ? neighbors.down
+        : null;
+      if (!go) return;
       e.preventDefault();
-      if (picking) onCancelPick();
-      else onClose();
+      onBrowse(go);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [picking, onClose, onCancelPick]);
+  }, [picking, neighbors, onBrowse, onClose, onCancelPick]);
 
   const title = pair
     ? `${sprites[0].name}  vs  ${sprites[1].name}`
@@ -2364,6 +2440,26 @@ const QuadrantPreviewOverlay: React.FC<{
       aria-label={picking ? 'Elegir sprite para comparar' : 'Vista grande del cuadrante'}
       onClick={picking ? undefined : onClose}
     >
+      {canBrowse && neighbors.prev && (
+        <button
+          type="button"
+          className="quadrant-preview-nav is-prev"
+          title="Anterior (←)"
+          onClick={(e) => { e.stopPropagation(); onBrowse(neighbors.prev!); }}
+        >
+          <ChevronLeft size={48} strokeWidth={1.6} />
+        </button>
+      )}
+      {canBrowse && neighbors.next && (
+        <button
+          type="button"
+          className="quadrant-preview-nav is-next"
+          title="Siguiente (→)"
+          onClick={(e) => { e.stopPropagation(); onBrowse(neighbors.next!); }}
+        >
+          <ChevronRight size={48} strokeWidth={1.6} />
+        </button>
+      )}
       <div className="quadrant-preview-stage" onClick={(e) => e.stopPropagation()} onWheel={(e) => e.stopPropagation()}>
         <div className="quadrant-preview-bar">
           <span className="quadrant-preview-title">
@@ -7436,6 +7532,58 @@ const App: React.FC = () => {
     setQuadrantPicking(false);
   };
 
+  const browseQuadrantPreview = (id: string) => {
+    setQuadrantPreviewIds((prev) => {
+      if (prev.length <= 1) return [id];
+      const other = prev[1];
+      if (!other || other === id) return [id];
+      return [id, other];
+    });
+    setQuadrantPicking(false);
+  };
+
+  const quadrantPreviewNeighbors = (() => {
+    const empty = { prev: null as string | null, next: null as string | null, up: null as string | null, down: null as string | null };
+    const currentId = quadrantPreviewIds[0];
+    if (!currentId) return empty;
+    const order: { id: string; col: string; row: string }[] = [];
+    for (const row of spriteRows) {
+      for (const col of visibleSpriteColumns) {
+        for (const s of sprites) {
+          if (getSpriteColumnId(s) === col.id && getSpriteRowId(s) === row.id) {
+            order.push({ id: s.id, col: col.id, row: row.id });
+          }
+        }
+      }
+    }
+    const i = order.findIndex((x) => x.id === currentId);
+    if (i < 0 || order.length < 2) return empty;
+    const n = order.length;
+    const cur = order[i];
+    const colIds = visibleSpriteColumns.map((c) => c.id);
+    const rowIds = spriteRows.map((r) => r.id);
+    const cIdx = colIds.indexOf(cur.col);
+    const rIdx = rowIds.indexOf(cur.row);
+    const firstInCell = (ci: number, ri: number) =>
+      order.find((x) => x.col === colIds[ci] && x.row === rowIds[ri])?.id ?? null;
+    let up: string | null = null;
+    let down: string | null = null;
+    if (cIdx >= 0 && rIdx >= 0 && rowIds.length > 1) {
+      for (let step = 1; step < rowIds.length; step++) {
+        if (!up) up = firstInCell(cIdx, (rIdx - step + rowIds.length) % rowIds.length);
+        if (!down) down = firstInCell(cIdx, (rIdx + step) % rowIds.length);
+      }
+      if (up === currentId) up = null;
+      if (down === currentId) down = null;
+    }
+    return {
+      prev: order[(i - 1 + n) % n].id,
+      next: order[(i + 1) % n].id,
+      up,
+      down,
+    };
+  })();
+
   const renderSpriteCard = (s: SpriteData, dropColumnId?: string, dropRowId?: string) => (
     <div
       key={s.id}
@@ -7510,6 +7658,7 @@ const App: React.FC = () => {
         onOpenStretch={(id) => setStretchTargetId(id)}
         onOpenComposite={(id, size) => setCompositeTarget({ id, size: size || 8192 })}
         onExport={handleExportSprite}
+        onFocusResolution={focusSpriteResolution}
         isWhiteBg={isWhiteBg}
         quadrantView={quadrantBoard}
         onOpenQuadrantPreview={columnView ? openQuadrantPreview : undefined}
@@ -7701,8 +7850,7 @@ const App: React.FC = () => {
         throw new Error('El proyecto generado quedó vacío. Si hay muchos sprites, probá de nuevo o exportá por partes.');
       }
       const blob = new Blob([zipData.slice() as BlobPart], { type: 'application/zip' });
-      const result = await writeBlobWithFallback(dest, blob, suggestedName);
-      if (result === 'failed') alert('No se pudo guardar el proyecto.');
+      await writeBlobWithFallback(dest, blob, suggestedName);
     } catch (err) {
       console.error(err);
       alert(err instanceof Error ? err.message : 'No se pudo guardar el proyecto.');
@@ -7925,6 +8073,20 @@ const App: React.FC = () => {
     } else {
       setSelection([id]);
     }
+  };
+
+  const focusSpriteResolution = (id: string) => {
+    setSelection([id]);
+    setQuadrantPreviewIds([]);
+    setQuadrantPicking(false);
+    setControlsVisible(true);
+    window.setTimeout(() => {
+      const el = document.getElementById('joa-res-width') as HTMLInputElement | null;
+      if (!el || el.disabled) return;
+      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      el.focus();
+      el.select();
+    }, 80);
   };
 
   const updateDirHandle = (handle: FileSystemDirectoryHandle | null) => {
@@ -8904,12 +9066,7 @@ const App: React.FC = () => {
       }
 
       const result = await writeBlobWithFallback(dest, blob, defaultName);
-      if (result === 'failed') {
-        throw new Error('No se pudo guardar ni descargar el archivo.');
-      }
-      if (result === 'downloaded' && dest.kind !== 'download') {
-        alert('No se pudo escribir en la ubicación elegida. Se descargó una copia en Descargas.');
-      }
+      if (result === 'failed') return;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       alert(`Error al exportar${format === 'dds' ? ' DDS BC7' : format === 'ico' ? ' ICO' : format === 'jpg' ? ' JPG' : ' PNG'}:\n${msg}`);
@@ -9851,7 +10008,11 @@ const App: React.FC = () => {
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '8px' }}>
                 <div className="slider-item" style={{ marginBottom: 0 }}>
                   <div className="slider-label"><span>Ancho (px)</span></div>
-                  <input type="number" step="1" style={{ width: '100%', background: '#1a1a1a', border: '1px solid #333', color: 'white', padding: '4px', borderRadius: '4px' }}
+                  <input
+                    id="joa-res-width"
+                    type="number"
+                    step="1"
+                    style={{ width: '100%', background: '#1a1a1a', border: '1px solid #333', color: 'white', padding: '4px', borderRadius: '4px' }}
                     value={firstSelected ? Math.round(firstSelected.img.width * (firstSelected.scale || 1)) : 0}
                     onChange={(e) => updateBulkWidth(parseInt(e.target.value) || 0)} disabled={selection.length === 0}
                   />
@@ -10282,6 +10443,8 @@ const App: React.FC = () => {
           picking={quadrantPicking}
           isWhiteBg={isWhiteBg}
           compareNumberSize={compareNumberSize}
+          neighbors={quadrantPreviewNeighbors}
+          onBrowse={browseQuadrantPreview}
           onClose={() => {
             setQuadrantPreviewIds([]);
             setQuadrantPicking(false);

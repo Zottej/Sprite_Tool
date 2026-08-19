@@ -1550,6 +1550,53 @@ input[type="range"] { accent-color: var(--accent); height: 4px; }
   backdrop-filter: blur(8px);
 }
 
+.quadrant-preview-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2;
+  width: 88px;
+  height: min(72vh, 520px);
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0.4;
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+
+.quadrant-preview-nav:hover,
+.quadrant-preview-nav:focus-visible {
+  opacity: 1;
+  outline: none;
+}
+
+.quadrant-preview-nav.is-prev {
+  left: 0;
+}
+
+.quadrant-preview-nav.is-next {
+  right: 0;
+}
+
+.quadrant-preview-nav.is-prev:hover,
+.quadrant-preview-nav.is-prev:focus-visible {
+  background: linear-gradient(to right, rgba(0, 0, 0, 0.45), transparent);
+}
+
+.quadrant-preview-nav.is-next:hover,
+.quadrant-preview-nav.is-next:focus-visible {
+  background: linear-gradient(to left, rgba(0, 0, 0, 0.45), transparent);
+}
+
+.quadrant-preview-overlay:not(.is-picking) {
+  padding: 10px 96px;
+}
+
 .quadrant-preview-overlay.is-picking {
   background: rgba(0, 0, 0, 0.18);
   backdrop-filter: none;

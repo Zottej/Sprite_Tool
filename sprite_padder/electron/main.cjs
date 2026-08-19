@@ -150,16 +150,21 @@ ipcMain.handle('desktop:pickOpenFiles', async (_event, options = {}) => {
 
 ipcMain.handle('desktop:pickSaveFile', async (_event, options = {}) => {
   const current = getWorkingFolder();
+  const suggestedName = options.suggestedName || 'export.bin';
   const result = await dialog.showSaveDialog(mainWindow, {
     title: options.title || 'Guardar archivo',
-    defaultPath: path.join(current?.path || app.getPath('documents'), options.suggestedName || 'export.bin'),
+    defaultPath: path.join(current?.path || app.getPath('documents'), suggestedName),
     filters: options.filters || [{ name: 'Todos', extensions: ['*'] }],
   });
   if (result.canceled || !result.filePath) return null;
 
-  const parent = path.dirname(result.filePath);
+  let filePath = result.filePath;
+  const suggestedExt = path.extname(suggestedName);
+  if (suggestedExt && !path.extname(filePath)) filePath += suggestedExt;
+
+  const parent = path.dirname(filePath);
   if (fs.existsSync(parent)) writeConfig({ workingFolder: parent });
-  return result.filePath;
+  return filePath;
 });
 
 ipcMain.handle('desktop:writeFile', async (_event, filePath, data) => {

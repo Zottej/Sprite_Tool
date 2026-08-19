@@ -50,14 +50,16 @@ export const writeDesktopFileBytes = async (filePath: string, data: Uint8Array):
   const desktop = getDesktop();
   if (!desktop) return false;
   if (data.byteLength === 0) return false;
+  const copy = (bytes: Uint8Array) =>
+    bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
   if (data.byteLength <= DESKTOP_WRITE_CHUNK_BYTES) {
-    return desktop.writeFile(filePath, data);
+    return desktop.writeFile(filePath, copy(data));
   }
   await desktop.writeFileBegin(filePath);
   try {
     for (let offset = 0; offset < data.byteLength; offset += DESKTOP_WRITE_CHUNK_BYTES) {
       const chunk = data.subarray(offset, Math.min(offset + DESKTOP_WRITE_CHUNK_BYTES, data.byteLength));
-      await desktop.writeFileChunk(filePath, chunk);
+      await desktop.writeFileChunk(filePath, copy(chunk));
     }
     return await desktop.writeFileEnd(filePath);
   } catch (err) {
