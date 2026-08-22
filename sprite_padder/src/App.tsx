@@ -1882,6 +1882,7 @@ interface SpriteModuleProps {
   onSetAnchor: (id: string, x: number, y: number) => void;
   onSetReference: (id: string) => void;
   onOpenEraser: (id: string) => void;
+  onOpenGhostCompare: (id: string) => void;
   onOpenReplace: (id: string) => void;
   onOpenCopyRect: (id: string) => void;
   onOpenPixelEditor: (id: string) => void;
@@ -1900,7 +1901,7 @@ interface SpriteModuleProps {
   onOpenQuadrantPreview?: (id: string) => void;
 }
 
-const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggleSelect, onRemove, onSetAnchor, onSetReference, onOpenEraser, onOpenReplace, onOpenCopyRect, onOpenPixelEditor, onOpenTransform, onOpenTagging, onOpenPaint, onOpenBucket, onOpenStretch, onOpenComposite, onExport, onFocusResolution, onUpdateSprite, isReference, isWhiteBg, quadrantView, onOpenQuadrantPreview }) => {
+const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggleSelect, onRemove, onSetAnchor, onSetReference, onOpenEraser, onOpenGhostCompare, onOpenReplace, onOpenCopyRect, onOpenPixelEditor, onOpenTransform, onOpenTagging, onOpenPaint, onOpenBucket, onOpenStretch, onOpenComposite, onExport, onFocusResolution, onUpdateSprite, isReference, isWhiteBg, quadrantView, onOpenQuadrantPreview }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const quadrantPointerRef = useRef<{ x: number; y: number } | null>(null);
@@ -2262,6 +2263,9 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
           </button>
           <button type="button" className="dropdown-item" onClick={() => { onOpenEraser(sprite.id); closeTools(); }}>
             <Eraser size={12} /> Goma (Borrador)
+          </button>
+          <button type="button" className="dropdown-item" onClick={() => { onOpenGhostCompare(sprite.id); closeTools(); }}>
+            <Layers size={12} /> Comparar overlay
           </button>
           <button type="button" className="dropdown-item" onClick={() => { onOpenReplace(sprite.id); closeTools(); }}>
             <Stamp size={12} /> Reemplazar de...
@@ -3219,6 +3223,391 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
             </button>
             <button className="btn btn-outline" onClick={handleReset}>Reiniciar</button>
             <button className="btn btn-primary" style={{ paddingLeft: '24px', paddingRight: '24px' }} onClick={handleSave}>Guardar Cambios</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- Ghost / onion compare: source transparent behind current sprite ---
+interface GhostCompareModalProps {
+  sprite: SpriteData;
+  sprites: SpriteData[];
+  onChangeSprite: (next: SpriteData) => void;
+  onClose: () => void;
+  isWhiteBg?: boolean;
+}
+
+const GHOST_COMPARE_PREFS_KEY = 'joa-ghost-compare-prefs';
+
+const nudgeSpriteContent = (s: SpriteData, dx: number, dy: number): SpriteData => {
+  if (!dx && !dy) return s;
+  return {
+    ...s,
+    padding: {
+      left: s.padding.left + dx,
+      right: s.padding.right - dx,
+      top: s.padding.top + dy,
+      bottom: s.padding.bottom - dy,
+    },
+  };
+};
+
+const setSpriteInternalScale = (s: SpriteData, val: number): SpriteData => {
+  const stretchX = s.stretchX || 1;
+  const stretchY = s.stretchY || 1;
+  const currScX = (s.scale || 1) * stretchX;
+  const currScY = (s.scale || 1) * stretchY;
+  const currW = s.img.width * currScX;
+  const currH = s.img.height * currScY;
+  const newScX = val * stretchX;
+  const newScY = val * stretchY;
+  const newW = s.img.width * newScX;
+  const newH = s.img.height * newScY;
+  const diffW = currW - newW;
+  const diffH = currH - newH;
+  return {
+    ...s,
+    scale: val,
+    padding: {
+      left: s.padding.left + diffW / 2,
+      right: s.padding.right + diffW / 2,
+      top: s.padding.top + diffH / 2,
+      bottom: s.padding.bottom + diffH / 2,
+    },
+  };
+};
+
+const drawSpriteFrameToTemp = (sprite: SpriteData) => {
+  const { w, h } = getSpriteFrameSize(sprite);
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(w));
+  c.height = Math.max(1, Math.round(h));
+  const ctx = c.getContext('2d')!;
+  ctx.imageSmoothingEnabled = false;
+  renderSpriteToContext(ctx, sprite, false);
+  return c;
+};
+
+/** Primer píxel opaco de la fila más baja con dibujo (izq → der). */
+const findBottomFirstPainted = (canvas: HTMLCanvasElement): { x: number; y: number } | null => {
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return null;
+  const w = canvas.width;
+  const h = canvas.height;
+  if (w < 1 || h < 1) return null;
+  const { data } = ctx.getImageData(0, 0, w, h);
+  for (let y = h - 1; y >= 0; y--) {
+    const row = y * w * 4;
+    for (let x = 0; x < w; x++) {
+      if (data[row + x * 4 + 3] >= 12) return { x, y };
+    }
+  }
+  return null;
+};
+
+/** Alinea `moving` a `fixed` por el primer píxel pintado de la base. */
+const autoAlignSpriteToFixedBottom = (moving: SpriteData, fixed: SpriteData): SpriteData | null => {
+  const fixedPt = findBottomFirstPainted(drawSpriteFrameToTemp(fixed));
+  const movingPt = findBottomFirstPainted(drawSpriteFrameToTemp(moving));
+  if (!fixedPt || !movingPt) return null;
+  return nudgeSpriteContent(moving, fixedPt.x - movingPt.x, fixedPt.y - movingPt.y);
+};
+
+const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, onChangeSprite, onClose, isWhiteBg }) => {
+  const others = sprites.filter((s) => s.id !== sprite.id);
+  const [sourceId, setSourceId] = useState<string | null>(() => {
+    if (others.length === 1) return others[0].id;
+    const lastName = loadPref<string>('joa-ghost-compare-last-source', '');
+    const remembered = others.find((s) => s.name === lastName);
+    return remembered?.id ?? null;
+  });
+  const source = others.find((s) => s.id === sourceId) || null;
+  const prefs = loadPref<{ zoom?: number; opacity?: number; editSource?: boolean }>(GHOST_COMPARE_PREFS_KEY, {});
+  const [zoom, setZoom] = useState(() => clampNum(prefs.zoom, 0.5, 8, 1));
+  const [opacity, setOpacity] = useState(() => Math.round(clampNum(prefs.opacity, 5, 95, 40)));
+  const [editSource, setEditSource] = useState(() => prefs.editSource === true);
+  const [nudgeStep, setNudgeStep] = useState(() => Math.round(clampNum(loadPref('joa-content-nudge-step', 1), 1, 512, 1)));
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-ghost-compare-scroll', sprite.name);
+  useModalWheelControls({ zoom, setZoom, workspaceRef });
+
+  useEffect(() => {
+    if (source) savePref('joa-ghost-compare-last-source', source.name);
+  }, [source]);
+
+  useEffect(() => {
+    savePref(GHOST_COMPARE_PREFS_KEY, { zoom, opacity, editSource });
+  }, [zoom, opacity, editSource]);
+
+  useEffect(() => {
+    savePref('joa-content-nudge-step', nudgeStep);
+  }, [nudgeStep]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !source) return;
+    const bg = drawSpriteFrameToTemp(source);
+    const fg = drawSpriteFrameToTemp(sprite);
+    const w = Math.max(bg.width, fg.width);
+    const h = Math.max(bg.height, fg.height);
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d')!;
+    ctx.clearRect(0, 0, w, h);
+    ctx.imageSmoothingEnabled = false;
+    ctx.globalAlpha = opacity / 100;
+    ctx.drawImage(bg, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.drawImage(fg, 0, 0);
+  }, [sprite, source, opacity]);
+
+  const spriteRef = useRef(sprite);
+  spriteRef.current = sprite;
+  const sourceRef = useRef(source);
+  sourceRef.current = source;
+  const editSourceRef = useRef(editSource);
+  editSourceRef.current = editSource;
+  const onChangeRef = useRef(onChangeSprite);
+  onChangeRef.current = onChangeSprite;
+
+  useEffect(() => {
+    if (!source) return;
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+      const step = e.shiftKey ? Math.max(1, nudgeStep * 5) : nudgeStep;
+      let dx = 0;
+      let dy = 0;
+      if (e.key === 'ArrowLeft') dx = -step;
+      else if (e.key === 'ArrowRight') dx = step;
+      else if (e.key === 'ArrowUp') dy = -step;
+      else if (e.key === 'ArrowDown') dy = step;
+      else return;
+      e.preventDefault();
+      const moving = editSourceRef.current ? sourceRef.current : spriteRef.current;
+      if (!moving) return;
+      onChangeRef.current(nudgeSpriteContent(moving, dx, dy));
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [source, nudgeStep]);
+
+  const picker = (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '1080px', height: 'auto', maxHeight: '92vh' }}>
+        <div className="modal-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <Layers size={18} color="var(--accent)" />
+            <h3 style={{ fontSize: '1rem' }}>Comparar overlay: {sprite.name}</h3>
+          </div>
+          <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
+        </div>
+        <div style={{ padding: '16px 20px', overflow: 'auto' }}>
+          <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '14px', lineHeight: 1.45 }}>
+            Elegí el sprite fuente. Se dibuja <strong>atrás</strong>, semitransparente, y <strong>{sprite.name}</strong> queda encima opaco (misma esquina superior izquierda del envase Full).
+          </p>
+          {others.length === 0 ? (
+            <div className="empty-msg">Cargá al menos otro sprite para compararlo.</div>
+          ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: '10px' }}>
+              {others.map((s) => (
+                <button
+                  key={s.id}
+                  type="button"
+                  className="btn btn-outline"
+                  onClick={() => setSourceId(s.id)}
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    gap: '8px',
+                    padding: '10px',
+                    height: 'auto',
+                    textAlign: 'center',
+                  }}
+                >
+                  <div className="checker-mini" style={{ width: '100%', height: '88px', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '4px', overflow: 'hidden' }}>
+                    <img src={s.img.src} alt="" style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', imageRendering: 'pixelated' }} />
+                  </div>
+                  <span style={{ fontSize: '0.7rem', wordBreak: 'break-all' }}>{s.name}</span>
+                  <span style={{ fontSize: '0.6rem', color: 'var(--text-muted)' }}>{s.img.width}×{s.img.height}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
+  if (!source) return picker;
+
+  const editTarget = editSource ? source : sprite;
+  const alignFixed = editSource ? sprite : source;
+  const fgSize = getSpriteFrameSize(sprite);
+  const bgSize = getSpriteFrameSize(source);
+  const stageW = Math.max(fgSize.w, bgSize.w);
+  const stageH = Math.max(fgSize.h, bgSize.h);
+  const internalScale = editTarget.scale || 1;
+  const nudgeBtn = (dx: number, dy: number, title: string, icon: React.ReactNode) => (
+    <button
+      type="button"
+      className="btn btn-outline"
+      style={{ width: '34px', height: '34px', padding: 0 }}
+      title={title}
+      onClick={() => onChangeSprite(nudgeSpriteContent(editTarget, dx, dy))}
+    >
+      {icon}
+    </button>
+  );
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+            <Layers size={18} color="var(--accent)" />
+            <h3 style={{ fontSize: '1rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              Overlay: {sprite.name}
+            </h3>
+            <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', flexShrink: 0 }}>
+              fondo ← {source.name}
+            </span>
+            <span style={{
+              fontSize: '0.65rem',
+              flexShrink: 0,
+              padding: '2px 8px',
+              borderRadius: '999px',
+              border: '1px solid var(--border)',
+              color: editSource ? '#ffcc66' : 'var(--accent)',
+              background: editSource ? 'rgba(255,204,102,0.12)' : 'rgba(107,102,255,0.12)',
+            }}>
+              editando: {editTarget.name}
+            </span>
+          </div>
+          <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
+        </div>
+        <div
+          ref={workspaceRef}
+          className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`}
+          style={{ overflow: 'auto' }}
+          onScroll={onWorkspaceScroll}
+        >
+          <div style={{ width: stageW * zoom, height: stageH * zoom, position: 'relative' }}>
+            <canvas
+              ref={canvasRef}
+              style={{
+                width: stageW * zoom,
+                height: stageH * zoom,
+                imageRendering: 'pixelated',
+                display: 'block',
+              }}
+            />
+          </div>
+        </div>
+        <div className="modal-footer" style={{ padding: '16px 20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '16px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+          <label
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '8px',
+              fontSize: '0.75rem',
+              color: 'var(--text-muted)',
+              cursor: 'pointer',
+              userSelect: 'none',
+              padding: '6px 10px',
+              border: '1px solid var(--border)',
+              borderRadius: '8px',
+              background: editSource ? 'rgba(255,204,102,0.08)' : 'transparent',
+            }}
+            title="Si está activo, mover / escala / autoalinear modifican la fuente (fondo). Si no, modifican el sprite de arriba."
+          >
+            <input
+              type="checkbox"
+              checked={editSource}
+              onChange={(e) => setEditSource(e.target.checked)}
+              style={{ cursor: 'pointer' }}
+            />
+            Editar fuente
+          </label>
+          <div className="slider-item" style={{ flex: '1 1 140px', marginBottom: 0, minWidth: '120px' }}>
+            <div className="slider-label"><span><Search size={14} /> Zoom</span><span>{zoom.toFixed(1)}x</span></div>
+            <input type="range" min="0.5" max="8" step="0.1" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
+          </div>
+          <div className="slider-item" style={{ flex: '1 1 140px', marginBottom: 0, minWidth: '120px' }}>
+            <div className="slider-label"><span>Opacidad fuente</span><span>{opacity}%</span></div>
+            <input type="range" min="5" max="95" step="1" value={opacity} onChange={(e) => setOpacity(parseInt(e.target.value, 10))} />
+          </div>
+          <div className="slider-item" style={{ flex: '1 1 160px', marginBottom: 0, minWidth: '140px' }}>
+            <div className="slider-label"><span>Escala interna</span><span>{internalScale.toFixed(2)}x</span></div>
+            <input
+              type="range"
+              min="0.1"
+              max="4"
+              step="0.01"
+              value={internalScale}
+              onChange={(e) => onChangeSprite(setSpriteInternalScale(editTarget, parseFloat(e.target.value)))}
+            />
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(3, 34px)',
+                gridTemplateRows: 'repeat(3, 34px)',
+                gap: '4px',
+                justifyItems: 'center',
+                alignItems: 'center',
+              }}
+            >
+              <span />
+              {nudgeBtn(0, -nudgeStep, 'Subir contenido (↑)', <ArrowUp size={16} />)}
+              <span />
+              {nudgeBtn(-nudgeStep, 0, 'Mover a la izquierda (←)', <ArrowLeft size={16} />)}
+              <span style={{ fontSize: '0.6rem', color: 'var(--text-muted)' }}>px</span>
+              {nudgeBtn(nudgeStep, 0, 'Mover a la derecha (→)', <ArrowRight size={16} />)}
+              <span />
+              {nudgeBtn(0, nudgeStep, 'Bajar contenido (↓)', <ArrowDown size={16} />)}
+              <span />
+            </div>
+            <div style={{ width: '72px' }}>
+              <div className="slider-label" style={{ marginBottom: '4px' }}>
+                <span>Paso</span>
+                <span>{nudgeStep}px</span>
+              </div>
+              <input
+                type="number"
+                min={1}
+                max={512}
+                className="input-small"
+                style={{ width: '100%' }}
+                value={nudgeStep}
+                onChange={(e) => setNudgeStep(Math.max(1, parseInt(e.target.value, 10) || 1))}
+              />
+            </div>
+            <button
+              type="button"
+              className="btn btn-outline"
+              title={editSource
+                ? 'Alinea la fuente al primer píxel pintado de la base del sprite de arriba (el de arriba no se mueve)'
+                : 'Alinea el sprite de arriba al primer píxel pintado de la base de la fuente (la fuente no se mueve)'}
+              onClick={() => {
+                const aligned = autoAlignSpriteToFixedBottom(editTarget, alignFixed);
+                if (!aligned) {
+                  alert('No se encontró dibujo en la base de alguno de los dos sprites.');
+                  return;
+                }
+                onChangeSprite(aligned);
+              }}
+            >
+              <Target size={14} /> Autoalinear base
+            </button>
+          </div>
+          <div style={{ display: 'flex', gap: '12px', marginLeft: 'auto' }}>
+            <button className="btn btn-outline" onClick={() => setSourceId(null)}>Cambiar fuente</button>
+            <button className="btn btn-primary" onClick={onClose}>Cerrar</button>
           </div>
         </div>
       </div>
@@ -7152,6 +7541,7 @@ const App: React.FC = () => {
   const columnPanRef = useRef<{ x: number; y: number; sl: number; st: number } | null>(null);
   const cellImportTargetRef = useRef<{ columnId: string; rowId: string } | null>(null);
   const [eraserTargetId, setEraserTargetId] = useState<string | null>(null);
+  const [ghostCompareTargetId, setGhostCompareTargetId] = useState<string | null>(null);
   const [replaceTargetId, setReplaceTargetId] = useState<string | null>(null);
   const [copyRectTargetId, setCopyRectTargetId] = useState<string | null>(null);
   const [pixelEditorTargetId, setPixelEditorTargetId] = useState<string | null>(null);
@@ -7167,7 +7557,7 @@ const App: React.FC = () => {
   const [quadrantPicking, setQuadrantPicking] = useState(false);
   const [emptyCellMenu, setEmptyCellMenu] = useState<{ x: number; y: number; columnId: string; rowId: string } | null>(null);
   const anyModalOpen = !!(
-    eraserTargetId || replaceTargetId || copyRectTargetId || pixelEditorTargetId || transformTargetId ||
+    eraserTargetId || ghostCompareTargetId || replaceTargetId || copyRectTargetId || pixelEditorTargetId || transformTargetId ||
     taggingTargetId || effectMaskTargetId || paintTargetId || bucketTargetId ||
     stretchTargetId || compositeTarget || showAnimationModal || (quadrantPreviewIds.length > 0 && !quadrantPicking)
   );
@@ -7648,6 +8038,7 @@ const App: React.FC = () => {
           commitSprites(next);
         }}
         onOpenEraser={(id) => setEraserTargetId(id)}
+        onOpenGhostCompare={(id) => setGhostCompareTargetId(id)}
         onOpenReplace={(id) => setReplaceTargetId(id)}
         onOpenCopyRect={(id) => setCopyRectTargetId(id)}
         onOpenPixelEditor={(id) => setPixelEditorTargetId(id)}
@@ -7748,6 +8139,7 @@ const App: React.FC = () => {
 
   const closeSpriteEditors = () => {
     setEraserTargetId(null);
+    setGhostCompareTargetId(null);
     setReplaceTargetId(null);
     setCopyRectTargetId(null);
     setPixelEditorTargetId(null);
@@ -8544,10 +8936,42 @@ const App: React.FC = () => {
     });
   };
 
-  const removeBackgroundBulk = async () => {
+  /** Quita todo píxel negro (umbral), aunque esté cerrado por otros colores. */
+  const removeBlackBackgroundPrecise = async (img: HTMLImageElement, threshold: number): Promise<HTMLImageElement> => {
+    return new Promise((resolve) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+      ctx.drawImage(img, 0, 0);
+      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const data = imgData.data;
+      for (let i = 0; i < data.length; i += 4) {
+        if (
+          data[i + 3] > 0 &&
+          data[i] <= threshold &&
+          data[i + 1] <= threshold &&
+          data[i + 2] <= threshold
+        ) {
+          data[i + 3] = 0;
+        }
+      }
+      ctx.putImageData(imgData, 0, 0);
+      const newImg = new Image();
+      newImg.onload = () => resolve(newImg);
+      newImg.src = canvas.toDataURL('image/png');
+    });
+  };
+
+  const removeBackgroundBulk = async (mode: 'smart' | 'precise' = 'smart') => {
     if (selection.length === 0) return;
 
-    const tolStr = prompt('Tolerancia de color negro (0 a 100, donde 0 es solo negro absoluto):', '5');
+    const tolStr = prompt(
+      mode === 'precise'
+        ? 'Negro preciso: borra TODO píxel negro (aunque esté cerrado). Tolerancia 0–100 (0 = solo negro absoluto):'
+        : 'Fondo inteligente: solo negro conectado al borde. Tolerancia 0–100 (0 = solo negro absoluto):',
+      '5'
+    );
     if (tolStr === null) return;
     const tol = parseInt(tolStr, 10);
     if (isNaN(tol) || tol < 0 || tol > 255) {
@@ -8562,7 +8986,10 @@ const App: React.FC = () => {
       let changed = false;
       for (let i = 0; i < next.length; i++) {
         if (selection.includes(next[i].id)) {
-          const newImg = await removeBlackBackground(next[i].originalImg || next[i].img, tol);
+          const src = next[i].originalImg || next[i].img;
+          const newImg = mode === 'precise'
+            ? await removeBlackBackgroundPrecise(src, tol)
+            : await removeBlackBackground(src, tol);
           next[i] = { ...next[i], img: newImg, originalImg: newImg };
           changed = true;
         }
@@ -9246,9 +9673,20 @@ const App: React.FC = () => {
       {/* TOP BAR */}
       <header className="top-bar">
         <div className="logo-group">
-          <h1 style={{ display: 'flex', alignItems: 'center' }}>
-            JOA Engine <span style={{ color: 'var(--text-muted)', fontSize: '0.7rem', marginLeft: '4px' }}>SYNC v6</span>
-            <label style={{ marginLeft: '16px', fontSize: '0.7rem', display: 'inline-flex', alignItems: 'center', cursor: 'pointer', fontWeight: 'normal', color: 'var(--text-muted)', userSelect: 'none' }}>
+          <h1 style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', rowGap: '6px' }}>
+            <span style={{
+              fontSize: '1.1rem',
+              fontWeight: 800,
+              background: 'linear-gradient(135deg, #fff, #888)',
+              WebkitBackgroundClip: 'text',
+              backgroundClip: 'text',
+              WebkitTextFillColor: 'transparent',
+              marginRight: '4px',
+            }}>
+              JOA Engine
+            </span>
+            <span style={{ color: 'var(--text-muted)', fontSize: '0.7rem', marginRight: '8px', fontWeight: 600 }}>SYNC v6</span>
+            <label style={{ marginLeft: '8px', fontSize: '0.7rem', display: 'inline-flex', alignItems: 'center', cursor: 'pointer', fontWeight: 'normal', color: 'var(--text-muted)', userSelect: 'none' }}>
               <input type="checkbox" checked={showGridlines} onChange={(e) => setShowGridlines(e.target.checked)} style={{ marginRight: '6px', cursor: 'pointer' }} />
               Guías
             </label>
@@ -9256,7 +9694,7 @@ const App: React.FC = () => {
               <input type="checkbox" checked={isWhiteBg} onChange={(e) => setIsWhiteBg(e.target.checked)} style={{ marginRight: '6px', cursor: 'pointer' }} />
               Fondo Blanco
             </label>
-            <span style={{ marginLeft: '16px', height: '20px', width: '1px', background: 'var(--border)', display: 'inline-block' }} />
+            <span style={{ marginLeft: '12px', height: '20px', width: '1px', background: 'var(--border)', display: 'inline-block', flexShrink: 0 }} />
             <label style={{ marginLeft: '12px', fontSize: '0.7rem', display: 'inline-flex', alignItems: 'center', gap: '8px', fontWeight: 'normal', color: 'var(--text-muted)', userSelect: 'none' }}>
               Visualización
               <input
@@ -9266,7 +9704,7 @@ const App: React.FC = () => {
                 step={0.05}
                 value={gridZoom}
                 onChange={(e) => setGridZoom(parseFloat(e.target.value))}
-                style={{ width: '110px', cursor: 'pointer' }}
+                style={{ width: '90px', cursor: 'pointer' }}
                 title={columnView
                   ? `${gridZoom.toFixed(2)}x — Shift + rueda sobre el tablero para zoom al cursor. Arrastrá el fondo para moverte.`
                   : `${gridZoom.toFixed(1)}x — Shift + rueda para zoom`}
@@ -9362,7 +9800,7 @@ const App: React.FC = () => {
            <button className="btn btn-outline" onClick={() => setShowAnimationModal(true)}>
              <Film size={16} /> Probar Animación
            </button>
-           <div style={{ height: '24px', width: '1px', background: 'var(--border)', margin: '0 8px' }} />
+           <div style={{ height: '24px', width: '1px', background: 'var(--border)', margin: '0 2px', flexShrink: 0 }} />
            <button className="btn btn-outline" onClick={() => setSelection(sprites.map((s: SpriteData) => s.id))}>
              <CheckSquare size={16} /> Todos
            </button>
@@ -9373,7 +9811,7 @@ const App: React.FC = () => {
            }}>
              <Trash2 size={16} /> Eliminar
            </button>
-           <div style={{ height: '24px', width: '1px', background: 'var(--border)', margin: '0 8px' }} />
+           <div style={{ height: '24px', width: '1px', background: 'var(--border)', margin: '0 2px', flexShrink: 0 }} />
            <button className="btn btn-outline" onClick={openProjectPicker} disabled={isSaving} title="Abre un .joa o .zip con columnas e imágenes">
              <FolderOpen size={16} /> Abrir proyecto
            </button>
@@ -9398,7 +9836,7 @@ const App: React.FC = () => {
            }} />
            <input type="file" id="slice-up" hidden accept="image/*" onChange={(e) => { if (e.target.files && e.target.files[0]) handleSliceFile(e.target.files[0]); e.target.value = ''; }} />
            <input type="file" id="project-up" hidden accept=".joa,.zip,application/zip" onChange={(e) => { if (e.target.files && e.target.files[0]) openProjectFile(e.target.files[0]); e.target.value = ''; }} />
-           <div style={{ height: '24px', width: '1px', background: 'var(--border)', margin: '0 8px' }} />
+           <div style={{ height: '24px', width: '1px', background: 'var(--border)', margin: '0 2px', flexShrink: 0 }} />
            <button className="btn btn-outline" onClick={() => setBatchExportFormat('png')} disabled={sprites.length === 0 || isSaving}>
              <Archive size={16} /> Exportar PNG
            </button>
@@ -9895,9 +10333,26 @@ const App: React.FC = () => {
             <button className="btn btn-outline" style={{ marginTop: '8px', width: '100%' }} onClick={autoMaximizeInternal} disabled={selection.length === 0}>
                <Maximize size={16} /> Auto-Maximizar a los Márgenes
             </button>
-            <button className="btn btn-outline" style={{ marginTop: '8px', width: '100%' }} onClick={removeBackgroundBulk} disabled={selection.length === 0}>
-               <Eraser size={16} /> Quitar Fondo Negro Inteligente
-            </button>
+            <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
+              <button
+                className="btn btn-outline"
+                style={{ flex: 1, minWidth: 0, fontSize: '0.7rem', padding: '8px 6px', whiteSpace: 'normal', lineHeight: 1.25 }}
+                onClick={() => removeBackgroundBulk('smart')}
+                disabled={selection.length === 0}
+                title="Solo negro conectado al borde del canvas (no toca huecos cerrados)"
+              >
+                <Eraser size={14} /> Fondo Negro Inteligente
+              </button>
+              <button
+                className="btn btn-outline"
+                style={{ flex: 1, minWidth: 0, fontSize: '0.7rem', padding: '8px 6px', whiteSpace: 'normal', lineHeight: 1.25 }}
+                onClick={() => removeBackgroundBulk('precise')}
+                disabled={selection.length === 0}
+                title="Borra todo píxel negro bajo la tolerancia, aunque esté rodeado de otros colores"
+              >
+                <Eraser size={14} /> Negro Preciso
+              </button>
+            </div>
             <button className="btn btn-outline" style={{ marginTop: '8px', width: '100%' }} onClick={flipHorizontalBulk} disabled={selection.length === 0}>
                <FlipHorizontal size={16} /> Voltear Horizontalmente
             </button>
@@ -10465,6 +10920,17 @@ const App: React.FC = () => {
             commitSprites(next);
             setEraserTargetId(null);
           }}
+        />
+      )}
+      {ghostCompareTargetId && (
+        <GhostCompareModal
+          sprite={sprites.find(s => s.id === ghostCompareTargetId)!}
+          sprites={sprites}
+          onChangeSprite={(next) => {
+            commitSprites(sprites.map((s) => (s.id === next.id ? next : s)));
+          }}
+          onClose={() => setGhostCompareTargetId(null)}
+          isWhiteBg={isWhiteBg}
         />
       )}
       {replaceTargetId && (

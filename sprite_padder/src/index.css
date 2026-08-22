@@ -40,29 +40,62 @@ body {
 
 /* Header */
 .top-bar {
-  height: 64px;
+  min-height: 64px;
+  height: auto;
   background: var(--bg-panel);
   border-bottom: 1px solid var(--border);
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  padding: 0 24px;
+  gap: 8px 12px;
+  padding: 8px 16px;
   z-index: 100;
 }
 
+.logo-group {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  flex: 1 1 260px;
+}
+
 .logo-group h1 {
-  font-size: 1.1rem;
-  font-weight: 800;
-  background: linear-gradient(135deg, #fff, #888);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
+  font-size: inherit;
+  font-weight: inherit;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  row-gap: 6px;
+  column-gap: 0;
+  min-width: 0;
+  color: inherit;
+  background: none;
+  -webkit-text-fill-color: initial;
 }
 
 .top-actions {
   display: flex;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 6px;
   align-items: center;
+  justify-content: flex-end;
+  min-width: 0;
+  flex: 1 1 320px;
+}
+
+.top-bar .btn {
+  padding: 6px 10px;
+  font-size: 0.72rem;
+  gap: 6px;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.top-bar .btn svg {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
 }
 
 /* Main Area */
