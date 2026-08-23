@@ -735,6 +735,8 @@ interface SpriteData {
   rowId?: string;
   /** Dato numérico de interfaz (overlay). No se pinta ni se exporta con el sprite. */
   compareValue?: string;
+  /** En grilla default con Separar: true = debajo de la barra horizontal. */
+  belowSplit?: boolean;
 }
 
 const getSpriteFilter = (sprite: SpriteData, isExport = false) => {
@@ -948,6 +950,12 @@ const applyWhiteFilters = (img: HTMLImageElement | HTMLCanvasElement, shiftDeg: 
 };
 
 const pixelLuminance = (r: number, g: number, b: number) => 0.299 * r + 0.587 * g + 0.114 * b;
+
+const pixelSaturation = (r: number, g: number, b: number) => {
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  return max <= 0 ? 0 : (max - min) / max;
+};
 
 const applyHandDrawnEffect = (img: HTMLImageElement | HTMLCanvasElement, amount: number): HTMLCanvasElement | HTMLImageElement => {
   if (amount <= 0) return img;
@@ -1551,6 +1559,7 @@ const DEFAULT_SPRITE_ROW_ID = 'row-default';
 const SPRITE_COLUMNS_KEY = 'joa-sprite-columns';
 const SPRITE_ROWS_KEY = 'joa-sprite-rows';
 const COLUMN_VIEW_KEY = 'joa-column-view';
+const GRID_SPLIT_KEY = 'joa-grid-split';
 const QUADRANT_VIEW_KEY = 'joa-quadrant-view';
 const COLLAPSED_COLUMNS_KEY = 'joa-collapsed-columns';
 const COLLAPSED_ROWS_KEY = 'joa-collapsed-rows';
@@ -1594,6 +1603,261 @@ const normalizeSpriteRows = (saved: unknown): SpriteRow[] => {
 
 const loadSpriteColumns = (): SpriteColumn[] => normalizeSpriteColumns(loadPref<SpriteColumn[]>(SPRITE_COLUMNS_KEY, []));
 const loadSpriteRows = (): SpriteRow[] => normalizeSpriteRows(loadPref<SpriteRow[]>(SPRITE_ROWS_KEY, []));
+
+/** Orden fila × columna del tablero (Sin fila → filas; Sin grupo → columnas). */
+const buildSpritesInBoardOrder = (
+  sprites: SpriteData[],
+  rows: SpriteRow[],
+  columns: SpriteColumn[],
+): SpriteData[] => {
+  const colIds = new Set(columns.map((c) => c.id));
+  const rowIds = new Set(rows.map((r) => r.id));
+  const resolveColumnId = (s: SpriteData) => {
+    const id = s.columnId;
+    if (id && id !== DEFAULT_SPRITE_COLUMN_ID && colIds.has(id)) return id;
+    return DEFAULT_SPRITE_COLUMN_ID;
+  };
+  const resolveRowId = (s: SpriteData) => {
+    const id = s.rowId;
+    if (id && id !== DEFAULT_SPRITE_ROW_ID && rowIds.has(id)) return id;
+    return DEFAULT_SPRITE_ROW_ID;
+  };
+  const boardColumns: SpriteColumn[] = [
+    { id: DEFAULT_SPRITE_COLUMN_ID, name: 'Sin grupo' },
+    ...columns,
+  ];
+  const ordered: SpriteData[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    for (const col of boardColumns) {
+      for (const s of sprites) {
+        if (resolveColumnId(s) === col.id && resolveRowId(s) === row.id) {
+          ordered.push(s);
+          seen.add(s.id);
+        }
+      }
+    }
+  }
+  for (const s of sprites) {
+    if (!seen.has(s.id)) ordered.push(s);
+  }
+  return ordered;
+};
+
+const spritesOrderMatches = (a: SpriteData[], b: SpriteData[]) =>
+  a.length === b.length && a.every((s, i) => s.id === b[i]?.id);
+
+type TextComponentStats = {
+  area: number;
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+  sumR: number;
+  sumG: number;
+  sumB: number;
+  edgeTouch: boolean;
+  highContrast: number;
+};
+
+const localContrastAt = (data: Uint8ClampedArray, w: number, h: number, x: number, y: number) => {
+  const idx = (y * w + x) * 4;
+  if (data[idx + 3] === 0) return 0;
+  const center = pixelLuminance(data[idx], data[idx + 1], data[idx + 2]);
+  let maxDiff = 0;
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      if (dx === 0 && dy === 0) continue;
+      const nx = x + dx;
+      const ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+      const ni = (ny * w + nx) * 4;
+      if (data[ni + 3] === 0) continue;
+      maxDiff = Math.max(maxDiff, Math.abs(center - pixelLuminance(data[ni], data[ni + 1], data[ni + 2])));
+    }
+  }
+  return maxDiff;
+};
+
+const labelOpaqueComponents = (data: Uint8ClampedArray, w: number, h: number) => {
+  const labels = new Int32Array(w * h);
+  const comps = new Map<number, TextComponentStats>();
+  let nextLabel = 1;
+  const stack: number[] = [];
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const p = y * w + x;
+      const idx = p * 4;
+      if (data[idx + 3] === 0 || labels[p] !== 0) continue;
+
+      const label = nextLabel++;
+      labels[p] = label;
+      stack.push(p);
+      const stats: TextComponentStats = {
+        area: 0,
+        minX: x,
+        minY: y,
+        maxX: x,
+        maxY: y,
+        sumR: 0,
+        sumG: 0,
+        sumB: 0,
+        edgeTouch: x === 0 || y === 0 || x === w - 1 || y === h - 1,
+        highContrast: 0,
+      };
+
+      while (stack.length > 0) {
+        const cur = stack.pop()!;
+        const cx = cur % w;
+        const cy = Math.floor(cur / w);
+        const cidx = cur * 4;
+        stats.area += 1;
+        stats.minX = Math.min(stats.minX, cx);
+        stats.minY = Math.min(stats.minY, cy);
+        stats.maxX = Math.max(stats.maxX, cx);
+        stats.maxY = Math.max(stats.maxY, cy);
+        stats.sumR += data[cidx];
+        stats.sumG += data[cidx + 1];
+        stats.sumB += data[cidx + 2];
+        if (localContrastAt(data, w, h, cx, cy) >= 42) stats.highContrast += 1;
+        if (cx === 0 || cy === 0 || cx === w - 1 || cy === h - 1) stats.edgeTouch = true;
+
+        if (cx > 0) {
+          const n = cur - 1;
+          if (data[n * 4 + 3] > 0 && labels[n] === 0) {
+            labels[n] = label;
+            stack.push(n);
+          }
+        }
+        if (cx < w - 1) {
+          const n = cur + 1;
+          if (data[n * 4 + 3] > 0 && labels[n] === 0) {
+            labels[n] = label;
+            stack.push(n);
+          }
+        }
+        if (cy > 0) {
+          const n = cur - w;
+          if (data[n * 4 + 3] > 0 && labels[n] === 0) {
+            labels[n] = label;
+            stack.push(n);
+          }
+        }
+        if (cy < h - 1) {
+          const n = cur + w;
+          if (data[n * 4 + 3] > 0 && labels[n] === 0) {
+            labels[n] = label;
+            stack.push(n);
+          }
+        }
+      }
+
+      comps.set(label, stats);
+    }
+  }
+
+  return { labels, comps };
+};
+
+const isLikelyTextComponent = (
+  comp: TextComponentStats,
+  w: number,
+  h: number,
+  imageArea: number,
+  mainArea: number,
+  toneThreshold: number,
+) => {
+  const area = comp.area;
+  if (area < 6) return true;
+  if (area >= mainArea * 0.92) return false;
+  if (area > imageArea * 0.42) return false;
+
+  const bboxW = comp.maxX - comp.minX + 1;
+  const bboxH = comp.maxY - comp.minY + 1;
+  const aspect = bboxW / Math.max(1, bboxH);
+  const avgR = comp.sumR / area;
+  const avgG = comp.sumG / area;
+  const avgB = comp.sumB / area;
+  const lum = pixelLuminance(avgR, avgG, avgB);
+  const sat = pixelSaturation(avgR, avgG, avgB);
+  const grayish = sat < 0.42;
+  const extremeTone = lum <= toneThreshold || lum >= 255 - toneThreshold;
+  const contrastRatio = comp.highContrast / area;
+
+  const inTop = comp.maxY < h * 0.24;
+  const inBottom = comp.minY > h * 0.76;
+  const inSide = comp.maxX < w * 0.16 || comp.minX > w * 0.84;
+  const inMargin = inTop || inBottom || inSide;
+
+  if (grayish && extremeTone && inMargin && area < imageArea * 0.28) return true;
+  if (grayish && extremeTone && aspect >= 2 && bboxH <= h * 0.16 && area < imageArea * 0.22) return true;
+  if (comp.edgeTouch && grayish && extremeTone && area < imageArea * 0.18) return true;
+  if (inMargin && contrastRatio > 0.28 && area < imageArea * 0.14 && bboxH <= h * 0.2) return true;
+  return false;
+};
+
+/** Detecta manchas de texto (watermarks, etiquetas) y las vuelve transparentes. */
+const removeTextSmart = async (img: HTMLImageElement, tolerance: number): Promise<HTMLImageElement> => {
+  const toneThreshold = Math.min(96, Math.max(4, Math.round(tolerance * 2.55)));
+  return new Promise((resolve) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    ctx.drawImage(img, 0, 0);
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const data = imgData.data;
+    const w = canvas.width;
+    const h = canvas.height;
+    const imageArea = w * h;
+
+    const { labels, comps } = labelOpaqueComponents(data, w, h);
+    let mainLabel = 0;
+    let mainArea = 0;
+    for (const [label, comp] of comps) {
+      if (comp.area > mainArea) {
+        mainArea = comp.area;
+        mainLabel = label;
+      }
+    }
+
+    const removeLabels = new Set<number>();
+    for (const [label, comp] of comps) {
+      if (label === mainLabel) continue;
+      if (isLikelyTextComponent(comp, w, h, imageArea, mainArea, toneThreshold)) {
+        removeLabels.add(label);
+      }
+    }
+
+    for (let p = 0; p < w * h; p++) {
+      const label = labels[p];
+      if (label > 0 && removeLabels.has(label)) {
+        data[p * 4 + 3] = 0;
+      }
+    }
+
+    const marginBandY = (y: number) => y < h * 0.2 || y > h * 0.8;
+    for (let y = 0; y < h; y++) {
+      if (!marginBandY(y)) continue;
+      for (let x = 0; x < w; x++) {
+        const idx = (y * w + x) * 4;
+        if (data[idx + 3] === 0) continue;
+        const lum = pixelLuminance(data[idx], data[idx + 1], data[idx + 2]);
+        const sat = pixelSaturation(data[idx], data[idx + 1], data[idx + 2]);
+        if (sat >= 0.42) continue;
+        if (lum > 255 - toneThreshold || lum < toneThreshold) {
+          if (localContrastAt(data, w, h, x, y) >= 36) data[idx + 3] = 0;
+        }
+      }
+    }
+
+    ctx.putImageData(imgData, 0, 0);
+    const newImg = new Image();
+    newImg.onload = () => resolve(newImg);
+    newImg.src = canvas.toDataURL('image/png');
+  });
+};
 
 const normalizeIdList = (saved: unknown): string[] => {
   if (!Array.isArray(saved)) return [];
@@ -1680,18 +1944,87 @@ const normalizeImportedImage = async (img: HTMLImageElement): Promise<HTMLImageE
 
 const loadImageFromBlob = (blob: Blob): Promise<HTMLImageElement> =>
   new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(blob);
-    const image = new Image();
-    image.onload = () => {
-      URL.revokeObjectURL(url);
-      resolve(image);
+    // Data URL (no blob:) para que img.src siga siendo usable en miniaturas <img>
+    // tras cerrar el Blob — createObjectURL + revoke deja el bitmap OK pero src muerto.
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('No se pudo leer una imagen del proyecto.'));
+    reader.onload = () => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error('No se pudo leer una imagen del proyecto.'));
+      image.src = String(reader.result || '');
     };
-    image.onerror = () => {
-      URL.revokeObjectURL(url);
-      reject(new Error('No se pudo leer una imagen del proyecto.'));
-    };
-    image.src = url;
+    reader.readAsDataURL(blob);
   });
+
+/** Miniatura desde el bitmap en memoria (no depende de img.src; sirve si el blob URL ya se revocó). */
+const imageToPreviewDataUrl = (img: HTMLImageElement, maxEdge = 180): string => {
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+  if (w < 1 || h < 1) return '';
+  const scale = Math.min(1, maxEdge / Math.max(w, h));
+  const dw = Math.max(1, Math.round(w * scale));
+  const dh = Math.max(1, Math.round(h * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = dw;
+  canvas.height = dh;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return img.src && !img.src.startsWith('blob:') ? img.src : '';
+  ctx.imageSmoothingEnabled = false;
+  try {
+    ctx.drawImage(img, 0, 0, dw, dh);
+    return canvas.toDataURL('image/png');
+  } catch {
+    return img.src && !img.src.startsWith('blob:') ? img.src : '';
+  }
+};
+
+const SpriteThumb: React.FC<{
+  img: HTMLImageElement;
+  maxWidth?: number;
+  maxHeight?: number;
+  alt?: string;
+  style?: React.CSSProperties;
+}> = ({ img, maxWidth = 140, maxHeight = 88, alt = '', style }) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useLayoutEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !img) return;
+    const w = img.naturalWidth || img.width;
+    const h = img.naturalHeight || img.height;
+    if (w < 1 || h < 1) return;
+    const scale = Math.min(maxWidth / w, maxHeight / h, 1);
+    const dw = Math.max(1, Math.round(w * scale));
+    const dh = Math.max(1, Math.round(h * scale));
+    if (canvas.width !== dw) canvas.width = dw;
+    if (canvas.height !== dh) canvas.height = dh;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, dw, dh);
+    try {
+      ctx.drawImage(img, 0, 0, dw, dh);
+    } catch {
+      /* ignore */
+    }
+  }, [img, maxWidth, maxHeight]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      role="img"
+      aria-label={alt}
+      style={{
+        maxWidth: '100%',
+        maxHeight: '100%',
+        objectFit: 'contain',
+        imageRendering: 'pixelated',
+        ...style,
+      }}
+    />
+  );
+};
 
 type JoaProjectSpriteMeta = Omit<SpriteData, 'img' | 'originalImg'> & {
   image: string;
@@ -3324,9 +3657,10 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
     return remembered?.id ?? null;
   });
   const source = others.find((s) => s.id === sourceId) || null;
-  const prefs = loadPref<{ zoom?: number; opacity?: number; editSource?: boolean }>(GHOST_COMPARE_PREFS_KEY, {});
+  const prefs = loadPref<{ zoom?: number; opacity?: number; targetOpacity?: number; editSource?: boolean }>(GHOST_COMPARE_PREFS_KEY, {});
   const [zoom, setZoom] = useState(() => clampNum(prefs.zoom, 0.5, 8, 1));
-  const [opacity, setOpacity] = useState(() => Math.round(clampNum(prefs.opacity, 5, 95, 40)));
+  const [opacity, setOpacity] = useState(() => Math.round(clampNum(prefs.opacity, 5, 100, 40)));
+  const [targetOpacity, setTargetOpacity] = useState(() => Math.round(clampNum(prefs.targetOpacity, 5, 100, 100)));
   const [editSource, setEditSource] = useState(() => prefs.editSource === true);
   const [nudgeStep, setNudgeStep] = useState(() => Math.round(clampNum(loadPref('joa-content-nudge-step', 1), 1, 512, 1)));
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -3338,8 +3672,8 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
   }, [source]);
 
   useEffect(() => {
-    savePref(GHOST_COMPARE_PREFS_KEY, { zoom, opacity, editSource });
-  }, [zoom, opacity, editSource]);
+    savePref(GHOST_COMPARE_PREFS_KEY, { zoom, opacity, targetOpacity, editSource });
+  }, [zoom, opacity, targetOpacity, editSource]);
 
   useEffect(() => {
     savePref('joa-content-nudge-step', nudgeStep);
@@ -3359,9 +3693,9 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
     ctx.imageSmoothingEnabled = false;
     ctx.globalAlpha = opacity / 100;
     ctx.drawImage(bg, 0, 0);
-    ctx.globalAlpha = 1;
+    ctx.globalAlpha = targetOpacity / 100;
     ctx.drawImage(fg, 0, 0);
-  }, [sprite, source, opacity]);
+  }, [sprite, source, opacity, targetOpacity]);
 
   const spriteRef = useRef(sprite);
   spriteRef.current = sprite;
@@ -3406,7 +3740,7 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
         </div>
         <div style={{ padding: '16px 20px', overflow: 'auto' }}>
           <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '14px', lineHeight: 1.45 }}>
-            Elegí el sprite fuente. Se dibuja <strong>atrás</strong>, semitransparente, y <strong>{sprite.name}</strong> queda encima opaco (misma esquina superior izquierda del envase Full).
+            Elegí el sprite fuente. Se superponen ambos sprites (misma esquina superior izquierda del envase Full); podés ajustar la opacidad de cada capa en el comparador.
           </p>
           {others.length === 0 ? (
             <div className="empty-msg">Cargá al menos otro sprite para compararlo.</div>
@@ -3429,7 +3763,7 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
                   }}
                 >
                   <div className="checker-mini" style={{ width: '100%', height: '88px', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '4px', overflow: 'hidden' }}>
-                    <img src={s.img.src} alt="" style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', imageRendering: 'pixelated' }} />
+                    <SpriteThumb img={s.img} maxWidth={140} maxHeight={88} alt={s.name} />
                   </div>
                   <span style={{ fontSize: '0.7rem', wordBreak: 'break-all' }}>{s.name}</span>
                   <span style={{ fontSize: '0.6rem', color: 'var(--text-muted)' }}>{s.img.width}×{s.img.height}</span>
@@ -3538,7 +3872,11 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
           </div>
           <div className="slider-item" style={{ flex: '1 1 140px', marginBottom: 0, minWidth: '120px' }}>
             <div className="slider-label"><span>Opacidad fuente</span><span>{opacity}%</span></div>
-            <input type="range" min="5" max="95" step="1" value={opacity} onChange={(e) => setOpacity(parseInt(e.target.value, 10))} />
+            <input type="range" min="5" max="100" step="1" value={opacity} onChange={(e) => setOpacity(parseInt(e.target.value, 10))} />
+          </div>
+          <div className="slider-item" style={{ flex: '1 1 140px', marginBottom: 0, minWidth: '120px' }}>
+            <div className="slider-label"><span>Opacidad destino</span><span>{targetOpacity}%</span></div>
+            <input type="range" min="5" max="100" step="1" value={targetOpacity} onChange={(e) => setTargetOpacity(parseInt(e.target.value, 10))} />
           </div>
           <div className="slider-item" style={{ flex: '1 1 160px', marginBottom: 0, minWidth: '140px' }}>
             <div className="slider-label"><span>Escala interna</span><span>{internalScale.toFixed(2)}x</span></div>
@@ -4080,7 +4418,7 @@ const ReplaceBrushModal: React.FC<ReplaceBrushModalProps> = ({ sprite, sprites, 
                   }}
                 >
                   <div className="checker-mini" style={{ width: '100%', height: '88px', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '4px', overflow: 'hidden' }}>
-                    <img src={s.img.src} alt="" style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', imageRendering: 'pixelated' }} />
+                    <SpriteThumb img={s.img} maxWidth={140} maxHeight={88} alt={s.name} />
                   </div>
                   <span style={{ fontSize: '0.7rem', wordBreak: 'break-all' }}>{s.name}</span>
                   <span style={{ fontSize: '0.6rem', color: 'var(--text-muted)' }}>{s.img.width}×{s.img.height}</span>
@@ -4716,7 +5054,7 @@ const CopyRectModal: React.FC<CopyRectModalProps> = ({ sprite, sprites, onSave, 
                   }}
                 >
                   <div className="checker-mini" style={{ width: '100%', height: '88px', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '4px', overflow: 'hidden' }}>
-                    <img src={s.img.src} alt="" style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', imageRendering: 'pixelated' }} />
+                    <SpriteThumb img={s.img} maxWidth={140} maxHeight={88} alt={s.name} />
                   </div>
                   <span style={{ fontSize: '0.7rem', wordBreak: 'break-all' }}>{s.name}</span>
                   <span style={{ fontSize: '0.6rem', color: 'var(--text-muted)' }}>{s.img.width}×{s.img.height}</span>
@@ -7465,7 +7803,7 @@ const AnimationModal: React.FC<AnimationModalProps> = ({ onClose }) => {
                 {frames.map((f, i) => (
                   <div key={f.id} className="region-item" style={{ background: currentFrameIdx === i ? 'rgba(107, 102, 255, 0.15)' : undefined, border: currentFrameIdx === i ? '1px solid var(--accent)' : '1px solid var(--border)' }}>
                     <div style={{ width: '40px', height: '40px', background: 'rgba(0,0,0,0.3)', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '4px', overflow: 'hidden' }} className="checker-mini">
-                      <img src={f.img.src} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', imageRendering: 'pixelated' }} />
+                      <SpriteThumb img={f.img} maxWidth={40} maxHeight={40} alt={f.fileName} />
                     </div>
                     <div className="region-info" style={{ flex: 1 }}>
                       <span className="region-label" style={{ fontSize: '0.7rem', wordBreak: 'break-all' }}>{i+1}. {f.fileName}</span>
@@ -7521,6 +7859,7 @@ const App: React.FC = () => {
   const [gridZoom, setGridZoom] = useState(() => clampNum(loadPref('joa-grid-zoom', 1), 0.4, 3, 1));
   const [columnView, setColumnView] = useState(() => loadPref<boolean>(COLUMN_VIEW_KEY, false) === true);
   const [quadrantView, setQuadrantView] = useState(() => loadPref<boolean>(QUADRANT_VIEW_KEY, false) === true);
+  const [gridSplitActive, setGridSplitActive] = useState(() => loadPref<boolean>(GRID_SPLIT_KEY, false) === true);
   const [spriteColumns, setSpriteColumns] = useState<SpriteColumn[]>(() => loadSpriteColumns());
   const [spriteRows, setSpriteRows] = useState<SpriteRow[]>(() => loadSpriteRows());
   const [collapsedColumnIds, setCollapsedColumnIds] = useState<string[]>(() => normalizeIdList(loadPref(COLLAPSED_COLUMNS_KEY, [])));
@@ -7637,6 +7976,100 @@ const App: React.FC = () => {
     return () => window.removeEventListener('keydown', handleKey);
   }, [historyIndex, history, paintTargetId, bucketTargetId, pixelEditorTargetId, eraserTargetId, replaceTargetId, copyRectTargetId]);
 
+  // SUPR / Ctrl+C / Ctrl+V en la pantalla general (no en modales ni inputs).
+  const spriteClipboardRef = useRef<SpriteData[]>([]);
+
+  const uniqueSpriteName = (desired: string, used: Set<string>) => {
+    if (!used.has(desired)) {
+      used.add(desired);
+      return desired;
+    }
+    const ext = desired.match(/\.[^.]+$/)?.[0] || '';
+    const base = ext ? desired.slice(0, -ext.length) : desired;
+    let n = 2;
+    let candidate = `${base}_${n}${ext}`;
+    while (used.has(candidate)) {
+      n += 1;
+      candidate = `${base}_${n}${ext}`;
+    }
+    used.add(candidate);
+    return candidate;
+  };
+
+  const snapshotSpritesForClipboard = (ids: string[]): SpriteData[] => {
+    const idSet = new Set(ids);
+    return sprites
+      .filter((s) => idSet.has(s.id))
+      .map((s) => ({
+        ...s,
+        padding: { ...s.padding },
+        anchor: s.anchor ? { ...s.anchor } : null,
+        regions: s.regions?.map((r) => ({ ...r })),
+        effectMasks: s.effectMasks?.map((m) => ({ ...m })),
+      }));
+  };
+
+  const duplicateClipboardSprites = (): SpriteData[] => {
+    const usedNames = new Set(sprites.map((s) => s.name));
+    return spriteClipboardRef.current.map((s) => {
+      const ext = s.name.match(/\.[^.]+$/)?.[0] || '';
+      const base = ext ? s.name.slice(0, -ext.length) : s.name;
+      const name = uniqueSpriteName(`${base}_copia${ext}`, usedNames);
+      return {
+        ...s,
+        id: generateId(),
+        name,
+        padding: { ...s.padding },
+        anchor: s.anchor ? { ...s.anchor } : null,
+        regions: s.regions?.map((r) => ({ ...r, id: generateId() })),
+        effectMasks: s.effectMasks?.map((m) => ({ ...m, id: generateId() })),
+      };
+    });
+  };
+
+  useEffect(() => {
+    const isTypingTarget = (el: EventTarget | null) => {
+      if (!(el instanceof HTMLElement)) return false;
+      const tag = el.tagName;
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+    };
+
+    const onKey = (e: KeyboardEvent) => {
+      if (anyModalOpen) return;
+      if (isTypingTarget(e.target)) return;
+
+      const ctrl = e.ctrlKey || e.metaKey;
+      const key = e.key.toLowerCase();
+
+      if (ctrl && key === 'c') {
+        if (selection.length === 0) return;
+        e.preventDefault();
+        spriteClipboardRef.current = snapshotSpritesForClipboard(selection);
+        return;
+      }
+
+      if (ctrl && key === 'v') {
+        if (spriteClipboardRef.current.length === 0) return;
+        e.preventDefault();
+        const copies = duplicateClipboardSprites();
+        if (copies.length === 0) return;
+        commitSprites([...sprites, ...copies]);
+        setSelection(copies.map((s) => s.id));
+        return;
+      }
+
+      if (e.key !== 'Delete') return;
+      if (selection.length === 0) return;
+      e.preventDefault();
+      const remove = new Set(selection);
+      commitSprites(sprites.filter((s) => !remove.has(s.id)));
+      if (referenceId && remove.has(referenceId)) setReferenceId(null);
+      setSelection([]);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [anyModalOpen, selection, sprites, referenceId, historyIndex, history]);
+
   useEffect(() => {
     try { localStorage.setItem('joa-controls-width', String(controlsWidth)); } catch { /* ignore */ }
   }, [controlsWidth]);
@@ -7652,6 +8085,10 @@ const App: React.FC = () => {
   useEffect(() => {
     savePref(COLUMN_VIEW_KEY, columnView);
   }, [columnView]);
+
+  useEffect(() => {
+    savePref(GRID_SPLIT_KEY, gridSplitActive);
+  }, [gridSplitActive]);
 
   useEffect(() => {
     savePref(QUADRANT_VIEW_KEY, quadrantView);
@@ -7765,10 +8202,99 @@ const App: React.FC = () => {
   const [highlightedYs, setHighlightedYs] = useState<number[]>([]);
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
   const [draggedSpriteId, setDraggedSpriteId] = useState<string | null>(null);
+  const [dragGhost, setDragGhost] = useState<{
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+    src: string;
+    name: string;
+  } | null>(null);
   const [draggedColumnId, setDraggedColumnId] = useState<string | null>(null);
   const [draggedRowId, setDraggedRowId] = useState<string | null>(null);
   const [rowDragOverId, setRowDragOverId] = useState<string | null>(null);
   const [cellDragOverKey, setCellDragOverKey] = useState<string | null>(null);
+  const [splitDragOverBand, setSplitDragOverBand] = useState<'upper' | 'lower' | null>(null);
+  // Pointer-drag (no HTML5): Chromium/Electron no entrega wheel durante DnD nativo.
+  const spriteDragSessionRef = useRef<{
+    id: string;
+    pointerId: number;
+    startX: number;
+    startY: number;
+    offsetX: number;
+    offsetY: number;
+    width: number;
+    height: number;
+    activated: boolean;
+  } | null>(null);
+  const suppressSpriteClickRef = useRef(false);
+  const dragPointerPosRef = useRef({ x: 0, y: 0 });
+  const spritesRef = useRef(sprites);
+  spritesRef.current = sprites;
+  const columnViewRef = useRef(columnView);
+  columnViewRef.current = columnView;
+  const gridSplitActiveRef = useRef(gridSplitActive);
+  gridSplitActiveRef.current = gridSplitActive;
+  const moveSpriteToCellRef = useRef<(spriteId: string, columnId: string, rowId: string, beforeId?: string | null) => void>(() => {});
+  const commitSpritesRef = useRef(commitSprites);
+  commitSpritesRef.current = commitSprites;
+  const compareCellKeyRef = useRef((columnId: string, rowId: string) => `${columnId}::${rowId}`);
+
+  // Scroll con rueda + auto-scroll en bordes mientras se arrastra un sprite.
+  useEffect(() => {
+    if (!draggedSpriteId) return;
+    const EDGE = 56;
+    const MAX_SPEED = 28;
+    let raf = 0;
+
+    const scrollFromWheel = (e: WheelEvent) => {
+      if (e.shiftKey || e.altKey) return;
+      const el = columnViewportRef.current;
+      if (!el) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const scale = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? el.clientHeight : 1;
+      el.scrollLeft += e.deltaX * scale;
+      el.scrollTop += e.deltaY * scale;
+    };
+
+    const edgeTick = () => {
+      const el = columnViewportRef.current;
+      if (!el) {
+        raf = 0;
+        return;
+      }
+      const { x, y } = dragPointerPosRef.current;
+      const rect = el.getBoundingClientRect();
+      let dx = 0;
+      let dy = 0;
+      if (y < rect.top + EDGE) dy = -MAX_SPEED * (1 - Math.max(0, y - rect.top) / EDGE);
+      else if (y > rect.bottom - EDGE) dy = MAX_SPEED * (1 - Math.max(0, rect.bottom - y) / EDGE);
+      if (x < rect.left + EDGE) dx = -MAX_SPEED * (1 - Math.max(0, x - rect.left) / EDGE);
+      else if (x > rect.right - EDGE) dx = MAX_SPEED * (1 - Math.max(0, rect.right - x) / EDGE);
+      if (dx || dy) {
+        el.scrollLeft += dx;
+        el.scrollTop += dy;
+        raf = requestAnimationFrame(edgeTick);
+      } else {
+        raf = 0;
+      }
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      dragPointerPosRef.current = { x: e.clientX, y: e.clientY };
+      if (!raf) raf = requestAnimationFrame(edgeTick);
+    };
+
+    window.addEventListener('wheel', scrollFromWheel, { passive: false, capture: true });
+    window.addEventListener('pointermove', onPointerMove, true);
+    raf = requestAnimationFrame(edgeTick);
+    return () => {
+      window.removeEventListener('wheel', scrollFromWheel, { capture: true });
+      window.removeEventListener('pointermove', onPointerMove, true);
+      cancelAnimationFrame(raf);
+    };
+  }, [draggedSpriteId]);
 
   const getSpriteColumnId = (s: SpriteData) => {
     const id = s.columnId;
@@ -7783,11 +8309,22 @@ const App: React.FC = () => {
   };
 
   const compareCellKey = (columnId: string, rowId: string) => `${columnId}::${rowId}`;
+  compareCellKeyRef.current = compareCellKey;
 
-  const visibleSpriteColumns: SpriteColumn[] = [
-    { id: DEFAULT_SPRITE_COLUMN_ID, name: 'Sin grupo' },
-    ...spriteColumns,
-  ];
+  const ungroupedColumn: SpriteColumn = { id: DEFAULT_SPRITE_COLUMN_ID, name: 'Sin grupo' };
+  /** Columnas con grupo (sin «Sin grupo»): la matriz no debe heredar el alto de la pila sin agrupar. */
+  const boardSpriteColumns: SpriteColumn[] = spriteColumns;
+  const visibleSpriteColumns: SpriteColumn[] = [ungroupedColumn, ...spriteColumns];
+
+  const syncSpritesToBoardOrder = () => {
+    const ordered = buildSpritesInBoardOrder(sprites, spriteRows, spriteColumns);
+    if (!spritesOrderMatches(ordered, sprites)) commitSprites(ordered);
+  };
+
+  const toggleColumnView = () => {
+    if (columnView) syncSpritesToBoardOrder();
+    setColumnView((v) => !v);
+  };
 
   const moveSpriteToCell = (spriteId: string, columnId: string, rowId: string, beforeId?: string | null) => {
     const item = sprites.find((s) => s.id === spriteId);
@@ -7811,6 +8348,7 @@ const App: React.FC = () => {
     }
     commitSprites([...without.slice(0, insertAt), moved, ...without.slice(insertAt)]);
   };
+  moveSpriteToCellRef.current = moveSpriteToCell;
 
   const addSpriteColumn = () => {
     const n = spriteColumns.length + 1;
@@ -7881,13 +8419,14 @@ const App: React.FC = () => {
   const isRowCollapsed = (id: string) => collapsedRowIds.includes(id);
   const toggleColumnCollapsed = (id: string) => setCollapsedColumnIds((ids) => toggleIdInList(ids, id));
   const toggleRowCollapsed = (id: string) => setCollapsedRowIds((ids) => toggleIdInList(ids, id));
-  const allColumnsCollapsed = visibleSpriteColumns.length > 0 && visibleSpriteColumns.every((c) => isColumnCollapsed(c.id));
+  const allColumnsCollapsed =
+    visibleSpriteColumns.length > 0 && visibleSpriteColumns.every((c) => isColumnCollapsed(c.id));
   const allRowsCollapsed = spriteRows.length > 0 && spriteRows.every((r) => isRowCollapsed(r.id));
 
   const isColumnPanTarget = (el: EventTarget | null) => {
     if (!(el instanceof HTMLElement)) return false;
     if (el.closest('.sprite-module')) return false;
-    if (el.closest('button, input, textarea, a, .sprite-column-header, .column-row-label, .column-board-corner, .row-label-resize-handle')) return false;
+    if (el.closest('button, input, textarea, a, .sprite-column-header, .column-row-label, .column-board-corner, .row-label-resize-handle, .ungrouped-rail')) return false;
     return true;
   };
 
@@ -7974,45 +8513,202 @@ const App: React.FC = () => {
     };
   })();
 
+  const resolveSpriteDropTarget = (clientX: number, clientY: number, draggedId: string) => {
+    const stack = document.elementsFromPoint(clientX, clientY);
+    for (const node of stack) {
+      if (!(node instanceof Element)) continue;
+      if (node.closest('.sprite-drag-ghost')) continue;
+      const card = node.closest('[data-sprite-card]') as HTMLElement | null;
+      if (card?.dataset.spriteId && card.dataset.spriteId !== draggedId) {
+        const band = card.dataset.splitBand;
+        return {
+          kind: 'sprite' as const,
+          spriteId: card.dataset.spriteId,
+          columnId: card.dataset.dropColumn || undefined,
+          rowId: card.dataset.dropRow || undefined,
+          splitBand: band === 'upper' || band === 'lower' ? band : undefined,
+        };
+      }
+      const cell = node.closest('[data-sprite-cell]') as HTMLElement | null;
+      if (cell?.dataset.columnId && cell?.dataset.rowId) {
+        return {
+          kind: 'cell' as const,
+          columnId: cell.dataset.columnId,
+          rowId: cell.dataset.rowId,
+        };
+      }
+      const zone = node.closest('[data-split-zone]') as HTMLElement | null;
+      const zoneBand = zone?.dataset.splitZone;
+      if (zoneBand === 'upper' || zoneBand === 'lower') {
+        return {
+          kind: 'split' as const,
+          splitBand: zoneBand,
+        };
+      }
+    }
+    return null;
+  };
+
+  const applySplitBand = (s: SpriteData, band: 'upper' | 'lower'): SpriteData => (
+    band === 'lower' ? { ...s, belowSplit: true } : { ...s, belowSplit: undefined }
+  );
+
+  const moveSpriteInDefaultGrid = (
+    draggedId: string,
+    opts: { beforeId?: string; splitBand?: 'upper' | 'lower' },
+  ) => {
+    const list = spritesRef.current;
+    const oldIndex = list.findIndex((sp) => sp.id === draggedId);
+    if (oldIndex < 0) return;
+    const next = [...list];
+    const [moved] = next.splice(oldIndex, 1);
+    let updated = moved;
+    if (opts.splitBand) {
+      updated = applySplitBand(moved, opts.splitBand);
+    } else if (opts.beforeId && gridSplitActiveRef.current) {
+      const target = list.find((sp) => sp.id === opts.beforeId);
+      if (target) updated = applySplitBand(moved, target.belowSplit ? 'lower' : 'upper');
+    }
+
+    if (opts.beforeId) {
+      const insertAt = next.findIndex((sp) => sp.id === opts.beforeId);
+      if (insertAt < 0) next.push(updated);
+      else next.splice(insertAt, 0, updated);
+    } else if (opts.splitBand === 'upper') {
+      let lastUpper = -1;
+      for (let i = 0; i < next.length; i++) {
+        if (!next[i].belowSplit) lastUpper = i;
+      }
+      if (lastUpper < 0) next.unshift(updated);
+      else next.splice(lastUpper + 1, 0, updated);
+    } else if (opts.splitBand === 'lower') {
+      next.push(updated);
+    } else {
+      next.splice(Math.min(oldIndex, next.length), 0, updated);
+    }
+    commitSpritesRef.current(next);
+  };
+
+  const endSpritePointerDrag = (clientX: number, clientY: number, activated: boolean, draggedId: string) => {
+    spriteDragSessionRef.current = null;
+    if (!activated) {
+      setDragGhost(null);
+      setSplitDragOverBand(null);
+      return;
+    }
+    suppressSpriteClickRef.current = true;
+    const target = resolveSpriteDropTarget(clientX, clientY, draggedId);
+    if (target) {
+      if (columnViewRef.current) {
+        if (target.kind === 'sprite' && target.columnId) {
+          moveSpriteToCellRef.current(
+            draggedId,
+            target.columnId,
+            target.rowId || DEFAULT_SPRITE_ROW_ID,
+            target.spriteId,
+          );
+        } else if (target.kind === 'cell') {
+          moveSpriteToCellRef.current(draggedId, target.columnId, target.rowId);
+        }
+      } else if (target.kind === 'sprite') {
+        moveSpriteInDefaultGrid(draggedId, {
+          beforeId: target.spriteId,
+          splitBand: gridSplitActiveRef.current ? target.splitBand : undefined,
+        });
+      } else if (target.kind === 'split' && gridSplitActiveRef.current) {
+        moveSpriteInDefaultGrid(draggedId, { splitBand: target.splitBand });
+      }
+    }
+    setDraggedSpriteId(null);
+    setDragGhost(null);
+    setColumnDragOverId(null);
+    setCellDragOverKey(null);
+    setSplitDragOverBand(null);
+    window.setTimeout(() => {
+      suppressSpriteClickRef.current = false;
+    }, 0);
+  };
+
   const renderSpriteCard = (s: SpriteData, dropColumnId?: string, dropRowId?: string) => (
     <div
       key={s.id}
-      draggable
-      onDragStart={(e) => {
-        if ((e.target as HTMLElement).closest('input, textarea, button')) {
-          e.preventDefault();
-          return;
-        }
-        setDraggedSpriteId(s.id);
-        e.dataTransfer.effectAllowed = 'move';
+      data-sprite-card=""
+      data-sprite-id={s.id}
+      data-drop-column={dropColumnId || ''}
+      data-drop-row={dropRowId || ''}
+      onPointerDown={(e) => {
+        if (e.button !== 0) return;
+        if ((e.target as HTMLElement).closest('input, textarea, button, a')) return;
+        // Anchor crosshair and similar interactive bits stop their own propagation.
+        const rect = e.currentTarget.getBoundingClientRect();
+        const session = {
+          id: s.id,
+          pointerId: e.pointerId,
+          startX: e.clientX,
+          startY: e.clientY,
+          offsetX: e.clientX - rect.left,
+          offsetY: e.clientY - rect.top,
+          width: rect.width,
+          height: rect.height,
+          activated: false,
+          ghostSrc: '' as string,
+        };
+        spriteDragSessionRef.current = session;
+        dragPointerPosRef.current = { x: e.clientX, y: e.clientY };
+
+        const onMove = (ev: PointerEvent) => {
+          if (ev.pointerId !== session.pointerId) return;
+          dragPointerPosRef.current = { x: ev.clientX, y: ev.clientY };
+          const dist = Math.hypot(ev.clientX - session.startX, ev.clientY - session.startY);
+          if (!session.activated) {
+            if (dist < 8) return;
+            session.activated = true;
+            session.ghostSrc = imageToPreviewDataUrl(s.img);
+            setDraggedSpriteId(session.id);
+            setDragGhost({
+              x: ev.clientX - session.offsetX,
+              y: ev.clientY - session.offsetY,
+              w: session.width,
+              h: session.height,
+              src: session.ghostSrc,
+              name: s.name,
+            });
+          } else {
+            setDragGhost({
+              x: ev.clientX - session.offsetX,
+              y: ev.clientY - session.offsetY,
+              w: session.width,
+              h: session.height,
+              src: session.ghostSrc,
+              name: s.name,
+            });
+            const target = resolveSpriteDropTarget(ev.clientX, ev.clientY, session.id);
+            if (target?.kind === 'cell') {
+              setCellDragOverKey(compareCellKeyRef.current(target.columnId, target.rowId));
+            } else if (target?.kind === 'sprite' && target.columnId && target.rowId) {
+              setCellDragOverKey(compareCellKeyRef.current(target.columnId, target.rowId));
+            } else {
+              setCellDragOverKey(null);
+            }
+          }
+        };
+
+        const onUp = (ev: PointerEvent) => {
+          if (ev.pointerId !== session.pointerId) return;
+          window.removeEventListener('pointermove', onMove, true);
+          window.removeEventListener('pointerup', onUp, true);
+          window.removeEventListener('pointercancel', onUp, true);
+          endSpritePointerDrag(ev.clientX, ev.clientY, session.activated, session.id);
+        };
+
+        window.addEventListener('pointermove', onMove, true);
+        window.addEventListener('pointerup', onUp, true);
+        window.addEventListener('pointercancel', onUp, true);
       }}
-      onDragOver={(e) => {
-        e.preventDefault();
-        e.dataTransfer.dropEffect = 'move';
-      }}
-      onDrop={(e) => {
+      onClickCapture={(e) => {
+        if (!suppressSpriteClickRef.current) return;
         e.preventDefault();
         e.stopPropagation();
-        if (!draggedSpriteId || draggedSpriteId === s.id) return;
-        if (columnView && dropColumnId) {
-          moveSpriteToCell(draggedSpriteId, dropColumnId, dropRowId || DEFAULT_SPRITE_ROW_ID, s.id);
-        } else {
-          const oldIndex = sprites.findIndex((sp: SpriteData) => sp.id === draggedSpriteId);
-          const newIndex = sprites.findIndex((sp: SpriteData) => sp.id === s.id);
-          if (oldIndex === -1 || newIndex === -1) return;
-          const newSprites = [...sprites];
-          const [moved] = newSprites.splice(oldIndex, 1);
-          newSprites.splice(newIndex, 0, moved);
-          commitSprites(newSprites);
-        }
-        setDraggedSpriteId(null);
-        setColumnDragOverId(null);
-        setCellDragOverKey(null);
-      }}
-      onDragEnd={() => {
-        setDraggedSpriteId(null);
-        setColumnDragOverId(null);
-        setCellDragOverKey(null);
       }}
       onContextMenu={(e) => e.preventDefault()}
       style={{
@@ -8020,6 +8716,7 @@ const App: React.FC = () => {
         cursor: draggedSpriteId === s.id ? 'grabbing' : quadrantBoard ? 'zoom-in' : 'grab',
         transition: 'opacity 0.2s ease',
         position: 'relative',
+        touchAction: 'none',
       }}
     >
       <SpriteModule
@@ -8123,6 +8820,7 @@ const App: React.FC = () => {
         tintOpacity: 0,
         columnId: targetCell && targetCell.columnId !== DEFAULT_SPRITE_COLUMN_ID ? targetCell.columnId : undefined,
         rowId: targetCell && targetCell.rowId !== DEFAULT_SPRITE_ROW_ID ? targetCell.rowId : undefined,
+        belowSplit: gridSplitActive && !targetCell ? true : undefined,
       });
     }
     if (newSprites.length > 0) {
@@ -8166,8 +8864,9 @@ const App: React.FC = () => {
     setColumnView(loaded.columnView);
     setReferenceId(loaded.referenceId);
     setSelection([]);
-    setSprites(loaded.sprites);
-    setHistory([loaded.sprites.map((s) => ({ ...s, padding: { ...s.padding } }))]);
+    const orderedSprites = buildSpritesInBoardOrder(loaded.sprites, loaded.rows, loaded.columns);
+    setSprites(orderedSprites);
+    setHistory([orderedSprites.map((s) => ({ ...s, padding: { ...s.padding } }))]);
     setHistoryIndex(0);
   };
 
@@ -8442,7 +9141,8 @@ const App: React.FC = () => {
           hue: 0,
           opacity: 100,
           tintColor: '#000000',
-          tintOpacity: 0
+          tintOpacity: 0,
+          belowSplit: gridSplitActive ? true : undefined,
         });
         counter++;
       }
@@ -8961,6 +9661,41 @@ const App: React.FC = () => {
       newImg.onload = () => resolve(newImg);
       newImg.src = canvas.toDataURL('image/png');
     });
+  };
+
+  const removeTextBulk = async () => {
+    if (selection.length === 0) return;
+
+    const tolStr = prompt(
+      'Quitar letras: detecta watermarks y etiquetas (blanco/negro/gris) separadas del dibujo principal. Tolerancia 0–100 (0 = solo blanco/negro puro):',
+      '20',
+    );
+    if (tolStr === null) return;
+    const tol = parseInt(tolStr, 10);
+    if (isNaN(tol) || tol < 0 || tol > 100) {
+      alert('Tolerancia inválida.');
+      return;
+    }
+
+    setIsSaving(true);
+    try {
+      const next = [...sprites];
+      let changed = false;
+      for (let i = 0; i < next.length; i++) {
+        if (selection.includes(next[i].id)) {
+          const src = next[i].originalImg || next[i].img;
+          const newImg = await removeTextSmart(src, tol);
+          next[i] = { ...next[i], img: newImg, originalImg: newImg };
+          changed = true;
+        }
+      }
+      if (changed) commitSprites(next);
+    } catch (e) {
+      console.error(e);
+      alert('Hubo un error quitando letras de las imágenes.');
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const removeBackgroundBulk = async (mode: 'smart' | 'precise' = 'smart') => {
@@ -9690,6 +10425,22 @@ const App: React.FC = () => {
               <input type="checkbox" checked={showGridlines} onChange={(e) => setShowGridlines(e.target.checked)} style={{ marginRight: '6px', cursor: 'pointer' }} />
               Guías
             </label>
+            <label
+              style={{
+                marginLeft: '12px',
+                fontSize: '0.7rem',
+                display: columnView ? 'none' : 'inline-flex',
+                alignItems: 'center',
+                cursor: 'pointer',
+                fontWeight: 'normal',
+                color: gridSplitActive ? 'var(--accent)' : 'var(--text-muted)',
+                userSelect: 'none',
+              }}
+              title="Divide la grilla en dos. Con Separar activo, todo lo que importes va debajo de la línea."
+            >
+              <input type="checkbox" checked={gridSplitActive} onChange={(e) => setGridSplitActive(e.target.checked)} style={{ marginRight: '6px', cursor: 'pointer' }} />
+              Separar
+            </label>
             <label style={{ marginLeft: '12px', fontSize: '0.7rem', display: 'inline-flex', alignItems: 'center', cursor: 'pointer', fontWeight: 'normal', color: 'var(--text-muted)', userSelect: 'none' }}>
               <input type="checkbox" checked={isWhiteBg} onChange={(e) => setIsWhiteBg(e.target.checked)} style={{ marginRight: '6px', cursor: 'pointer' }} />
               Fondo Blanco
@@ -9714,7 +10465,7 @@ const App: React.FC = () => {
             <button
               type="button"
               className={`btn-ghost ${columnView ? 'active' : ''}`}
-              onClick={() => setColumnView((v) => !v)}
+              onClick={toggleColumnView}
               title="Tabla de comparación: columnas compartidas por las mismas filas"
               style={{
                 marginLeft: '8px',
@@ -9934,14 +10685,124 @@ const App: React.FC = () => {
                </label>
             </div>
           ) : columnView ? (
-            <div className="column-board-sizer">
+            <div
+              className="column-board-sizer"
+              style={{
+                '--sprite-col-w': `${Math.max(quadrantBoard ? 56 : 180, 280 * gridZoom)}px`,
+                '--sprite-row-label-w': `${rowLabelsCollapsed ? ROW_LABEL_WIDTH_COLLAPSED : rowLabelWidth}px`,
+              } as React.CSSProperties}
+            >
+              <div className="column-board-layout">
+                {(() => {
+                  const col = ungroupedColumn;
+                  const ungroupedCollapsed = isColumnCollapsed(col.id);
+                  const ungroupedCount = sprites.filter((s) => getSpriteColumnId(s) === col.id).length;
+                  return (
+                    <aside className={`ungrouped-rail${ungroupedCollapsed ? ' is-collapsed' : ''}`}>
+                      <div className={`sprite-column-header column-board-head ungrouped-rail-head${ungroupedCollapsed ? ' is-collapsed' : ''}`}>
+                        <button
+                          type="button"
+                          className="btn-ghost collapse-toggle"
+                          title={ungroupedCollapsed ? 'Expandir Sin grupo' : 'Contraer Sin grupo'}
+                          onClick={() => toggleColumnCollapsed(col.id)}
+                        >
+                          {ungroupedCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                        </button>
+                        <span className="sprite-column-title">{col.name}</span>
+                        <span className="sprite-column-count">{ungroupedCount}</span>
+                      </div>
+                      {!ungroupedCollapsed && (
+                        <div className="ungrouped-rail-body">
+                          {spriteRows.map((row) => {
+                            const cellSprites = sprites.filter(
+                              (s) => getSpriteColumnId(s) === col.id && getSpriteRowId(s) === row.id
+                            );
+                            const key = compareCellKey(col.id, row.id);
+                            const rowCollapsed = isRowCollapsed(row.id);
+                            if (rowCollapsed && cellSprites.length === 0) return null;
+                            return (
+                              <div key={`ug-${row.id}`} className="ungrouped-rail-section">
+                                {spriteRows.length > 1 && (
+                                  <div className="ungrouped-rail-row-caption">
+                                    {row.name}{cellSprites.length > 0 ? ` · ${cellSprites.length}` : ''}
+                                  </div>
+                                )}
+                                <div
+                                  data-sprite-cell=""
+                                  data-column-id={col.id}
+                                  data-row-id={row.id}
+                                  className={`sprite-cell is-ungrouped${cellSprites.length === 0 ? ' is-empty' : ''}${cellDragOverKey === key ? ' drag-over' : ''}${rowCollapsed ? ' is-collapsed-row' : ''}`}
+                                  onDragOver={(e) => {
+                                    if (!draggedSpriteId && !Array.from(e.dataTransfer.types).includes('Files')) return;
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    e.dataTransfer.dropEffect = draggedSpriteId ? 'move' : 'copy';
+                                    setCellDragOverKey(key);
+                                  }}
+                                  onDragLeave={(e) => {
+                                    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+                                    setCellDragOverKey((k) => (k === key ? null : k));
+                                  }}
+                                  onDrop={(e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    if (draggedSpriteId) {
+                                      moveSpriteToCell(draggedSpriteId, col.id, row.id);
+                                    } else if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                                      void handleFiles(e.dataTransfer.files, { columnId: col.id, rowId: row.id });
+                                    }
+                                    setDraggedSpriteId(null);
+                                    setCellDragOverKey(null);
+                                  }}
+                                  onContextMenu={(e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    if (rowCollapsed || cellSprites.length > 0 || quadrantPicking) return;
+                                    setEmptyCellMenu({
+                                      x: Math.max(8, Math.min(e.clientX, window.innerWidth - 200)),
+                                      y: Math.max(8, Math.min(e.clientY, window.innerHeight - 80)),
+                                      columnId: col.id,
+                                      rowId: row.id,
+                                    });
+                                  }}
+                                >
+                                  {!rowCollapsed && cellSprites.map((s) => renderSpriteCard(s, col.id, row.id))}
+                                  {rowCollapsed && cellSprites.length > 0 && (
+                                    <div className="sprite-cell-hint">{cellSprites.length}</div>
+                                  )}
+                                  {!rowCollapsed && cellSprites.length === 0 && draggedSpriteId && (
+                                    <div className="sprite-cell-hint">Soltá acá</div>
+                                  )}
+                                  {!rowCollapsed && cellSprites.length === 0 && !draggedSpriteId && !quadrantPicking && (
+                                    <button
+                                      type="button"
+                                      className="sprite-cell-import"
+                                      title="Importar sprite a Sin grupo"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        void importIntoCell(col.id, row.id);
+                                      }}
+                                    >
+                                      <Plus size={18} />
+                                      <span>Importar</span>
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </aside>
+                  );
+                })()}
               <div
                 ref={columnBoardRef}
                 className={`column-board${rowLabelsCollapsed ? ' is-gutter-collapsed' : ''}${isResizingRowLabels ? ' is-resizing-labels' : ''}${quadrantBoard ? ' is-quadrant' : ''}`}
                 style={{
                   '--sprite-col-w': `${Math.max(quadrantBoard ? 56 : 180, 280 * gridZoom)}px`,
                   '--sprite-row-label-w': `${rowLabelsCollapsed ? ROW_LABEL_WIDTH_COLLAPSED : rowLabelWidth}px`,
-                  gridTemplateColumns: `${rowLabelsCollapsed ? ROW_LABEL_WIDTH_COLLAPSED : rowLabelWidth}px ${visibleSpriteColumns.map((c) => isColumnCollapsed(c.id) ? '42px' : 'var(--sprite-col-w)').join(' ')}${quadrantBoard ? '' : ' min-content'}`,
+                  gridTemplateColumns: `${rowLabelsCollapsed ? ROW_LABEL_WIDTH_COLLAPSED : rowLabelWidth}px ${boardSpriteColumns.map((c) => isColumnCollapsed(c.id) ? '42px' : 'var(--sprite-col-w)').join(' ')}${quadrantBoard ? '' : ' min-content'}`,
                 } as React.CSSProperties}
               >
                 <div className={`column-board-corner${rowLabelsCollapsed ? ' is-gutter-collapsed' : ''}`}>
@@ -9959,7 +10820,7 @@ const App: React.FC = () => {
                         type="button"
                         className="btn-ghost collapse-toggle"
                         title={allColumnsCollapsed ? 'Expandir todas las columnas' : 'Contraer todas las columnas'}
-                        onClick={() => setCollapsedColumnIds(allColumnsCollapsed ? [] : visibleSpriteColumns.map((c) => c.id))}
+                        onClick={() => setCollapsedColumnIds(allColumnsCollapsed ? [] : boardSpriteColumns.map((c) => c.id))}
                       >
                         <Columns2 size={14} />
                       </button>
@@ -9975,7 +10836,7 @@ const App: React.FC = () => {
                   )}
                   {renderRowLabelResizeHandle()}
                 </div>
-                {visibleSpriteColumns.map((col) => {
+                {boardSpriteColumns.map((col) => {
                   const isDefault = col.id === DEFAULT_SPRITE_COLUMN_ID;
                   const count = sprites.filter((s) => getSpriteColumnId(s) === col.id).length;
                   const colCollapsed = isColumnCollapsed(col.id);
@@ -10133,7 +10994,7 @@ const App: React.FC = () => {
                         )}
                         {renderRowLabelResizeHandle()}
                       </div>
-                      {visibleSpriteColumns.map((col) => {
+                      {boardSpriteColumns.map((col) => {
                         const cellSprites = sprites.filter(
                           (s) => getSpriteColumnId(s) === col.id && getSpriteRowId(s) === row.id
                         );
@@ -10143,6 +11004,9 @@ const App: React.FC = () => {
                         return (
                           <div
                             key={key}
+                            data-sprite-cell=""
+                            data-column-id={col.id}
+                            data-row-id={row.id}
                             className={`sprite-cell${cellSprites.length === 0 ? ' is-empty' : ''}${cellDragOverKey === key ? ' drag-over' : ''}${rowDragOverId === row.id ? ' row-active' : ''}${rowCollapsed ? ' is-collapsed-row' : ''}${colCollapsed ? ' is-collapsed-col' : ''}`}
                             onDragOver={(e) => {
                               if (!draggedSpriteId && !Array.from(e.dataTransfer.types).includes('Files')) return;
@@ -10214,11 +11078,42 @@ const App: React.FC = () => {
                   </button>
                 )}
               </div>
+              </div>
             </div>
           ) : (
-            <div className="sprite-grid" style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${280 * gridZoom}px, 1fr))` }}>
-              {sprites.map((s: SpriteData) => renderSpriteCard(s))}
-            </div>
+            (() => {
+              const gridCols = { gridTemplateColumns: `repeat(auto-fill, minmax(${280 * gridZoom}px, 1fr))` } as React.CSSProperties;
+              if (!gridSplitActive) {
+                return (
+                  <div className="sprite-grid" style={gridCols}>
+                    {sprites.map((s: SpriteData) => renderSpriteCard(s))}
+                  </div>
+                );
+              }
+              const upperSprites = sprites.filter((s) => !s.belowSplit);
+              const lowerSprites = sprites.filter((s) => !!s.belowSplit);
+              return (
+                <div className="sprite-grid-split">
+                  <div className="sprite-grid" style={gridCols}>
+                    {upperSprites.map((s: SpriteData) => renderSpriteCard(s))}
+                  </div>
+                  <div className="sprite-grid-split-bar" role="separator" aria-label="Separador de grupos">
+                    <span className="sprite-grid-split-bar-line" />
+                    <span className="sprite-grid-split-bar-label">Grupo inferior · nuevas importaciones</span>
+                    <span className="sprite-grid-split-bar-line" />
+                  </div>
+                  <div className="sprite-grid sprite-grid-lower" style={gridCols}>
+                    {lowerSprites.length === 0 ? (
+                      <div className="sprite-grid-split-empty">
+                        Las imágenes que importes ahora aparecen acá abajo
+                      </div>
+                    ) : (
+                      lowerSprites.map((s: SpriteData) => renderSpriteCard(s))
+                    )}
+                  </div>
+                </div>
+              );
+            })()
           )}
         </div>
 
@@ -10353,6 +11248,15 @@ const App: React.FC = () => {
                 <Eraser size={14} /> Negro Preciso
               </button>
             </div>
+            <button
+              className="btn btn-outline"
+              style={{ marginTop: '8px', width: '100%', fontSize: '0.72rem', whiteSpace: 'normal', lineHeight: 1.25 }}
+              onClick={removeTextBulk}
+              disabled={selection.length === 0}
+              title="Detecta watermarks y etiquetas de texto separadas del sprite (bandas superior/inferior, blanco/negro/gris)"
+            >
+              <Type size={14} /> Quitar Letras Inteligente
+            </button>
             <button className="btn btn-outline" style={{ marginTop: '8px', width: '100%' }} onClick={flipHorizontalBulk} disabled={selection.length === 0}>
                <FlipHorizontal size={16} /> Voltear Horizontalmente
             </button>
@@ -11063,6 +11967,19 @@ const App: React.FC = () => {
       )}
       {showAnimationModal && (
         <AnimationModal onClose={() => setShowAnimationModal(false)} />
+      )}
+      {dragGhost && (
+        <div
+          className="sprite-drag-ghost"
+          style={{
+            left: dragGhost.x,
+            top: dragGhost.y,
+            width: dragGhost.w,
+            height: dragGhost.h,
+          }}
+        >
+          <img src={dragGhost.src} alt={dragGhost.name} draggable={false} />
+        </div>
       )}
     </div>
   );

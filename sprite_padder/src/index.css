@@ -211,6 +211,59 @@ body {
   gap: 24px;
 }
 
+.sprite-grid-split {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  width: 100%;
+}
+
+.sprite-grid-split-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 20px 0 18px;
+  user-select: none;
+}
+
+.sprite-grid-split-bar-line {
+  flex: 1;
+  height: 2px;
+  border-radius: 1px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  opacity: 0.55;
+}
+
+.sprite-grid-split-bar-label {
+  flex-shrink: 0;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--accent);
+  padding: 4px 10px;
+  border: 1px solid rgba(107, 102, 255, 0.45);
+  border-radius: 999px;
+  background: rgba(107, 102, 255, 0.12);
+}
+
+.sprite-grid-lower {
+  min-height: 120px;
+}
+
+.sprite-grid-split-empty {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100px;
+  padding: 20px;
+  border: 1px dashed rgba(107, 102, 255, 0.4);
+  border-radius: 12px;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  text-align: center;
+}
+
 .grid-container.column-board-viewport {
   display: block;
   overflow: auto;
@@ -232,9 +285,61 @@ body {
   padding: 24px;
 }
 
+.column-board-layout {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  width: max-content;
+  height: max-content;
+}
+
+.ungrouped-rail {
+  flex: 0 0 auto;
+  width: var(--sprite-col-w, 280px);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-self: flex-start;
+}
+
+.ungrouped-rail.is-collapsed {
+  width: 42px;
+}
+
+.ungrouped-rail-head {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+}
+
+.ungrouped-rail-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ungrouped-rail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ungrouped-rail-row-caption {
+  font-size: 0.65rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  padding: 0 4px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.ungrouped-rail .sprite-cell.is-ungrouped {
+  min-height: 120px;
+}
+
 .column-board {
   display: grid;
-  align-items: stretch;
+  align-items: start;
   gap: 12px 16px;
 }
 
@@ -711,6 +816,26 @@ body {
 .sprite-module.reference {
   border-color: #ffcc00;
   box-shadow: 0 0 0 2px #ffcc00, 0 12px 30px rgba(0,0,0,0.5);
+}
+
+.sprite-drag-ghost {
+  position: fixed;
+  z-index: 10000;
+  pointer-events: none;
+  opacity: 0.88;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  border: 1px solid var(--accent);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
+  background: var(--bg-card);
+}
+
+.sprite-drag-ghost img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #0a0a0c;
 }
 
 .sprite-module.is-quadrant .module-header,
