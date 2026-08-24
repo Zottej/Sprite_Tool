@@ -208,7 +208,127 @@ const clampNum = (value: unknown, min: number, max: number, fallback: number) =>
   return Math.min(max, Math.max(min, n));
 };
 
+/** Prompt numérico que recuerda el último valor válido usado. Cancelar → null. */
+const promptLastInt = (
+  prefKey: string,
+  message: string,
+  fallback: number,
+  opts?: { min?: number; max?: number; invalidMessage?: string },
+): number | null => {
+  const min = opts?.min ?? Number.NEGATIVE_INFINITY;
+  const max = opts?.max ?? Number.POSITIVE_INFINITY;
+  const def = Math.round(clampNum(loadPref<number>(prefKey, fallback), min, max, fallback));
+  const str = prompt(message, String(def));
+  if (str === null) return null;
+  const n = parseInt(str.trim(), 10);
+  if (!Number.isFinite(n) || n < min || n > max) {
+    if (opts?.invalidMessage) alert(opts.invalidMessage);
+    return null;
+  }
+  savePref(prefKey, n);
+  return n;
+};
+
+/** Confirm Sí/No que recuerda la última elección y preselecciona ese botón. */
+const confirmLastBool = (
+  prefKey: string,
+  message: string,
+  fallback = false,
+  labels: { yes?: string; no?: string; title?: string } = {},
+): Promise<boolean> => {
+  const lastYes = loadPref<boolean>(prefKey, fallback) === true;
+  const yesLabel = labels.yes ?? 'Aceptar';
+  const noLabel = labels.no ?? 'Cancelar';
+  const title = labels.title ?? 'Confirmar';
+
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay joa-confirm-overlay';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+
+    const box = document.createElement('div');
+    box.className = 'joa-confirm-box';
+    box.addEventListener('click', (e) => e.stopPropagation());
+
+    const heading = document.createElement('h3');
+    heading.className = 'joa-confirm-title';
+    heading.textContent = title;
+
+    const body = document.createElement('p');
+    body.className = 'joa-confirm-message';
+    body.textContent = message;
+
+    const hint = document.createElement('p');
+    hint.className = 'joa-confirm-hint';
+    hint.textContent = lastYes
+      ? 'Última vez: Aceptar (preseleccionado)'
+      : 'Última vez: Cancelar (preseleccionado)';
+
+    const actions = document.createElement('div');
+    actions.className = 'joa-confirm-actions';
+
+    const noBtn = document.createElement('button');
+    noBtn.type = 'button';
+    noBtn.className = 'btn btn-outline';
+    noBtn.textContent = noLabel;
+
+    const yesBtn = document.createElement('button');
+    yesBtn.type = 'button';
+    yesBtn.className = 'btn btn-primary';
+    yesBtn.textContent = yesLabel;
+
+    const finish = (value: boolean) => {
+      window.removeEventListener('keydown', onKey, true);
+      overlay.remove();
+      savePref(prefKey, value);
+      resolve(value);
+    };
+
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(false);
+        return;
+      }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        e.stopPropagation();
+        const active = document.activeElement;
+        if (active === noBtn) finish(false);
+        else if (active === yesBtn) finish(true);
+        else finish(lastYes);
+      }
+    };
+
+    yesBtn.addEventListener('click', () => finish(true));
+    noBtn.addEventListener('click', () => finish(false));
+    overlay.addEventListener('click', () => finish(false));
+
+    actions.append(noBtn, yesBtn);
+    box.append(heading, body, hint, actions);
+    overlay.append(box);
+    document.body.append(overlay);
+    window.addEventListener('keydown', onKey, true);
+
+    requestAnimationFrame(() => {
+      (lastYes ? yesBtn : noBtn).focus();
+    });
+  });
+};
+
 const LAST_COLOR_KEY = 'joa-last-color';
+const LAST_SLICE_COLS_KEY = 'joa-last-slice-cols';
+const LAST_SLICE_ROWS_KEY = 'joa-last-slice-rows';
+const LAST_EXPORT_STRIP_COLS_KEY = 'joa-last-export-strip-cols';
+const LAST_EXPORT_STRIP_ROWS_KEY = 'joa-last-export-strip-rows';
+const LAST_EXPORT_STRIP_GRID_KEY = 'joa-last-export-strip-grid';
+const LAST_BG_BLACK_SMART_TOL_KEY = 'joa-last-bg-black-smart-tol';
+const LAST_BG_BLACK_PRECISE_TOL_KEY = 'joa-last-bg-black-precise-tol';
+const LAST_REMOVE_TEXT_TOL_KEY = 'joa-last-remove-text-tol';
+const LAST_ADD_TEXT_SIZE_KEY = 'joa-last-add-text-size';
+const LAST_COMPOSITE_SIZE_KEY = 'joa-last-composite-size';
 
 const normalizeHexColor = (value: unknown, fallback = ''): string => {
   if (typeof value !== 'string') return fallback;
@@ -2359,10 +2479,13 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
   const handleAddText = async () => {
     const text = prompt('Escribe el texto a añadir a la imagen:');
     if (!text) return;
-    const sizeStr = prompt('Elige el tamaño del texto (en píxeles):', '16');
-    if (!sizeStr) return;
-    const size = parseInt(sizeStr, 10);
-    if (isNaN(size) || size <= 0) return;
+    const size = promptLastInt(
+      LAST_ADD_TEXT_SIZE_KEY,
+      'Elige el tamaño del texto (en píxeles):',
+      16,
+      { min: 1, max: 4096 },
+    );
+    if (size === null) return;
 
     const tmpCanvas = document.createElement('canvas');
     tmpCanvas.width = sprite.img.width;
@@ -2619,8 +2742,14 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
             <Maximize size={12} /> Estirar (Resize)
           </button>
           <button type="button" className="dropdown-item" onClick={() => {
-            const sizeStr = prompt('¿Tamaño del lienzo de trabajo (en píxeles)?', Math.max(8192, sprite.img.width, sprite.img.height).toString());
-            if (sizeStr && !isNaN(parseInt(sizeStr))) onOpenComposite(sprite.id, parseInt(sizeStr));
+            const fallback = Math.max(8192, sprite.img.width, sprite.img.height);
+            const size = promptLastInt(
+              LAST_COMPOSITE_SIZE_KEY,
+              '¿Tamaño del lienzo de trabajo (en píxeles)?',
+              fallback,
+              { min: 1, max: 32768 },
+            );
+            if (size !== null) onOpenComposite(sprite.id, size);
             closeTools();
           }}>
             <Layers size={12} /> Componer (Collage)
@@ -8611,12 +8740,18 @@ const App: React.FC = () => {
           moveSpriteToCellRef.current(draggedId, target.columnId, target.rowId);
         }
       } else if (target.kind === 'sprite') {
+        const band = target.splitBand === 'upper' || target.splitBand === 'lower'
+          ? target.splitBand
+          : undefined;
         moveSpriteInDefaultGrid(draggedId, {
           beforeId: target.spriteId,
-          splitBand: gridSplitActiveRef.current ? target.splitBand : undefined,
+          splitBand: gridSplitActiveRef.current ? band : undefined,
         });
       } else if (target.kind === 'split' && gridSplitActiveRef.current) {
-        moveSpriteInDefaultGrid(draggedId, { splitBand: target.splitBand });
+        const band = target.splitBand === 'upper' || target.splitBand === 'lower'
+          ? target.splitBand
+          : undefined;
+        if (band) moveSpriteInDefaultGrid(draggedId, { splitBand: band });
       }
     }
     setDraggedSpriteId(null);
@@ -8629,13 +8764,14 @@ const App: React.FC = () => {
     }, 0);
   };
 
-  const renderSpriteCard = (s: SpriteData, dropColumnId?: string, dropRowId?: string) => (
+  const renderSpriteCard = (s: SpriteData, dropColumnId?: string, dropRowId?: string, splitBand?: 'upper' | 'lower') => (
     <div
       key={s.id}
       data-sprite-card=""
       data-sprite-id={s.id}
       data-drop-column={dropColumnId || ''}
       data-drop-row={dropRowId || ''}
+      data-split-band={splitBand || ''}
       onPointerDown={(e) => {
         if (e.button !== 0) return;
         if ((e.target as HTMLElement).closest('input, textarea, button, a')) return;
@@ -8685,10 +8821,19 @@ const App: React.FC = () => {
             const target = resolveSpriteDropTarget(ev.clientX, ev.clientY, session.id);
             if (target?.kind === 'cell') {
               setCellDragOverKey(compareCellKeyRef.current(target.columnId, target.rowId));
+              setSplitDragOverBand(null);
             } else if (target?.kind === 'sprite' && target.columnId && target.rowId) {
               setCellDragOverKey(compareCellKeyRef.current(target.columnId, target.rowId));
+              setSplitDragOverBand(null);
+            } else if (target?.kind === 'sprite' && (target.splitBand === 'upper' || target.splitBand === 'lower')) {
+              setCellDragOverKey(null);
+              setSplitDragOverBand(target.splitBand);
+            } else if (target?.kind === 'split' && (target.splitBand === 'upper' || target.splitBand === 'lower')) {
+              setCellDragOverKey(null);
+              setSplitDragOverBand(target.splitBand);
             } else {
               setCellDragOverKey(null);
+              setSplitDragOverBand(null);
             }
           }
         };
@@ -9068,18 +9213,21 @@ const App: React.FC = () => {
 
   const handleSliceFile = async (file: File) => {
     if (!file || !isProbablyImageFile(file)) return;
-    const colsStr = prompt('¿En cuántas columnas (cortes verticales) deseas dividir la imagen?', '1');
-    if (!colsStr) return;
-    const cols = parseInt(colsStr, 10);
-    
-    const rowsStr = prompt('¿En cuántas filas (cortes horizontales) deseas dividir la imagen?', '1');
-    if (!rowsStr) return;
-    const rows = parseInt(rowsStr, 10);
+    const cols = promptLastInt(
+      LAST_SLICE_COLS_KEY,
+      '¿En cuántas columnas (cortes verticales) deseas dividir la imagen?',
+      1,
+      { min: 1, max: 1024, invalidMessage: 'Número de columnas inválido' },
+    );
+    if (cols === null) return;
 
-    if (isNaN(cols) || cols <= 0 || isNaN(rows) || rows <= 0) {
-      alert('Número de filas o columnas inválido');
-      return;
-    }
+    const rows = promptLastInt(
+      LAST_SLICE_ROWS_KEY,
+      '¿En cuántas filas (cortes horizontales) deseas dividir la imagen?',
+      1,
+      { min: 1, max: 1024, invalidMessage: 'Número de filas o columnas inválido' },
+    );
+    if (rows === null) return;
 
     const img = await new Promise<HTMLImageElement>((res, rej) => {
       const reader = new FileReader();
@@ -9666,16 +9814,13 @@ const App: React.FC = () => {
   const removeTextBulk = async () => {
     if (selection.length === 0) return;
 
-    const tolStr = prompt(
+    const tol = promptLastInt(
+      LAST_REMOVE_TEXT_TOL_KEY,
       'Quitar letras: detecta watermarks y etiquetas (blanco/negro/gris) separadas del dibujo principal. Tolerancia 0–100 (0 = solo blanco/negro puro):',
-      '20',
+      20,
+      { min: 0, max: 100, invalidMessage: 'Tolerancia inválida.' },
     );
-    if (tolStr === null) return;
-    const tol = parseInt(tolStr, 10);
-    if (isNaN(tol) || tol < 0 || tol > 100) {
-      alert('Tolerancia inválida.');
-      return;
-    }
+    if (tol === null) return;
 
     setIsSaving(true);
     try {
@@ -9701,18 +9846,15 @@ const App: React.FC = () => {
   const removeBackgroundBulk = async (mode: 'smart' | 'precise' = 'smart') => {
     if (selection.length === 0) return;
 
-    const tolStr = prompt(
+    const tol = promptLastInt(
+      mode === 'precise' ? LAST_BG_BLACK_PRECISE_TOL_KEY : LAST_BG_BLACK_SMART_TOL_KEY,
       mode === 'precise'
         ? 'Negro preciso: borra TODO píxel negro (aunque esté cerrado). Tolerancia 0–100 (0 = solo negro absoluto):'
         : 'Fondo inteligente: solo negro conectado al borde. Tolerancia 0–100 (0 = solo negro absoluto):',
-      '5'
+      5,
+      { min: 0, max: 255, invalidMessage: 'Tolerancia inválida.' },
     );
-    if (tolStr === null) return;
-    const tol = parseInt(tolStr, 10);
-    if (isNaN(tol) || tol < 0 || tol > 255) {
-      alert('Tolerancia inválida.');
-      return;
-    }
+    if (tol === null) return;
 
     setIsSaving(true);
     
@@ -10240,20 +10382,28 @@ const App: React.FC = () => {
   const exportGridSpritesheet = async () => {
     if (sprites.length === 0) return;
 
-    const colsStr = prompt('¿Cuántas columnas deseas para el spritesheet al exportar?', '10');
-    if (!colsStr) return;
-    const cols = parseInt(colsStr, 10);
+    const cols = promptLastInt(
+      LAST_EXPORT_STRIP_COLS_KEY,
+      '¿Cuántas columnas deseas para el spritesheet al exportar?',
+      10,
+      { min: 1, max: 1024, invalidMessage: 'Número de filas o columnas inválido.' },
+    );
+    if (cols === null) return;
 
-    const rowsStr = prompt('¿Cuántas filas deseas para el spritesheet al exportar?', '1');
-    if (!rowsStr) return;
-    const rows = parseInt(rowsStr, 10);
+    const rows = promptLastInt(
+      LAST_EXPORT_STRIP_ROWS_KEY,
+      '¿Cuántas filas deseas para el spritesheet al exportar?',
+      1,
+      { min: 1, max: 1024, invalidMessage: 'Número de filas o columnas inválido.' },
+    );
+    if (rows === null) return;
 
-    if (isNaN(cols) || cols <= 0 || isNaN(rows) || rows <= 0) {
-      alert('Número de filas o columnas inválido.');
-      return;
-    }
-
-    const includeGrid = window.confirm('¿Deseas dibujar una cuadrícula guía sobre las imágenes exportadas?');
+    const includeGrid = await confirmLastBool(
+      LAST_EXPORT_STRIP_GRID_KEY,
+      '¿Deseas dibujar una cuadrícula guía sobre las imágenes exportadas?',
+      false,
+      { yes: 'Sí, con guía', no: 'No', title: 'Exportar como Tira' },
+    );
 
     setIsSaving(true);
     let maxW = 0;
@@ -11094,21 +11244,35 @@ const App: React.FC = () => {
               const lowerSprites = sprites.filter((s) => !!s.belowSplit);
               return (
                 <div className="sprite-grid-split">
-                  <div className="sprite-grid" style={gridCols}>
-                    {upperSprites.map((s: SpriteData) => renderSpriteCard(s))}
+                  <div
+                    className={`sprite-grid${splitDragOverBand === 'upper' ? ' split-drag-over' : ''}`}
+                    style={gridCols}
+                    data-split-zone="upper"
+                  >
+                    {upperSprites.length === 0 ? (
+                      <div className="sprite-grid-split-empty">
+                        Soltá sprites acá (grupo superior)
+                      </div>
+                    ) : (
+                      upperSprites.map((s: SpriteData) => renderSpriteCard(s, undefined, undefined, 'upper'))
+                    )}
                   </div>
                   <div className="sprite-grid-split-bar" role="separator" aria-label="Separador de grupos">
                     <span className="sprite-grid-split-bar-line" />
                     <span className="sprite-grid-split-bar-label">Grupo inferior · nuevas importaciones</span>
                     <span className="sprite-grid-split-bar-line" />
                   </div>
-                  <div className="sprite-grid sprite-grid-lower" style={gridCols}>
+                  <div
+                    className={`sprite-grid sprite-grid-lower${splitDragOverBand === 'lower' ? ' split-drag-over' : ''}`}
+                    style={gridCols}
+                    data-split-zone="lower"
+                  >
                     {lowerSprites.length === 0 ? (
                       <div className="sprite-grid-split-empty">
-                        Las imágenes que importes ahora aparecen acá abajo
+                        Soltá sprites acá · también van las nuevas importaciones
                       </div>
                     ) : (
-                      lowerSprites.map((s: SpriteData) => renderSpriteCard(s))
+                      lowerSprites.map((s: SpriteData) => renderSpriteCard(s, undefined, undefined, 'lower'))
                     )}
                   </div>
                 </div>

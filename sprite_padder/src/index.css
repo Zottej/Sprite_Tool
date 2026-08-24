@@ -250,6 +250,14 @@ body {
   min-height: 120px;
 }
 
+.sprite-grid.split-drag-over,
+.sprite-grid-lower.split-drag-over {
+  outline: 2px dashed rgba(107, 102, 255, 0.65);
+  outline-offset: 6px;
+  border-radius: 12px;
+  background: rgba(107, 102, 255, 0.06);
+}
+
 .sprite-grid-split-empty {
   grid-column: 1 / -1;
   display: flex;
@@ -262,6 +270,7 @@ body {
   color: var(--text-muted);
   font-size: 0.78rem;
   text-align: center;
+  pointer-events: none;
 }
 
 .grid-container.column-board-viewport {
@@ -1225,6 +1234,57 @@ input[type="range"] { accent-color: var(--accent); height: 4px; }
   flex-direction: column;
   overflow: hidden;
   box-shadow: 0 20px 50px rgba(0,0,0,0.6);
+}
+
+.joa-confirm-overlay {
+  z-index: 10050;
+}
+
+.joa-confirm-box {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  width: min(420px, 92vw);
+  padding: 20px 22px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.55);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.joa-confirm-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.joa-confirm-message {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+}
+
+.joa-confirm-hint {
+  margin: 0;
+  font-size: 0.7rem;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.joa-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.joa-confirm-actions .btn:focus-visible,
+.joa-confirm-actions .btn:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .modal-content.paint-modal {
