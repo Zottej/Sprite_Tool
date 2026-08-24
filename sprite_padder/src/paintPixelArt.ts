@@ -66,6 +66,74 @@ export const hexToRgbaCss = (hex: string, opacityPct: number): string => {
   return `rgba(${r}, ${g}, ${b}, ${a})`;
 };
 
+/** Radio de blur (px) a partir de intensidad 0–100 y tamaño de pincel. */
+export const brushBlurRadius = (softPct: number, brushSize: number): number => {
+  const soft = Math.max(0, Math.min(100, softPct)) / 100;
+  if (soft <= 0) return 0;
+  return Math.max(1, Math.round(soft * Math.max(1, brushSize) * 0.65));
+};
+
+/** Box blur separable sobre ImageData (pérdida de definición pareja en toda la zona). */
+export const boxBlurImageData = (imageData: ImageData, radius: number): ImageData => {
+  const r = Math.max(0, Math.round(radius));
+  if (r <= 0) return imageData;
+  const { width: w, height: h } = imageData;
+  const src = imageData.data;
+  const tmp = new Uint8ClampedArray(src.length);
+  const out = new Uint8ClampedArray(src.length);
+  const pass = (from: Uint8ClampedArray, to: Uint8ClampedArray, horizontal: boolean) => {
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let sr = 0;
+        let sg = 0;
+        let sb = 0;
+        let sa = 0;
+        let n = 0;
+        if (horizontal) {
+          const x0 = Math.max(0, x - r);
+          const x1 = Math.min(w - 1, x + r);
+          for (let xi = x0; xi <= x1; xi++) {
+            const i = (y * w + xi) * 4;
+            const a = from[i + 3];
+            sr += from[i] * a;
+            sg += from[i + 1] * a;
+            sb += from[i + 2] * a;
+            sa += a;
+            n += 1;
+          }
+        } else {
+          const y0 = Math.max(0, y - r);
+          const y1 = Math.min(h - 1, y + r);
+          for (let yi = y0; yi <= y1; yi++) {
+            const i = (yi * w + x) * 4;
+            const a = from[i + 3];
+            sr += from[i] * a;
+            sg += from[i + 1] * a;
+            sb += from[i + 2] * a;
+            sa += a;
+            n += 1;
+          }
+        }
+        const o = (y * w + x) * 4;
+        if (sa <= 0) {
+          to[o] = 0;
+          to[o + 1] = 0;
+          to[o + 2] = 0;
+          to[o + 3] = 0;
+        } else {
+          to[o] = Math.round(sr / sa);
+          to[o + 1] = Math.round(sg / sa);
+          to[o + 2] = Math.round(sb / sa);
+          to[o + 3] = Math.round(sa / n);
+        }
+      }
+    }
+  };
+  pass(src, tmp, true);
+  pass(tmp, out, false);
+  return new ImageData(out, w, h);
+};
+
 export const parseDitherPattern = (value: unknown): DitherPattern =>
   DITHER_OPTIONS.some((o) => o.id === value) ? (value as DitherPattern) : 'off';
 

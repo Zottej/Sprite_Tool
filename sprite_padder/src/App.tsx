@@ -16,6 +16,8 @@ import {
 } from './desktopBridge';
 import {
   DITHER_OPTIONS,
+  boxBlurImageData,
+  brushBlurRadius,
   ditherPick,
   extractPaletteFromImageData,
   hexToRgbaCss,
@@ -6546,6 +6548,7 @@ type PaintPrefs = {
   brushShape: 'circle' | 'square';
   paintColor: string;
   paintOpacity: number;
+  brushSoftness: number;
   paintBehind: boolean;
   gridLock: boolean;
   showPixelGrid: boolean;
@@ -6608,6 +6611,7 @@ const loadPaintPrefs = (): PaintPrefs => {
     brushShape: saved.brushShape === 'square' ? 'square' : 'circle',
     paintColor: normalizeHexColor(saved.paintColor, loadLastColor('#ff0000')) || '#ff0000',
     paintOpacity: Math.round(clampNum(saved.paintOpacity, 1, 100, 100)),
+    brushSoftness: Math.round(clampNum(saved.brushSoftness, 0, 100, 0)),
     paintBehind: saved.paintBehind === true,
     gridLock: saved.gridLock === true,
     showPixelGrid: saved.showPixelGrid === true,
@@ -6624,6 +6628,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
   const [brushShape, setBrushShape] = useState<'circle' | 'square'>(() => loadPaintPrefs().brushShape);
   const [paintColor, setPaintColor] = useState(() => loadPaintPrefs().paintColor);
   const [paintOpacity, setPaintOpacity] = useState(() => loadPaintPrefs().paintOpacity);
+  const [brushSoftness, setBrushSoftness] = useState(() => loadPaintPrefs().brushSoftness);
   const [paintBehind, setPaintBehind] = useState(() => loadPaintPrefs().paintBehind);
   const [gridLock, setGridLock] = useState(() => loadPaintPrefs().gridLock);
   const [showPixelGrid, setShowPixelGrid] = useState(() => loadPaintPrefs().showPixelGrid);
@@ -6665,12 +6670,12 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
 
   useEffect(() => {
     savePref(PAINT_PREFS_KEY, {
-      zoom, brushSize, brushShape, paintColor, paintOpacity, paintBehind, gridLock,
+      zoom, brushSize, brushShape, paintColor, paintOpacity, brushSoftness, paintBehind, gridLock,
       showPixelGrid, ditherPattern, ditherColorB, ditherEmpty, paletteLock,
     });
     rememberLastColor(paintColor);
     setColorDraft(paintColor);
-  }, [zoom, brushSize, brushShape, paintColor, paintOpacity, paintBehind, gridLock, showPixelGrid, ditherPattern, ditherColorB, ditherEmpty, paletteLock]);
+  }, [zoom, brushSize, brushShape, paintColor, paintOpacity, brushSoftness, paintBehind, gridLock, showPixelGrid, ditherPattern, ditherColorB, ditherEmpty, paletteLock]);
 
   useEffect(() => {
     const size = Math.max(1, Math.round(brushSize));
@@ -6776,10 +6781,8 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     if (!canvas) return;
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     const rect = canvas.getBoundingClientRect();
-    const scaleX = canvas.width / (rect.width / zoom);
-    const scaleY = canvas.height / (rect.height / zoom);
-    const px = Math.floor(((e.clientX - rect.left) / zoom) * scaleX);
-    const py = Math.floor(((e.clientY - rect.top) / zoom) * scaleY);
+    const px = Math.floor((e.clientX - rect.left) * (canvas.width / Math.max(1, rect.width)));
+    const py = Math.floor((e.clientY - rect.top) * (canvas.height / Math.max(1, rect.height)));
     if (px < 0 || py < 0 || px >= canvas.width || py >= canvas.height) return;
     const { data } = ctx.getImageData(px, py, 1, 1);
     if (data[3] < 8) return; // vacío: no cambiar color
@@ -6806,6 +6809,15 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
   const paintCssColor = (hex = paintColor) =>
     hexToRgbaCss(normalizeHexColor(hex, '#ff0000') || '#ff0000', paintOpacity);
 
+  const softScratchRef = useRef<HTMLCanvasElement | null>(null);
+  const getSoftScratch = (w: number, h: number) => {
+    const c = softScratchRef.current || document.createElement('canvas');
+    softScratchRef.current = c;
+    if (c.width !== w) c.width = w;
+    if (c.height !== h) c.height = h;
+    return c;
+  };
+
   const applyDitherStyle = (
     ctx: CanvasRenderingContext2D,
     ix: number,
@@ -6823,6 +6835,35 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     return true;
   };
 
+  /** Pinta duro en un buffer y aplica blur pareja (pérdida de definición general). */
+  const stampHardThenBlur = (
+    dest: CanvasRenderingContext2D,
+    stampW: number,
+    stampH: number,
+    destX: number,
+    destY: number,
+    paintHard: (sctx: CanvasRenderingContext2D) => void,
+  ) => {
+    const blurR = brushBlurRadius(brushSoftness, Math.max(stampW, stampH) / 2);
+    const pad = blurR * 2;
+    const tw = Math.max(1, Math.ceil(stampW + pad * 2));
+    const th = Math.max(1, Math.ceil(stampH + pad * 2));
+    const tip = getSoftScratch(tw, th);
+    const tctx = tip.getContext('2d', { willReadFrequently: true })!;
+    tctx.setTransform(1, 0, 0, 1, 0, 0);
+    tctx.globalCompositeOperation = 'source-over';
+    tctx.clearRect(0, 0, tw, th);
+    tctx.save();
+    tctx.translate(pad, pad);
+    paintHard(tctx);
+    tctx.restore();
+    if (blurR > 0) {
+      const blurred = boxBlurImageData(tctx.getImageData(0, 0, tw, th), blurR);
+      tctx.putImageData(blurred, 0, 0);
+    }
+    dest.drawImage(tip, Math.floor(destX) - pad, Math.floor(destY) - pad);
+  };
+
   const stampBrush = (
     ctx: CanvasRenderingContext2D,
     px: number,
@@ -6831,32 +6872,55 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     colorA: string,
     colorB: string,
   ) => {
-    const ix = Math.round(px);
-    const iy = Math.round(py);
+    // Anclar al píxel: si el centro queda fraccionario, el cuadrado/círculo
+    // cambia de márgenes entre clics en el "mismo" punto.
+    const cx = Math.floor(px);
+    const cy = Math.floor(py);
     const r = brushSize;
-    const x0 = Math.floor(ix - r);
-    const y0 = Math.floor(iy - r);
-    const x1 = Math.ceil(ix + r);
-    const y1 = Math.ceil(iy + r);
-    const r2 = r * r;
-    for (let y = y0; y < y1; y++) {
-      for (let x = x0; x < x1; x++) {
-        if (brushShape === 'circle') {
-          const dx = x + 0.5 - px;
-          const dy = y + 0.5 - py;
-          if (dx * dx + dy * dy > r2) continue;
-        } else if (x < px - r || x >= px + r || y < py - r || y >= py + r) {
-          continue;
+    if (r <= 0) return;
+
+    const paintHardAt = (target: CanvasRenderingContext2D, ox: number, oy: number, trackPixels: boolean) => {
+      // Cobertura estable de exactamente 2r × 2r (enteros).
+      const x0 = ox - r;
+      const y0 = oy - r;
+      const x1 = ox + r;
+      const y1 = oy + r;
+      const r2 = r * r;
+      for (let y = y0; y < y1; y++) {
+        for (let x = x0; x < x1; x++) {
+          if (brushShape === 'circle') {
+            const dx = x + 0.5 - ox;
+            const dy = y + 0.5 - oy;
+            if (dx * dx + dy * dy > r2) continue;
+          }
+          if (trackPixels && painted) {
+            const ax = x - ox + cx;
+            const ay = y - oy + cy;
+            const pkey = `${ax},${ay}`;
+            if (painted.has(pkey)) continue;
+            painted.add(pkey);
+          }
+          if (!applyDitherStyle(target, x, y, colorA, colorB)) continue;
+          target.fillRect(x, y, 1, 1);
         }
-        if (!applyDitherStyle(ctx, x, y, colorA, colorB)) continue;
-        if (painted) {
-          const key = `${x},${y}`;
-          if (painted.has(key)) continue;
-          painted.add(key);
-        }
-        ctx.fillRect(x, y, 1, 1);
       }
+    };
+
+    if (brushSoftness <= 0) {
+      paintHardAt(ctx, cx, cy, true);
+      return;
     }
+
+    const dabKey = `dab:${cx},${cy}`;
+    if (painted) {
+      if (painted.has(dabKey)) return;
+      painted.add(dabKey);
+    }
+
+    const size = r * 2;
+    stampHardThenBlur(ctx, size, size, cx - r, cy - r, (tctx) => {
+      paintHardAt(tctx, r, r, false);
+    });
   };
 
   const stampGridCell = (
@@ -6876,22 +6940,34 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     const size = origin.size;
     const ix = Math.round((cellX - origin.x) / size);
     const iy = Math.round((cellY - origin.y) / size);
-    if (!applyDitherStyle(ctx, ix, iy, colorA, colorB)) return;
-    if (brushShape === 'circle') {
-      const cx = cellX + size / 2;
-      const cy = cellY + size / 2;
-      const r2 = (size / 2) * (size / 2);
-      for (let y = cellY; y < cellY + size; y++) {
-        for (let x = cellX; x < cellX + size; x++) {
-          const dx = x + 0.5 - cx;
-          const dy = y + 0.5 - cy;
-          if (dx * dx + dy * dy > r2) continue;
-          ctx.fillRect(x, y, 1, 1);
+
+    const paintCellHard = (target: CanvasRenderingContext2D, ox: number, oy: number) => {
+      if (!applyDitherStyle(target, ix, iy, colorA, colorB)) return;
+      if (brushShape === 'circle') {
+        const cx = ox + size / 2;
+        const cy = oy + size / 2;
+        const r2 = (size / 2) * (size / 2);
+        for (let y = oy; y < oy + size; y++) {
+          for (let x = ox; x < ox + size; x++) {
+            const dx = x + 0.5 - cx;
+            const dy = y + 0.5 - cy;
+            if (dx * dx + dy * dy > r2) continue;
+            target.fillRect(x, y, 1, 1);
+          }
         }
+        return;
       }
+      target.fillRect(ox, oy, size, size);
+    };
+
+    if (brushSoftness <= 0) {
+      paintCellHard(ctx, cellX, cellY);
       return;
     }
-    ctx.fillRect(cellX, cellY, size, size);
+
+    stampHardThenBlur(ctx, size, size, cellX, cellY, (tctx) => {
+      paintCellHard(tctx, 0, 0);
+    });
   };
 
   const ensureGridOrigin = (px: number, py: number): PaintGridOrigin => {
@@ -6913,20 +6989,16 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     const rect = canvas.getBoundingClientRect();
-    const x = (e.clientX - rect.left) / zoom;
-    const y = (e.clientY - rect.top) / zoom;
+    // Coordenada de píxel estable (sin subpíxeles → márgenes del dab no bailan).
+    const currX = Math.floor((e.clientX - rect.left) * (canvas.width / Math.max(1, rect.width)));
+    const currY = Math.floor((e.clientY - rect.top) * (canvas.height / Math.max(1, rect.height)));
 
-    setMousePos({ x, y });
+    setMousePos({ x: currX, y: currY });
 
     if (!isDrawingRef.current && !forceFirstPoint) {
       lastPos.current = null;
       return;
     }
-
-    const scaleX = canvas.width / (rect.width / zoom);
-    const scaleY = canvas.height / (rect.height / zoom);
-    const currX = x * scaleX;
-    const currY = y * scaleY;
     
     // destination-over: paint only shows through transparent / empty pixels
     ctx.globalCompositeOperation = paintBehind ? 'destination-over' : 'source-over';
@@ -6977,7 +7049,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
       pushHistory();
       strokeSavedRef.current = true;
     }
-    strokePaintedRef.current = (gridLock || paintOpacity < 100) ? new Set() : null;
+    strokePaintedRef.current = (gridLock || paintOpacity < 100 || brushSoftness > 0) ? new Set() : null;
     isDrawingRef.current = true;
     draw(e, true);
   };
@@ -7031,6 +7103,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
   const statusBits = [
     gridLock ? (gridOrigin ? `Grilla ${gridOrigin.size}px` : 'Grilla: clic para anclar') : null,
     ditherPattern !== 'off' ? `Dither ${DITHER_OPTIONS.find((o) => o.id === ditherPattern)?.label}` : null,
+    brushSoftness > 0 ? `Difuminar ${brushSoftness}%` : null,
     paletteLock ? `Paleta ${palette.length}` : null,
     paintBehind ? 'Detrás' : null,
   ].filter(Boolean) as string[];
@@ -7100,14 +7173,18 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
               onMouseMove={(e) => {
                 if (eyedropperMode) {
                   const rect = e.currentTarget.getBoundingClientRect();
-                  setMousePos({ x: (e.clientX - rect.left) / zoom, y: (e.clientY - rect.top) / zoom });
+                  const mx = Math.floor((e.clientX - rect.left) * (e.currentTarget.width / Math.max(1, rect.width)));
+                  const my = Math.floor((e.clientY - rect.top) * (e.currentTarget.height / Math.max(1, rect.height)));
+                  setMousePos({ x: mx, y: my });
                   return;
                 }
                 draw(e);
               }}
               onMouseEnter={(e) => {
                 const rect = e.currentTarget.getBoundingClientRect();
-                setMousePos({ x: (e.clientX - rect.left) / zoom, y: (e.clientY - rect.top) / zoom });
+                const mx = Math.floor((e.clientX - rect.left) * (e.currentTarget.width / Math.max(1, rect.width)));
+                const my = Math.floor((e.clientY - rect.top) * (e.currentTarget.height / Math.max(1, rect.height)));
+                setMousePos({ x: mx, y: my });
               }}
               onMouseLeave={() => {
                 endStroke();
@@ -7134,6 +7211,40 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
                const canvas = canvasRef.current!;
                const scale = canvas.offsetWidth / canvas.width;
                const previewBg = ditherPreviewBg();
+               const isSoft = brushSoftness > 0;
+               const blurPx = isSoft
+                 ? Math.max(0.5, brushBlurRadius(brushSoftness, brushSize) * scale)
+                 : 0;
+               const shapeRadius = brushShape === 'circle' ? '50%' : '0';
+               const renderPreview = (left: number, top: number, w: number, h: number) => (
+                 <div
+                   className={`brush-preview${isSoft ? ' is-soft' : ''}`}
+                   style={{
+                     left,
+                     top,
+                     width: w,
+                     height: h,
+                     borderColor: isSoft ? undefined : paintColor,
+                     background: isSoft ? undefined : previewBg,
+                     opacity: 1,
+                     borderRadius: shapeRadius,
+                   }}
+                 >
+                   {isSoft && (
+                     <>
+                       <div
+                         className="brush-preview-soft-body"
+                         style={{
+                           background: previewBg,
+                           borderRadius: shapeRadius,
+                           filter: blurPx > 0 ? `blur(${blurPx}px)` : undefined,
+                         }}
+                       />
+                       <div className="brush-preview-soft-center" />
+                     </>
+                   )}
+                 </div>
+               );
                if (gridLock) {
                  const size = gridOrigin?.size ?? Math.max(1, Math.round(brushSize));
                  const cell = gridOrigin
@@ -7142,30 +7253,18 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
                        x: Math.floor(mousePos.x) - Math.floor(size / 2),
                        y: Math.floor(mousePos.y) - Math.floor(size / 2),
                      };
-                 return (
-                   <div className="brush-preview" style={{
-                     left: cell.x + size / 2,
-                     top: cell.y + size / 2,
-                     width: size * scale,
-                     height: size * scale,
-                     borderColor: paintColor,
-                     background: previewBg,
-                     opacity: 1,
-                     borderRadius: brushShape === 'circle' ? '50%' : '0',
-                   }} />
+                 return renderPreview(
+                   cell.x + size / 2,
+                   cell.y + size / 2,
+                   size * scale,
+                   size * scale,
                  );
                }
-               return (
-               <div className="brush-preview" style={{
-                 left: mousePos.x,
-                 top: mousePos.y,
-                 width: brushSize * scale * 2,
-                 height: brushSize * scale * 2,
-                 borderColor: paintColor,
-                 background: previewBg,
-                 opacity: 1,
-                 borderRadius: brushShape === 'circle' ? '50%' : '0'
-               }} />
+               return renderPreview(
+                 mousePos.x,
+                 mousePos.y,
+                 brushSize * scale * 2,
+                 brushSize * scale * 2,
                );
              })()}
              </div>
@@ -7275,6 +7374,21 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
                 value={paintOpacity}
                 onChange={(e) => setPaintOpacity(parseInt(e.target.value, 10))}
                 title="Opacidad del pincel (píxeles semitransparentes)"
+              />
+            </div>
+
+            <div className="paint-dock-group" style={{ width: '130px' }}>
+              <div className="slider-label" style={{ marginBottom: 0 }}>
+                <span>Difuminar</span>
+                <span>{brushSoftness}%</span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                value={brushSoftness}
+                onChange={(e) => setBrushSoftness(parseInt(e.target.value, 10))}
+                title="Pérdida de definición pareja en todo el trazo (blur), no es opacidad ni borde suave de afuera hacia adentro"
               />
             </div>
 
@@ -11651,9 +11765,16 @@ const App: React.FC = () => {
                 />
               </div>
               <div className="slider-item">
-                <div className="slider-label"><span>Tono (Hue)</span><span>{firstSelected ? (firstSelected.hue ?? 0) : 0}º</span></div>
-                <input type="range" min="0" max="360" value={firstSelected ? (firstSelected.hue ?? 0) : 0}
-                  onChange={(e) => updateBulkFilter('hue', parseInt(e.target.value))} disabled={selection.length === 0}
+                <div className="slider-label"><span>Color</span><span>{firstSelected ? (firstSelected.hue ?? 0) : 0}°</span></div>
+                <input
+                  type="range"
+                  className="range-hue"
+                  min="0"
+                  max="360"
+                  value={firstSelected ? (firstSelected.hue ?? 0) : 0}
+                  onChange={(e) => updateBulkFilter('hue', parseInt(e.target.value))}
+                  disabled={selection.length === 0}
+                  title="Barra de matiz (tono)"
                 />
               </div>
               <div className="slider-item">
