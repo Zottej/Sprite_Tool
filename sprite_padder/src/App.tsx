@@ -18,11 +18,15 @@ import {
   DITHER_OPTIONS,
   boxBlurImageData,
   brushBlurRadius,
+  alignPixelGrid,
+  detectPixelGrid,
+  dirtyHexColor,
   ditherPick,
   extractPaletteFromImageData,
   hexToRgbaCss,
   nearestPaletteHex,
   parseDitherPattern,
+  transferImageColorsToReference,
   rgbToHex,
   type DitherPattern,
 } from './paintPixelArt';
@@ -804,6 +808,8 @@ interface SpriteData {
   brightness?: number;
   contrast?: number;
   saturation?: number;
+  /** Intensidad de color (estilo TV): 0 = sin color, 100 = normal, >100 = más vivo. */
+  colorIntensity?: number;
   hue?: number;
   opacity?: number;
   /** absolute = uniforme (default); radial = mayor en el centro de la imagen, menor hacia los bordes */
@@ -865,6 +871,8 @@ const getSpriteFilter = (sprite: SpriteData, isExport = false) => {
   const b = sprite.brightness ?? 100;
   const c = sprite.contrast ?? 100;
   const s = sprite.saturation ?? 100;
+  const colorInt = sprite.colorIntensity ?? 100;
+  const effectiveSat = Math.max(0, (s * colorInt) / 100);
   const useRadialOpacity = sprite.opacityMode === 'radial' && hasActiveEffectMask(sprite);
   const o = useRadialOpacity ? 100 : (sprite.opacity ?? 100);
   const hRotate = sprite.hue ?? 0;
@@ -879,7 +887,7 @@ const getSpriteFilter = (sprite: SpriteData, isExport = false) => {
   // A highlights boost (hl > 100) will stretch the upper range of luminosity.
   const highlightsFilter = hl !== 100 ? `contrast(${100 + (hl - 100) * 0.5}%) brightness(${100 + (hl - 100) * 0.2}%) contrast(${100 / (1 + (hl - 100) * 0.005)}%)` : '';
 
-  let filter = `brightness(${b * (exp / 100)}%) contrast(${c}%) saturate(${s}%) hue-rotate(${hRotate}deg) opacity(${o}%) grayscale(${gs}%) sepia(${sp}%) invert(${inv}%) blur(${bl}px) ${highlightsFilter}`;
+  let filter = `brightness(${b * (exp / 100)}%) contrast(${c}%) saturate(${effectiveSat}%) hue-rotate(${hRotate}deg) opacity(${o}%) grayscale(${gs}%) sepia(${sp}%) invert(${inv}%) blur(${bl}px) ${highlightsFilter}`;
   
   if (sprite.shadowColor && (sprite.shadowX || sprite.shadowY || sprite.shadowBlur)) {
     filter += ` drop-shadow(${sprite.shadowX || 0}px ${sprite.shadowY || 0}px ${sprite.shadowBlur || 0}px ${sprite.shadowColor})`;
@@ -1291,7 +1299,7 @@ const getSpriteImageSource = (sprite: SpriteData): HTMLImageElement | HTMLCanvas
 };
 
 const NEUTRAL_EFFECTS: Partial<SpriteData> = {
-  brightness: 100, contrast: 100, saturation: 100, hue: 0, opacity: 100,
+  brightness: 100, contrast: 100, saturation: 100, colorIntensity: 100, hue: 0, opacity: 100,
   opacityMode: 'absolute' as const,
   grayscale: 0, sepia: 0, invert: 0, blur: 0, exposure: 100, highlights: 100,
   pixelation: 1, posterize: undefined, tintOpacity: 0,
@@ -3788,11 +3796,13 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
     return remembered?.id ?? null;
   });
   const source = others.find((s) => s.id === sourceId) || null;
-  const prefs = loadPref<{ zoom?: number; opacity?: number; targetOpacity?: number; editSource?: boolean }>(GHOST_COMPARE_PREFS_KEY, {});
+  const prefs = loadPref<{ zoom?: number; opacity?: number; targetOpacity?: number; editSource?: boolean; paletteForce?: number }>(GHOST_COMPARE_PREFS_KEY, {});
   const [zoom, setZoom] = useState(() => clampNum(prefs.zoom, 0.5, 8, 1));
   const [opacity, setOpacity] = useState(() => Math.round(clampNum(prefs.opacity, 5, 100, 40)));
   const [targetOpacity, setTargetOpacity] = useState(() => Math.round(clampNum(prefs.targetOpacity, 5, 100, 100)));
   const [editSource, setEditSource] = useState(() => prefs.editSource === true);
+  const [paletteForce, setPaletteForce] = useState(() => Math.round(clampNum(prefs.paletteForce, 5, 100, 100)));
+  const [paletteBusy, setPaletteBusy] = useState(false);
   const [nudgeStep, setNudgeStep] = useState(() => Math.round(clampNum(loadPref('joa-content-nudge-step', 1), 1, 512, 1)));
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-ghost-compare-scroll', sprite.name);
@@ -3803,8 +3813,8 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
   }, [source]);
 
   useEffect(() => {
-    savePref(GHOST_COMPARE_PREFS_KEY, { zoom, opacity, targetOpacity, editSource });
-  }, [zoom, opacity, targetOpacity, editSource]);
+    savePref(GHOST_COMPARE_PREFS_KEY, { zoom, opacity, targetOpacity, editSource, paletteForce });
+  }, [zoom, opacity, targetOpacity, editSource, paletteForce]);
 
   useEffect(() => {
     savePref('joa-content-nudge-step', nudgeStep);
@@ -3916,6 +3926,27 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
   const stageW = Math.max(fgSize.w, bgSize.w);
   const stageH = Math.max(fgSize.h, bgSize.h);
   const internalScale = editTarget.scale || 1;
+
+  const matchPaletteToReference = async () => {
+    if (!source || paletteBusy) return;
+    const target = editSource ? source : sprite;
+    const reference = editSource ? sprite : source;
+    setPaletteBusy(true);
+    try {
+      const newImg = await transferImageColorsToReference(target.img, reference.img, paletteForce);
+      onChangeSprite({
+        ...target,
+        img: newImg,
+        originalImg: target.originalImg === target.img ? newImg : target.originalImg,
+      });
+    } catch (err) {
+      console.error(err);
+      alert('No se pudo igualar la paleta.');
+    } finally {
+      setPaletteBusy(false);
+    }
+  };
+
   const nudgeBtn = (dx: number, dy: number, title: string, icon: React.ReactNode) => (
     <button
       type="button"
@@ -3987,7 +4018,7 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
               borderRadius: '8px',
               background: editSource ? 'rgba(255,204,102,0.08)' : 'transparent',
             }}
-            title="Si está activo, mover / escala / autoalinear modifican la fuente (fondo). Si no, modifican el sprite de arriba."
+            title="Si está activo, mover / escala / autoalinear / igualar paleta modifican la fuente (fondo). Si no, modifican el sprite de arriba. La paleta de referencia es siempre el otro."
           >
             <input
               type="checkbox"
@@ -4072,6 +4103,29 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
               }}
             >
               <Target size={14} /> Autoalinear base
+            </button>
+            <div className="slider-item" style={{ flex: '1 1 120px', marginBottom: 0, minWidth: '110px' }}>
+              <div className="slider-label"><span>Fuerza paleta</span><span>{paletteForce}%</span></div>
+              <input
+                type="range"
+                min="5"
+                max="100"
+                step="1"
+                value={paletteForce}
+                onChange={(e) => setPaletteForce(parseInt(e.target.value, 10))}
+                title="Qué tan fuerte se acerca cada color a la paleta de referencia (100% = snap exacto)"
+              />
+            </div>
+            <button
+              type="button"
+              className="btn btn-outline"
+              disabled={paletteBusy}
+              title={editSource
+                ? `Transfiere la tonalidad/paleta de ${sprite.name} hacia la fuente (${source.name}): corrige casts (rojizos, etc.) y encaja en los colores de referencia`
+                : `Transfiere la tonalidad/paleta de la fuente (${source.name}) hacia ${sprite.name}: corrige casts (rojizos, etc.) y encaja en los colores de referencia`}
+              onClick={() => { void matchPaletteToReference(); }}
+            >
+              <Droplets size={14} /> {paletteBusy ? 'Igualando…' : 'Igualar paleta'}
             </button>
           </div>
           <div style={{ display: 'flex', gap: '12px', marginLeft: 'auto' }}>
@@ -6549,6 +6603,8 @@ type PaintPrefs = {
   paintColor: string;
   paintOpacity: number;
   brushSoftness: number;
+  brushNoise: number;
+  previewOpacity: number;
   paintBehind: boolean;
   gridLock: boolean;
   showPixelGrid: boolean;
@@ -6558,17 +6614,38 @@ type PaintPrefs = {
   paletteLock: boolean;
 };
 
-type PaintGridOrigin = { x: number; y: number; size: number };
+/** Color CSS a usar en una celda; varía por celda cuando el pincel está "sucio". */
+type PaintStyle = (ix: number, iy: number) => string;
+
+/** `size`/`sizeY` pueden ser fraccionarios cuando la grilla se detecta automáticamente. */
+type PaintGridOrigin = { x: number; y: number; size: number; sizeY: number; auto?: boolean };
 
 const paintGridMod = (n: number, m: number) => ((n % m) + m) % m;
 
-const snapPaintGridCell = (px: number, py: number, origin: PaintGridOrigin) => {
-  const { x: ox, y: oy, size } = origin;
+/** Índice de celda que contiene al píxel. */
+const paintGridIndexAt = (px: number, py: number, origin: PaintGridOrigin) => ({
+  ix: Math.floor((px - origin.x) / origin.size),
+  iy: Math.floor((py - origin.y) / origin.sizeY),
+});
+
+/** Rectángulo entero de una celda: los bordes se redondean para no dejar huecos ni solapes. */
+const paintGridCellRect = (origin: PaintGridOrigin, ix: number, iy: number) => {
+  const x = Math.round(origin.x + ix * origin.size);
+  const y = Math.round(origin.y + iy * origin.sizeY);
   return {
-    x: ox + Math.floor((px - ox) / size) * size,
-    y: oy + Math.floor((py - oy) / size) * size,
+    x,
+    y,
+    w: Math.max(1, Math.round(origin.x + (ix + 1) * origin.size) - x),
+    h: Math.max(1, Math.round(origin.y + (iy + 1) * origin.sizeY) - y),
   };
 };
+
+const formatGridSize = (n: number) => (Number.isInteger(n) ? `${n}` : n.toFixed(2).replace(/0$/, ''));
+
+const describeGrid = (origin: PaintGridOrigin) =>
+  Math.abs(origin.size - origin.sizeY) < 0.005
+    ? `${formatGridSize(origin.size)}px`
+    : `${formatGridSize(origin.size)}×${formatGridSize(origin.sizeY)}px`;
 
 /** Recorre celdas (índices) entre dos puntos de la malla, sin saltarse ni repetir. */
 const paintGridCellsOnLine = (
@@ -6612,6 +6689,8 @@ const loadPaintPrefs = (): PaintPrefs => {
     paintColor: normalizeHexColor(saved.paintColor, loadLastColor('#ff0000')) || '#ff0000',
     paintOpacity: Math.round(clampNum(saved.paintOpacity, 1, 100, 100)),
     brushSoftness: Math.round(clampNum(saved.brushSoftness, 0, 100, 0)),
+    brushNoise: Math.round(clampNum(saved.brushNoise, 0, 100, 0)),
+    previewOpacity: Math.round(clampNum(saved.previewOpacity, 0, 100, 35)),
     paintBehind: saved.paintBehind === true,
     gridLock: saved.gridLock === true,
     showPixelGrid: saved.showPixelGrid === true,
@@ -6629,6 +6708,8 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
   const [paintColor, setPaintColor] = useState(() => loadPaintPrefs().paintColor);
   const [paintOpacity, setPaintOpacity] = useState(() => loadPaintPrefs().paintOpacity);
   const [brushSoftness, setBrushSoftness] = useState(() => loadPaintPrefs().brushSoftness);
+  const [brushNoise, setBrushNoise] = useState(() => loadPaintPrefs().brushNoise);
+  const [previewOpacity, setPreviewOpacity] = useState(() => loadPaintPrefs().previewOpacity);
   const [paintBehind, setPaintBehind] = useState(() => loadPaintPrefs().paintBehind);
   const [gridLock, setGridLock] = useState(() => loadPaintPrefs().gridLock);
   const [showPixelGrid, setShowPixelGrid] = useState(() => loadPaintPrefs().showPixelGrid);
@@ -6638,6 +6719,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
   const [paletteLock, setPaletteLock] = useState(() => loadPaintPrefs().paletteLock);
   const [palette, setPalette] = useState<string[]>([]);
   const [gridOrigin, setGridOrigin] = useState<PaintGridOrigin | null>(null);
+  const [gridSizeDraft, setGridSizeDraft] = useState('');
   const [eyedropperMode, setEyedropperMode] = useState(false);
   const [zoom, setZoom] = useState(() => loadPaintPrefs().zoom);
   const [colorDraft, setColorDraft] = useState(() => loadPaintPrefs().paintColor);
@@ -6670,20 +6752,26 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
 
   useEffect(() => {
     savePref(PAINT_PREFS_KEY, {
-      zoom, brushSize, brushShape, paintColor, paintOpacity, brushSoftness, paintBehind, gridLock,
+      zoom, brushSize, brushShape, paintColor, paintOpacity, brushSoftness, brushNoise, previewOpacity, paintBehind, gridLock,
       showPixelGrid, ditherPattern, ditherColorB, ditherEmpty, paletteLock,
     });
     rememberLastColor(paintColor);
     setColorDraft(paintColor);
-  }, [zoom, brushSize, brushShape, paintColor, paintOpacity, brushSoftness, paintBehind, gridLock, showPixelGrid, ditherPattern, ditherColorB, ditherEmpty, paletteLock]);
+  }, [zoom, brushSize, brushShape, paintColor, paintOpacity, brushSoftness, brushNoise, previewOpacity, paintBehind, gridLock, showPixelGrid, ditherPattern, ditherColorB, ditherEmpty, paletteLock]);
 
   useEffect(() => {
     const size = Math.max(1, Math.round(brushSize));
-    if (!gridLock || (gridOriginRef.current && gridOriginRef.current.size !== size)) {
+    const current = gridOriginRef.current;
+    // La grilla medida automáticamente no depende del pincel: solo se suelta al apagar Grilla.
+    if (!gridLock || (current && !current.auto && current.size !== size)) {
       gridOriginRef.current = null;
       setGridOrigin(null);
     }
   }, [gridLock, brushSize]);
+
+  useEffect(() => {
+    setGridSizeDraft(gridOrigin ? String(Number(gridOrigin.size.toFixed(2))) : '');
+  }, [gridOrigin]);
 
   const pushHistory = () => {
     const canvas = canvasRef.current;
@@ -6809,6 +6897,30 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
   const paintCssColor = (hex = paintColor) =>
     hexToRgbaCss(normalizeHexColor(hex, '#ff0000') || '#ff0000', paintOpacity);
 
+  /**
+   * Color a usar en cada celda. Con "Sucio" en 0 es siempre el mismo; si no, cada celda
+   * recibe su propia variación (y se respeta la paleta si está bloqueada).
+   */
+  const makePaintStyle = (hex = paintColor): PaintStyle => {
+    const base = normalizeHexColor(hex, '#ff0000') || '#ff0000';
+    if (brushNoise <= 0) {
+      const css = hexToRgbaCss(base, paintOpacity);
+      return () => css;
+    }
+    const snapToPalette = paletteLock && palette.length > 0;
+    const cache = new Map<string, string>();
+    return (ix, iy) => {
+      const key = `${ix},${iy}`;
+      const hit = cache.get(key);
+      if (hit) return hit;
+      let dirty = dirtyHexColor(base, brushNoise, ix, iy);
+      if (snapToPalette) dirty = nearestPaletteHex(dirty, palette);
+      const css = hexToRgbaCss(dirty, paintOpacity);
+      cache.set(key, css);
+      return css;
+    };
+  };
+
   const softScratchRef = useRef<HTMLCanvasElement | null>(null);
   const getSoftScratch = (w: number, h: number) => {
     const c = softScratchRef.current || document.createElement('canvas');
@@ -6822,16 +6934,16 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     ctx: CanvasRenderingContext2D,
     ix: number,
     iy: number,
-    colorA: string,
-    colorB: string,
+    styleA: PaintStyle,
+    styleB: PaintStyle,
   ): boolean => {
     if (ditherPattern === 'off') {
-      ctx.fillStyle = colorA;
+      ctx.fillStyle = styleA(ix, iy);
       return true;
     }
     const pick = ditherPick(ix, iy, ditherPattern);
     if (pick === 'b' && ditherEmpty) return false;
-    ctx.fillStyle = pick === 'b' ? colorB : colorA;
+    ctx.fillStyle = pick === 'b' ? styleB(ix, iy) : styleA(ix, iy);
     return true;
   };
 
@@ -6869,8 +6981,8 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     px: number,
     py: number,
     painted: Set<string> | null,
-    colorA: string,
-    colorB: string,
+    styleA: PaintStyle,
+    styleB: PaintStyle,
   ) => {
     // Anclar al píxel: si el centro queda fraccionario, el cuadrado/círculo
     // cambia de márgenes entre clics en el "mismo" punto.
@@ -6893,14 +7005,15 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
             const dy = y + 0.5 - oy;
             if (dx * dx + dy * dy > r2) continue;
           }
+          // Coordenada real del lienzo: dither y suciedad no deben moverse con el trazo.
+          const ax = x - ox + cx;
+          const ay = y - oy + cy;
           if (trackPixels && painted) {
-            const ax = x - ox + cx;
-            const ay = y - oy + cy;
             const pkey = `${ax},${ay}`;
             if (painted.has(pkey)) continue;
             painted.add(pkey);
           }
-          if (!applyDitherStyle(target, x, y, colorA, colorB)) continue;
+          if (!applyDitherStyle(target, ax, ay, styleA, styleB)) continue;
           target.fillRect(x, y, 1, 1);
         }
       }
@@ -6925,47 +7038,46 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
 
   const stampGridCell = (
     ctx: CanvasRenderingContext2D,
-    cellX: number,
-    cellY: number,
+    ix: number,
+    iy: number,
     origin: PaintGridOrigin,
     painted: Set<string> | null,
-    colorA: string,
-    colorB: string,
+    styleA: PaintStyle,
+    styleB: PaintStyle,
   ) => {
-    const key = `${cellX},${cellY}`;
+    const key = `${ix},${iy}`;
     if (painted) {
       if (painted.has(key)) return;
       painted.add(key);
     }
-    const size = origin.size;
-    const ix = Math.round((cellX - origin.x) / size);
-    const iy = Math.round((cellY - origin.y) / size);
+    const rect = paintGridCellRect(origin, ix, iy);
 
     const paintCellHard = (target: CanvasRenderingContext2D, ox: number, oy: number) => {
-      if (!applyDitherStyle(target, ix, iy, colorA, colorB)) return;
+      if (!applyDitherStyle(target, ix, iy, styleA, styleB)) return;
       if (brushShape === 'circle') {
-        const cx = ox + size / 2;
-        const cy = oy + size / 2;
-        const r2 = (size / 2) * (size / 2);
-        for (let y = oy; y < oy + size; y++) {
-          for (let x = ox; x < ox + size; x++) {
-            const dx = x + 0.5 - cx;
-            const dy = y + 0.5 - cy;
-            if (dx * dx + dy * dy > r2) continue;
+        const rx = rect.w / 2;
+        const ry = rect.h / 2;
+        const cx = ox + rx;
+        const cy = oy + ry;
+        for (let y = oy; y < oy + rect.h; y++) {
+          for (let x = ox; x < ox + rect.w; x++) {
+            const dx = (x + 0.5 - cx) / rx;
+            const dy = (y + 0.5 - cy) / ry;
+            if (dx * dx + dy * dy > 1) continue;
             target.fillRect(x, y, 1, 1);
           }
         }
         return;
       }
-      target.fillRect(ox, oy, size, size);
+      target.fillRect(ox, oy, rect.w, rect.h);
     };
 
     if (brushSoftness <= 0) {
-      paintCellHard(ctx, cellX, cellY);
+      paintCellHard(ctx, rect.x, rect.y);
       return;
     }
 
-    stampHardThenBlur(ctx, size, size, cellX, cellY, (tctx) => {
+    stampHardThenBlur(ctx, rect.w, rect.h, rect.x, rect.y, (tctx) => {
       paintCellHard(tctx, 0, 0);
     });
   };
@@ -6977,10 +7089,57 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
       x: Math.floor(px) - Math.floor(size / 2),
       y: Math.floor(py) - Math.floor(size / 2),
       size,
+      sizeY: size,
     };
     gridOriginRef.current = origin;
     setGridOrigin(origin);
     return origin;
+  };
+
+  const anchorMeasuredGrid = (offsetX: number, offsetY: number, cellW: number, cellH: number) => {
+    const origin: PaintGridOrigin = {
+      // Retrocede al primer borde para que la celda 0 caiga dentro del lienzo.
+      x: offsetX - Math.ceil(offsetX / cellW) * cellW,
+      y: offsetY - Math.ceil(offsetY / cellH) * cellH,
+      size: cellW,
+      sizeY: cellH,
+      auto: true,
+    };
+    gridOriginRef.current = origin;
+    setGridOrigin(origin);
+    setGridLock(true);
+  };
+
+  /** Mide la grilla real del dibujo (bloques casi iguales) y la ancla tal cual. */
+  const autoDetectGrid = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    const found = detectPixelGrid(ctx.getImageData(0, 0, canvas.width, canvas.height));
+    if (!found) {
+      alert('No pude medir una grilla clara en este dibujo. Probá con el sprite sin difuminar o anclá la grilla a mano.');
+      return;
+    }
+    anchorMeasuredGrid(found.offsetX, found.offsetY, found.cellW, found.cellH);
+  };
+
+  /** El usuario corrige la medida: mantenemos su tamaño y realineamos la fase con el dibujo. */
+  const applyGridSize = (size: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const cell = Math.min(200, Math.max(1, size));
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    const aligned = alignPixelGrid(ctx.getImageData(0, 0, canvas.width, canvas.height), cell, cell);
+    anchorMeasuredGrid(aligned?.offsetX ?? 0, aligned?.offsetY ?? 0, cell, cell);
+  };
+
+  const commitGridSizeDraft = () => {
+    const value = parseFloat(gridSizeDraft.replace(',', '.'));
+    if (!Number.isFinite(value) || value < 1) {
+      setGridSizeDraft(gridOrigin ? String(Number(gridOrigin.size.toFixed(2))) : '');
+      return;
+    }
+    applyGridSize(value);
   };
 
   const draw = (e: React.MouseEvent, forceFirstPoint = false) => {
@@ -7002,26 +7161,22 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     
     // destination-over: paint only shows through transparent / empty pixels
     ctx.globalCompositeOperation = paintBehind ? 'destination-over' : 'source-over';
-    const colorA = paintCssColor();
-    const colorB = paintCssColor(ditherColorB);
-    ctx.fillStyle = colorA;
+    const styleA = makePaintStyle();
+    const styleB = makePaintStyle(ditherColorB);
     const painted = strokePaintedRef.current;
 
     if (gridLock) {
       const origin = ensureGridOrigin(currX, currY);
-      const cell = snapPaintGridCell(currX, currY, origin);
-      const ix = Math.round((cell.x - origin.x) / origin.size);
-      const iy = Math.round((cell.y - origin.y) / origin.size);
+      const cell = paintGridIndexAt(currX, currY, origin);
       if (lastPos.current && !forceFirstPoint) {
-        const lx = Math.round((lastPos.current.x - origin.x) / origin.size);
-        const ly = Math.round((lastPos.current.y - origin.y) / origin.size);
-        for (const c of paintGridCellsOnLine(lx, ly, ix, iy)) {
-          stampGridCell(ctx, origin.x + c.x * origin.size, origin.y + c.y * origin.size, origin, painted, colorA, colorB);
+        const prev = paintGridIndexAt(lastPos.current.x, lastPos.current.y, origin);
+        for (const c of paintGridCellsOnLine(prev.ix, prev.iy, cell.ix, cell.iy)) {
+          stampGridCell(ctx, c.x, c.y, origin, painted, styleA, styleB);
         }
       } else {
-        stampGridCell(ctx, cell.x, cell.y, origin, painted, colorA, colorB);
+        stampGridCell(ctx, cell.ix, cell.iy, origin, painted, styleA, styleB);
       }
-      lastPos.current = { x: cell.x, y: cell.y };
+      lastPos.current = { x: currX, y: currY };
       return;
     }
 
@@ -7032,10 +7187,10 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
       const steps = Math.max(1, Math.ceil(dist / Math.max(1, brushSize * 0.35)));
       for (let i = 0; i <= steps; i++) {
         const t = i / steps;
-        stampBrush(ctx, lastPos.current.x + dx * t, lastPos.current.y + dy * t, painted, colorA, colorB);
+        stampBrush(ctx, lastPos.current.x + dx * t, lastPos.current.y + dy * t, painted, styleA, styleB);
       }
     } else {
-      stampBrush(ctx, currX, currY, painted, colorA, colorB);
+      stampBrush(ctx, currX, currY, painted, styleA, styleB);
     }
     lastPos.current = { x: currX, y: currY };
   };
@@ -7097,13 +7252,19 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
       x: Math.floor(mousePos.x) - Math.floor(size / 2),
       y: Math.floor(mousePos.y) - Math.floor(size / 2),
       size,
+      sizeY: size,
     };
   })();
 
   const statusBits = [
-    gridLock ? (gridOrigin ? `Grilla ${gridOrigin.size}px` : 'Grilla: clic para anclar') : null,
+    gridLock
+      ? gridOrigin
+        ? `Grilla ${describeGrid(gridOrigin)}${gridOrigin.auto ? ' auto' : ''}`
+        : 'Grilla: clic para anclar'
+      : null,
     ditherPattern !== 'off' ? `Dither ${DITHER_OPTIONS.find((o) => o.id === ditherPattern)?.label}` : null,
     brushSoftness > 0 ? `Difuminar ${brushSoftness}%` : null,
+    brushNoise > 0 ? `Sucio ${brushNoise}%` : null,
     paletteLock ? `Paleta ${palette.length}` : null,
     paintBehind ? 'Detrás' : null,
   ].filter(Boolean) as string[];
@@ -7201,8 +7362,8 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
                    height: sprite.img.height,
                    pointerEvents: 'none',
                    backgroundImage: 'linear-gradient(to right, rgba(255,255,255,0.28) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.28) 1px, transparent 1px)',
-                   backgroundSize: `${cellGridOverlay.size}px ${cellGridOverlay.size}px`,
-                   backgroundPosition: `${paintGridMod(cellGridOverlay.x, cellGridOverlay.size)}px ${paintGridMod(cellGridOverlay.y, cellGridOverlay.size)}px`,
+                   backgroundSize: `${cellGridOverlay.size}px ${cellGridOverlay.sizeY}px`,
+                   backgroundPosition: `${paintGridMod(cellGridOverlay.x, cellGridOverlay.size)}px ${paintGridMod(cellGridOverlay.y, cellGridOverlay.sizeY)}px`,
                    zIndex: 1000,
                  }}
                />
@@ -7211,53 +7372,48 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
                const canvas = canvasRef.current!;
                const scale = canvas.offsetWidth / canvas.width;
                const previewBg = ditherPreviewBg();
-               const isSoft = brushSoftness > 0;
-               const blurPx = isSoft
-                 ? Math.max(0.5, brushBlurRadius(brushSoftness, brushSize) * scale)
+               const fillOpacity = Math.max(0, Math.min(1, previewOpacity / 100));
+               const blurPx = brushSoftness > 0
+                 ? Math.max(0.5, brushBlurRadius(brushSoftness, brushSize) * scale * 0.45)
                  : 0;
                const shapeRadius = brushShape === 'circle' ? '50%' : '0';
                const renderPreview = (left: number, top: number, w: number, h: number) => (
                  <div
-                   className={`brush-preview${isSoft ? ' is-soft' : ''}`}
+                   className="brush-preview"
                    style={{
                      left,
                      top,
                      width: w,
                      height: h,
-                     borderColor: isSoft ? undefined : paintColor,
-                     background: isSoft ? undefined : previewBg,
-                     opacity: 1,
                      borderRadius: shapeRadius,
                    }}
                  >
-                   {isSoft && (
-                     <>
-                       <div
-                         className="brush-preview-soft-body"
-                         style={{
-                           background: previewBg,
-                           borderRadius: shapeRadius,
-                           filter: blurPx > 0 ? `blur(${blurPx}px)` : undefined,
-                         }}
-                       />
-                       <div className="brush-preview-soft-center" />
-                     </>
-                   )}
+                   <div
+                     className="brush-preview-fill"
+                     style={{
+                       background: previewBg,
+                       borderRadius: shapeRadius,
+                       opacity: fillOpacity,
+                       filter: blurPx > 0 ? `blur(${blurPx}px)` : undefined,
+                     }}
+                   />
                  </div>
                );
                if (gridLock) {
-                 const size = gridOrigin?.size ?? Math.max(1, Math.round(brushSize));
-                 const cell = gridOrigin
-                   ? snapPaintGridCell(mousePos.x, mousePos.y, gridOrigin)
-                   : {
-                       x: Math.floor(mousePos.x) - Math.floor(size / 2),
-                       y: Math.floor(mousePos.y) - Math.floor(size / 2),
-                     };
+                 const size = Math.max(1, Math.round(brushSize));
+                 const origin: PaintGridOrigin = gridOrigin ?? {
+                   x: Math.floor(mousePos.x) - Math.floor(size / 2),
+                   y: Math.floor(mousePos.y) - Math.floor(size / 2),
+                   size,
+                   sizeY: size,
+                 };
+                 const cell = paintGridIndexAt(mousePos.x, mousePos.y, origin);
+                 const rect = paintGridCellRect(origin, cell.ix, cell.iy);
                  return renderPreview(
-                   cell.x + size / 2,
-                   cell.y + size / 2,
-                   size * scale,
-                   size * scale,
+                   rect.x + rect.w / 2,
+                   rect.y + rect.h / 2,
+                   rect.w * scale,
+                   rect.h * scale,
                  );
                }
                return renderPreview(
@@ -7392,6 +7548,36 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
               />
             </div>
 
+            <div className="paint-dock-group" style={{ width: '130px' }}>
+              <div className="slider-label" style={{ marginBottom: 0 }}>
+                <span>Sucio</span>
+                <span>{brushNoise}%</span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                value={brushNoise}
+                onChange={(e) => setBrushNoise(parseInt(e.target.value, 10))}
+                title="Varía el color en cada celda (grano tipo pintado a mano) en vez de dejarlo plano. Con Grilla el grano es de una celda; sin Grilla, de 1 px"
+              />
+            </div>
+
+            <div className="paint-dock-group" style={{ width: '130px' }}>
+              <div className="slider-label" style={{ marginBottom: 0 }}>
+                <span>Referencia</span>
+                <span>{previewOpacity}%</span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                value={previewOpacity}
+                onChange={(e) => setPreviewOpacity(parseInt(e.target.value, 10))}
+                title="Transparencia del cuadrante de referencia bajo el mouse (no afecta el trazo)"
+              />
+            </div>
+
             <div className="paint-dock-group" style={{ width: '140px' }}>
               <div className="slider-label" style={{ marginBottom: 0 }}>
                 <span><Search size={12} /> Zoom</span>
@@ -7449,8 +7635,39 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
                   title="Tras el primer clic, el pincel queda anclado a una malla del tamaño del pincel"
                 >
                   <Grid size={14} />
-                  {gridLock && gridOrigin ? `Grilla ${gridOrigin.size}px` : 'Grilla'}
+                  {gridLock && gridOrigin ? `Grilla ${describeGrid(gridOrigin)}` : 'Grilla'}
                 </button>
+                <button
+                  type="button"
+                  className={`paint-toggle ${gridOrigin?.auto ? 'active' : ''}`}
+                  onClick={autoDetectGrid}
+                  title="Mide los bloques del dibujo y arma la grilla con ese tamaño y desfase, aunque no sean números enteros"
+                >
+                  <Target size={14} />
+                  Auto
+                </button>
+                {gridOrigin && (
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: '3px', fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                    <input
+                      type="number"
+                      className="paint-num"
+                      step={0.05}
+                      min={1}
+                      max={200}
+                      value={gridSizeDraft}
+                      onChange={(e) => setGridSizeDraft(e.target.value)}
+                      onBlur={commitGridSizeDraft}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          commitGridSizeDraft();
+                        }
+                      }}
+                      title="Tamaño de celda. Si Auto se equivocó, escribí el correcto (admite decimales) y la grilla se realinea sola con el dibujo"
+                    />
+                    px
+                  </span>
+                )}
                 <button
                   type="button"
                   className={`paint-toggle ${showPixelGrid ? 'active' : ''}`}
@@ -10127,6 +10344,7 @@ const App: React.FC = () => {
         brightness: ref.brightness ?? 100,
         contrast: ref.contrast ?? 100,
         saturation: ref.saturation ?? 100,
+        colorIntensity: ref.colorIntensity ?? 100,
         hue: ref.hue ?? 0,
         opacity: ref.opacity ?? 100,
         opacityMode: ref.opacityMode ?? 'absolute',
@@ -11765,16 +11983,21 @@ const App: React.FC = () => {
                 />
               </div>
               <div className="slider-item">
-                <div className="slider-label"><span>Color</span><span>{firstSelected ? (firstSelected.hue ?? 0) : 0}°</span></div>
+                <div className="slider-label"><span>Color</span><span>{firstSelected ? (firstSelected.colorIntensity ?? 100) : 100}%</span></div>
                 <input
                   type="range"
-                  className="range-hue"
                   min="0"
-                  max="360"
-                  value={firstSelected ? (firstSelected.hue ?? 0) : 0}
-                  onChange={(e) => updateBulkFilter('hue', parseInt(e.target.value))}
+                  max="200"
+                  value={firstSelected ? (firstSelected.colorIntensity ?? 100) : 100}
+                  onChange={(e) => updateBulkFilter('colorIntensity', parseInt(e.target.value))}
                   disabled={selection.length === 0}
-                  title="Barra de matiz (tono)"
+                  title="Intensidad de color (como en TV): 0 = gris, 100 = normal, más = más vivo"
+                />
+              </div>
+              <div className="slider-item">
+                <div className="slider-label"><span>Tono (Hue)</span><span>{firstSelected ? (firstSelected.hue ?? 0) : 0}º</span></div>
+                <input type="range" min="0" max="360" value={firstSelected ? (firstSelected.hue ?? 0) : 0}
+                  onChange={(e) => updateBulkFilter('hue', parseInt(e.target.value))} disabled={selection.length === 0}
                 />
               </div>
               <div className="slider-item">

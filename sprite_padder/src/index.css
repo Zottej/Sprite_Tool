@@ -1171,75 +1171,6 @@ body {
 .slider-label { display: flex; justify-content: space-between; font-size: 0.75rem; margin-bottom: 6px; }
 input[type="range"] { accent-color: var(--accent); height: 4px; }
 
-input[type="range"].range-hue {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 100%;
-  height: 14px;
-  border-radius: 7px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: linear-gradient(
-    to right,
-    #ff0000 0%,
-    #ffff00 16.66%,
-    #00ff00 33.33%,
-    #00ffff 50%,
-    #0000ff 66.66%,
-    #ff00ff 83.33%,
-    #ff0000 100%
-  );
-  cursor: pointer;
-}
-
-input[type="range"].range-hue:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
-input[type="range"].range-hue::-webkit-slider-runnable-track {
-  height: 14px;
-  border-radius: 7px;
-  background: transparent;
-}
-
-input[type="range"].range-hue::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  width: 14px;
-  height: 14px;
-  margin-top: 0;
-  border-radius: 50%;
-  background: #fff;
-  border: 2px solid rgba(0, 0, 0, 0.8);
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.55);
-  cursor: pointer;
-}
-
-input[type="range"].range-hue::-moz-range-track {
-  height: 14px;
-  border-radius: 7px;
-  background: linear-gradient(
-    to right,
-    #ff0000 0%,
-    #ffff00 16.66%,
-    #00ff00 33.33%,
-    #00ffff 50%,
-    #0000ff 66.66%,
-    #ff00ff 83.33%,
-    #ff0000 100%
-  );
-  border: none;
-}
-
-input[type="range"].range-hue::-moz-range-thumb {
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  background: #fff;
-  border: 2px solid rgba(0, 0, 0, 0.8);
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.55);
-  cursor: pointer;
-}
-
 .badge {
   background: var(--border);
   padding: 2px 6px;
@@ -1634,45 +1565,19 @@ input[type="range"].range-hue::-moz-range-thumb {
 .brush-preview {
   position: absolute;
   pointer-events: none;
-  border: 1px solid white;
+  border: 1px solid rgba(255, 255, 255, 0.95);
   border-radius: 50%;
   transform: translate(-50%, -50%);
-  box-shadow: 0 0 0 1px rgba(0,0,0,0.5), inset 0 0 0 1px rgba(0,0,0,0.5);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.75);
   z-index: 1001;
-  mix-blend-mode: difference;
+  overflow: visible;
 }
 
-/* Con difuminar: borde y centro siempre nítidos; solo el relleno simula blur */
-.brush-preview.is-soft {
-  mix-blend-mode: normal;
-  border: 2px solid var(--accent);
-  background: transparent;
-  box-shadow:
-    0 0 0 1px rgba(0, 0, 0, 0.9),
-    0 0 0 2px rgba(255, 255, 255, 0.95),
-    inset 0 0 0 1px rgba(255, 255, 255, 0.35);
-}
-
-.brush-preview-soft-body {
+.brush-preview-fill {
   position: absolute;
-  inset: 3px;
+  inset: 0;
+  pointer-events: none;
   border-radius: inherit;
-  opacity: 0.82;
-  pointer-events: none;
-}
-
-.brush-preview-soft-center {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  width: 5px;
-  height: 5px;
-  transform: translate(-50%, -50%);
-  background: var(--accent);
-  border-radius: 1px;
-  box-shadow: 0 0 0 1px #fff, 0 0 0 2px rgba(0, 0, 0, 0.85);
-  z-index: 2;
-  pointer-events: none;
 }
 
 .tagging-modal {
