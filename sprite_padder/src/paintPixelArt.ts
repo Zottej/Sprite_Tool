@@ -444,11 +444,322 @@ export const rematchImageDataToPalette = (
 };
 
 /**
- * Transferencia de tonalidad hacia la referencia:
- * 1) Iguala los histogramas de L/a/b (percentil a percentil) → misma distribución
- *    de luces, sombras y temperatura que la referencia, sin disparar la saturación.
- * 2) Ajusta el resultado al color más parecido de la paleta de la referencia,
- *    para no inventar colores fuera de ella.
+ * Mapa color→color a full: iguala los histogramas de L/a/b (percentil a percentil) para
+ * copiar la distribución de luces, sombras y temperatura de la referencia sin disparar la
+ * saturación, y después ajusta cada color al más parecido de la paleta de la referencia.
+ */
+const referenceColorMapper = (
+  targetData: ImageData,
+  referenceData: ImageData,
+  palette: PaletteLab[],
+): ((r: number, g: number, b: number) => Rgb) => {
+  const srcHist = labHistograms(targetData.data);
+  const refHist = labHistograms(referenceData.data);
+  const canMatch = srcHist.count >= 16 && refHist.count >= 16;
+  const lutL = canMatch ? matchHistogramLut(srcHist.L, refHist.L, LAB_RANGES.L) : null;
+  const lutA = canMatch ? matchHistogramLut(srcHist.a, refHist.a, LAB_RANGES.a) : null;
+  const lutB = canMatch ? matchHistogramLut(srcHist.b, refHist.b, LAB_RANGES.b) : null;
+  const cache = new Map<string, Rgb>();
+
+  return (r, g, b) => {
+    const key = `${r},${g},${b}`;
+    const hit = cache.get(key);
+    if (hit) return hit;
+    const lab = rgbToLab(r, g, b);
+    const matched: Lab = lutL && lutA && lutB
+      ? {
+          L: lutL[binOf(lab.L, LAB_RANGES.L)],
+          a: lutA[binOf(lab.a, LAB_RANGES.a)],
+          b: lutB[binOf(lab.b, LAB_RANGES.b)],
+        }
+      : lab;
+    const mapped = matchPaletteByTone(matched, palette).rgb;
+    cache.set(key, mapped);
+    return mapped;
+  };
+};
+
+/** Reparto de celdas de arte sobre el lienzo, con todos los índices en positivo. */
+type CellLayout = {
+  cellW: number;
+  cellH: number;
+  originX: number;
+  originY: number;
+  cols: number;
+  rows: number;
+};
+
+const cellLayoutOf = (width: number, height: number, grid: DetectedPixelGrid): CellLayout => {
+  const originX = grid.offsetX - Math.ceil(grid.offsetX / grid.cellW) * grid.cellW;
+  const originY = grid.offsetY - Math.ceil(grid.offsetY / grid.cellH) * grid.cellH;
+  return {
+    cellW: grid.cellW,
+    cellH: grid.cellH,
+    originX,
+    originY,
+    cols: Math.max(1, Math.ceil((width - originX) / grid.cellW)),
+    rows: Math.max(1, Math.ceil((height - originY) / grid.cellH)),
+  };
+};
+
+/**
+ * Diferencia media entre cada línea y la anterior. Los picos marcan dónde cambia el color,
+ * o sea dónde caen los bordes entre píxeles de arte.
+ */
+const lineDeltas = (image: ImageData, axis: 'x' | 'y'): Float64Array => {
+  const { data, width, height } = image;
+  const n = axis === 'x' ? width : height;
+  const across = axis === 'x' ? height : width;
+  const deltas = new Float64Array(n);
+  for (let i = 1; i < n; i++) {
+    let sum = 0;
+    let count = 0;
+    for (let j = 0; j < across; j++) {
+      const a = axis === 'x' ? (j * width + i) * 4 : (i * width + j) * 4;
+      const b = axis === 'x' ? (j * width + i - 1) * 4 : ((i - 1) * width + j) * 4;
+      if (data[a + 3] < 8 || data[b + 3] < 8) continue;
+      sum +=
+        (Math.abs(data[a] - data[b]) +
+          Math.abs(data[a + 1] - data[b + 1]) +
+          Math.abs(data[a + 2] - data[b + 2])) /
+        3;
+      count += 1;
+    }
+    deltas[i] = count > 0 ? sum / count : 0;
+  }
+  return deltas;
+};
+
+/**
+ * El detector de grilla tolera hasta un píxel y medio de holgura en la fase, que para pintar
+ * alcanza pero acá no: con celdas fraccionarias, medio píxel de corrimiento mete una línea
+ * del píxel de arte vecino dentro de la celda y ensucia su color base. Se prueba la fase
+ * fina que deje los saltos de color justo sobre los bordes de celda.
+ */
+const refineCellPhase = (deltas: Float64Array, size: number, offset: number): number => {
+  const n = deltas.length;
+  if (n < 4 || size < 2) return offset;
+  let bestPhase = offset;
+  let bestScore = -Infinity;
+  for (let step = 0; step < 40; step++) {
+    const phase = (step / 40) * size;
+    let edgeSum = 0;
+    let edgeCount = 0;
+    let innerSum = 0;
+    let innerCount = 0;
+    for (let i = 1; i < n; i++) {
+      const isEdge =
+        Math.floor((i - phase) / size) > Math.floor((i - 1 - phase) / size);
+      if (isEdge) {
+        edgeSum += deltas[i];
+        edgeCount += 1;
+      } else {
+        innerSum += deltas[i];
+        innerCount += 1;
+      }
+    }
+    if (edgeCount === 0 || innerCount === 0) continue;
+    const score = edgeSum / edgeCount - innerSum / innerCount;
+    if (score > bestScore) {
+      bestScore = score;
+      bestPhase = phase;
+    }
+  }
+  return bestPhase;
+};
+
+const alignedGrid = (image: ImageData, grid: DetectedPixelGrid): DetectedPixelGrid => ({
+  ...grid,
+  offsetX: refineCellPhase(lineDeltas(image, 'x'), grid.cellW, grid.offsetX),
+  offsetY: refineCellPhase(lineDeltas(image, 'y'), grid.cellH, grid.offsetY),
+});
+
+const cellIndexAt = (layout: CellLayout, x: number, y: number): number => {
+  const ix = Math.floor((x - layout.originX) / layout.cellW);
+  const iy = Math.floor((y - layout.originY) / layout.cellH);
+  if (ix < 0 || iy < 0 || ix >= layout.cols || iy >= layout.rows) return -1;
+  return iy * layout.cols + ix;
+};
+
+/**
+ * Color base de cada celda de arte y cuánta "suciedad" tiene dentro (desviación media
+ * respecto de ese color base). Es lo que distingue un píxel de arte plano de uno granulado.
+ */
+type CellField = {
+  layout: CellLayout;
+  base: Float64Array;
+  count: Uint32Array;
+  /** Píxeles que abarca la celda, opacos o no. Con celdas fraccionarias no es constante. */
+  total: Uint32Array;
+  dirt: Float64Array;
+};
+
+const cellFieldOf = (image: ImageData, layout: CellLayout): CellField => {
+  const { data, width, height } = image;
+  const cells = layout.cols * layout.rows;
+  const base = new Float64Array(cells * 3);
+  const count = new Uint32Array(cells);
+  const total = new Uint32Array(cells);
+  const dirt = new Float64Array(cells);
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4;
+      const cell = cellIndexAt(layout, x, y);
+      if (cell >= 0) total[cell] += 1;
+      if (data[i + 3] < 8) continue;
+      const c = cell;
+      if (c < 0) continue;
+      base[c * 3] += data[i];
+      base[c * 3 + 1] += data[i + 1];
+      base[c * 3 + 2] += data[i + 2];
+      count[c] += 1;
+    }
+  }
+  for (let c = 0; c < cells; c++) {
+    if (count[c] === 0) continue;
+    base[c * 3] /= count[c];
+    base[c * 3 + 1] /= count[c];
+    base[c * 3 + 2] /= count[c];
+  }
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4;
+      if (data[i + 3] < 8) continue;
+      const c = cellIndexAt(layout, x, y);
+      if (c < 0) continue;
+      dirt[c] +=
+        (Math.abs(data[i] - base[c * 3]) +
+          Math.abs(data[i + 1] - base[c * 3 + 1]) +
+          Math.abs(data[i + 2] - base[c * 3 + 2])) /
+        3;
+    }
+  }
+  for (let c = 0; c < cells; c++) if (count[c] > 0) dirt[c] /= count[c];
+
+  return { layout, base, count, total, dirt };
+};
+
+/**
+ * Todos los colores distintos, sin recortar. `extractTonePaletteFromImageData` reparte un
+ * cupo por banda de luminancia, y en el mapa de celdas eso descarta colores base que sí
+ * existen: la celda terminaba saltando a un tono aproximado.
+ */
+const everyColorOf = (data: Uint8ClampedArray, limit: number): PaletteLab[] | null => {
+  const counts = new Map<string, { rgb: Rgb; count: number }>();
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] < 8) continue;
+    const hex = rgbToHex(data[i], data[i + 1], data[i + 2]);
+    const prev = counts.get(hex);
+    if (prev) prev.count += 1;
+    else {
+      if (counts.size >= limit) return null;
+      counts.set(hex, { rgb: { r: data[i], g: data[i + 1], b: data[i + 2] }, count: 1 });
+    }
+  }
+  return [...counts.entries()].map(([hex, v]) => ({
+    hex,
+    rgb: v.rgb,
+    lab: rgbToLab(v.rgb.r, v.rgb.g, v.rgb.b),
+    count: v.count,
+  }));
+};
+
+/** Imagen chica donde cada píxel es una celda de arte: la paleta real, sin el grano. */
+const cellImageOf = (field: CellField): ImageData => {
+  const { cols, rows } = field.layout;
+  const out = new ImageData(cols, rows);
+  for (let c = 0; c < cols * rows; c++) {
+    const o = c * 4;
+    if (field.count[c] === 0) continue;
+    out.data[o] = Math.round(field.base[c * 3]);
+    out.data[o + 1] = Math.round(field.base[c * 3 + 1]);
+    out.data[o + 2] = Math.round(field.base[c * 3 + 2]);
+    out.data[o + 3] = 255;
+  }
+  return out;
+};
+
+/**
+ * La suciedad no es pareja: en estos dibujos las sombras vienen más granuladas que las
+ * luces. Por eso se guarda la distribución de suciedad separada por banda de luminancia,
+ * y no un único promedio.
+ */
+const DIRT_BANDS = 5;
+const DIRT_BAND_SPAN = 100 / DIRT_BANDS;
+
+/**
+ * Una celda a medio cubrir cae sobre el borde de la silueta: lo que parece suciedad ahí es
+ * en realidad el contorno, no el grano. No sirve para medir ni conviene retocarla.
+ */
+const isFullCell = (field: CellField, c: number): boolean =>
+  field.total[c] >= field.layout.cellW * field.layout.cellH * 0.5 &&
+  field.count[c] >= field.total[c] * 0.9;
+
+const dirtProfileOf = (field: CellField): Float64Array[] => {
+  const buckets: number[][] = Array.from({ length: DIRT_BANDS }, () => []);
+  const pooled: number[] = [];
+  for (let c = 0; c < field.count.length; c++) {
+    if (!isFullCell(field, c)) continue;
+    const lab = rgbToLab(field.base[c * 3], field.base[c * 3 + 1], field.base[c * 3 + 2]);
+    const bi = Math.max(0, Math.min(DIRT_BANDS - 1, Math.floor(lab.L / DIRT_BAND_SPAN)));
+    buckets[bi].push(field.dirt[c]);
+    pooled.push(field.dirt[c]);
+  }
+  pooled.sort((a, b) => a - b);
+  const fallback = Float64Array.from(pooled);
+  return buckets.map((b) => (b.length >= 8 ? Float64Array.from(b.sort((x, y) => x - y)) : fallback));
+};
+
+/** Bandas vecinas y mezcla entre ellas, para que no se note el salto de una banda a otra. */
+const dirtBandMix = (L: number) => {
+  const raw = L / DIRT_BAND_SPAN - 0.5;
+  const base = Math.floor(raw);
+  if (base < 0) return { lo: 0, hi: 0, t: 0 };
+  if (base + 1 > DIRT_BANDS - 1) return { lo: DIRT_BANDS - 1, hi: DIRT_BANDS - 1, t: 0 };
+  return { lo: base, hi: base + 1, t: raw - base };
+};
+
+const quantileAt = (sorted: Float64Array, p: number): number => {
+  if (sorted.length === 0) return 0;
+  if (sorted.length === 1) return sorted[0];
+  const idx = Math.max(0, Math.min(1, p)) * (sorted.length - 1);
+  const i0 = Math.floor(idx);
+  const i1 = Math.min(sorted.length - 1, i0 + 1);
+  return sorted[i0] + (sorted[i1] - sorted[i0]) * (idx - i0);
+};
+
+type DirtBandMix = { lo: number; hi: number; t: number };
+
+/** Suciedad esperada en la posición p de la distribución mezclada entre dos bandas. */
+const mixedQuantile = (bands: Float64Array[], mix: DirtBandMix, p: number): number =>
+  quantileAt(bands[mix.lo], p) * (1 - mix.t) + quantileAt(bands[mix.hi], p) * mix.t;
+
+/**
+ * Posición (0..1) que ocupa un valor dentro de esa misma distribución mezclada. Se invierte
+ * por bisección en vez de mezclar posiciones de cada banda por separado: mezclar posiciones
+ * daría distinto según qué banda se mire, y entonces igualar una imagen consigo misma ya no
+ * dejaría el grano intacto.
+ */
+const mixedRank = (bands: Float64Array[], mix: DirtBandMix, value: number): number => {
+  let lo = 0;
+  let hi = 1;
+  for (let i = 0; i < 20; i++) {
+    const mid = (lo + hi) / 2;
+    if (mixedQuantile(bands, mix, mid) < value) lo = mid;
+    else hi = mid;
+  }
+  return (lo + hi) / 2;
+};
+
+/**
+ * Transferencia de tonalidad hacia la referencia.
+ *
+ * Cuando el dibujo es pixel art escalado, cada píxel de arte es un bloque con su propio
+ * grano. Mapear el lienzo píxel por píxel rompe ese grano: parte del bloque salta a un
+ * color de la paleta y parte a otro. Por eso el tono se decide sobre el color base de cada
+ * celda (promedio del bloque) y después se le vuelve a poner su grano original, con la
+ * fuerza que tiene el grano de la referencia en ese mismo tono.
  */
 export const transferImageColorsToReferenceData = (
   targetData: ImageData,
@@ -458,49 +769,115 @@ export const transferImageColorsToReferenceData = (
   const t = Math.max(0, Math.min(1, intensityPct / 100));
   if (t <= 0) return targetData;
 
-  const palette = extractTonePaletteFromImageData(referenceData.data, 160);
-  if (palette.length === 0) return targetData;
-
-  const srcHist = labHistograms(targetData.data);
-  const refHist = labHistograms(referenceData.data);
-  const canMatch = srcHist.count >= 16 && refHist.count >= 16;
-  const lutL = canMatch ? matchHistogramLut(srcHist.L, refHist.L, LAB_RANGES.L) : null;
-  const lutA = canMatch ? matchHistogramLut(srcHist.a, refHist.a, LAB_RANGES.a) : null;
-  const lutB = canMatch ? matchHistogramLut(srcHist.b, refHist.b, LAB_RANGES.b) : null;
-
   const out = new ImageData(
     new Uint8ClampedArray(targetData.data),
     targetData.width,
     targetData.height,
   );
   const data = out.data;
-  const cache = new Map<string, Rgb>();
 
+  const blend = (i: number, r: number, g: number, b: number) => {
+    if (t >= 0.999) {
+      data[i] = r;
+      data[i + 1] = g;
+      data[i + 2] = b;
+      return;
+    }
+    data[i] = Math.round(data[i] + (r - data[i]) * t);
+    data[i + 1] = Math.round(data[i + 1] + (g - data[i + 1]) * t);
+    data[i + 2] = Math.round(data[i + 2] + (b - data[i + 2]) * t);
+  };
+
+  const targetGrid = detectPixelGrid(targetData);
+  const referenceGrid = detectPixelGrid(referenceData);
+  const blocky =
+    targetGrid && referenceGrid && targetGrid.cellW >= 2.5 && targetGrid.cellH >= 2.5;
+
+  if (blocky) {
+    const targetCellGrid = alignedGrid(targetData, targetGrid);
+    const refCellGrid = alignedGrid(referenceData, referenceGrid);
+    const targetField = cellFieldOf(targetData, cellLayoutOf(targetData.width, targetData.height, targetCellGrid));
+    const refField = cellFieldOf(referenceData, cellLayoutOf(referenceData.width, referenceData.height, refCellGrid));
+    const targetCells = cellImageOf(targetField);
+    const refCells = cellImageOf(refField);
+    // La imagen de celdas es chica, así que entra entera como paleta.
+    const cellPalette =
+      everyColorOf(refCells.data, 8192) ?? extractTonePaletteFromImageData(refCells.data, 512);
+
+    if (cellPalette.length > 0) {
+      const mapCell = referenceColorMapper(targetCells, refCells, cellPalette);
+      const srcDirt = dirtProfileOf(targetField);
+      const refDirt = dirtProfileOf(refField);
+      const layout = targetField.layout;
+
+      /**
+       * Cuánto hay que subir o bajar el grano de una celda: se busca qué tan sucia es
+       * respecto de las demás celdas de su mismo tono en el original, y se le da la
+       * suciedad que tiene una celda igual de sucia, del tono nuevo, en la referencia.
+       * Así se conserva la distribución del grano dentro de la celda y también qué celdas
+       * son las granuladas, pero el nivel pasa a ser el de la referencia.
+       */
+      const dirtScaleFor = (dirt: number, srcL: number, refL: number): number => {
+        if (dirt < 0.35) return 1;
+        const p = mixedRank(srcDirt, dirtBandMix(srcL), dirt);
+        const wanted = mixedQuantile(refDirt, dirtBandMix(refL), p);
+        return Math.max(0.3, Math.min(3, wanted / dirt));
+      };
+
+      const scaleCache = new Map<number, number>();
+      const cellScale = (c: number, mapped: Rgb): number => {
+        const hit = scaleCache.get(c);
+        if (hit !== undefined) return hit;
+        if (!isFullCell(targetField, c)) {
+          scaleCache.set(c, 1);
+          return 1;
+        }
+        const srcL = rgbToLab(
+          targetField.base[c * 3],
+          targetField.base[c * 3 + 1],
+          targetField.base[c * 3 + 2],
+        ).L;
+        const refL = rgbToLab(mapped.r, mapped.g, mapped.b).L;
+        const scale = dirtScaleFor(targetField.dirt[c], srcL, refL);
+        scaleCache.set(c, scale);
+        return scale;
+      };
+      const clamp255 = (v: number) => (v < 0 ? 0 : v > 255 ? 255 : Math.round(v));
+
+      for (let y = 0; y < targetData.height; y++) {
+        for (let x = 0; x < targetData.width; x++) {
+          const i = (y * targetData.width + x) * 4;
+          if (data[i + 3] < 8) continue;
+          const c = cellIndexAt(layout, x, y);
+          if (c < 0 || targetField.count[c] === 0) continue;
+          const mapped = mapCell(
+            Math.round(targetField.base[c * 3]),
+            Math.round(targetField.base[c * 3 + 1]),
+            Math.round(targetField.base[c * 3 + 2]),
+          );
+          const scale = cellScale(c, mapped);
+          // El color base ya es de la paleta de la referencia; el grano va libre encima,
+          // igual que en la referencia. Engancharlo también a la paleta lo deformaba.
+          blend(
+            i,
+            clamp255(mapped.r + (data[i] - targetField.base[c * 3]) * scale),
+            clamp255(mapped.g + (data[i + 1] - targetField.base[c * 3 + 1]) * scale),
+            clamp255(mapped.b + (data[i + 2] - targetField.base[c * 3 + 2]) * scale),
+          );
+        }
+      }
+      return out;
+    }
+  }
+
+  const palette = extractTonePaletteFromImageData(referenceData.data, 160);
+  if (palette.length === 0) return out;
+
+  const mapPixel = referenceColorMapper(targetData, referenceData, palette);
   for (let i = 0; i < data.length; i += 4) {
     if (data[i + 3] < 8) continue;
-    const key = `${data[i]},${data[i + 1]},${data[i + 2]}`;
-    let mapped = cache.get(key);
-    if (!mapped) {
-      const lab = rgbToLab(data[i], data[i + 1], data[i + 2]);
-      const matched: Lab = lutL && lutA && lutB
-        ? {
-            L: lutL[binOf(lab.L, LAB_RANGES.L)],
-            a: lutA[binOf(lab.a, LAB_RANGES.a)],
-            b: lutB[binOf(lab.b, LAB_RANGES.b)],
-          }
-        : lab;
-      mapped = matchPaletteByTone(matched, palette).rgb;
-      cache.set(key, mapped);
-    }
-    if (t >= 0.999) {
-      data[i] = mapped.r;
-      data[i + 1] = mapped.g;
-      data[i + 2] = mapped.b;
-    } else {
-      data[i] = Math.round(data[i] + (mapped.r - data[i]) * t);
-      data[i + 1] = Math.round(data[i + 1] + (mapped.g - data[i + 1]) * t);
-      data[i + 2] = Math.round(data[i + 2] + (mapped.b - data[i + 2]) * t);
-    }
+    const mapped = mapPixel(data[i], data[i + 1], data[i + 2]);
+    blend(i, mapped.r, mapped.g, mapped.b);
   }
   return out;
 };

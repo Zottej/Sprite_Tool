@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { 
   Trash2, Plus, Archive, CheckSquare, Square, 
   Target, FolderSync, Save, AlertTriangle, Eraser, RotateCcw, Search, MapPin, Pencil, MoreHorizontal, FlipHorizontal, FlipVertical, Droplets, Grid, Circle, Maximize, Layers, Play, Pause, Film, PaintBucket, Scissors, Type, Crop, Brush, ChevronLeft, ChevronRight,
-  ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Pipette, Stamp, Lock, Columns2, FolderOpen, Rows3, Hash, ChevronDown, Maximize2, X
+  ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Pipette, Stamp, Lock, Columns2, FolderOpen, Rows3, Hash, ChevronDown, Maximize2, X, ShieldOff
 } from 'lucide-react';
 import JSZip from 'jszip';
 import { canvasToBc7Dds, spriteNameToDds } from './ddsExport';
@@ -405,6 +405,7 @@ const useModalWheelControls = (opts: {
   setBrushSize?: (value: number) => void;
   brushMin?: number;
   brushMax?: number;
+  brushStep?: number;
   enabled?: boolean;
   /** Contenedor con overflow:auto cuyo contenido escala con zoom. */
   workspaceRef?: React.RefObject<HTMLElement | null>;
@@ -415,7 +416,7 @@ const useModalWheelControls = (opts: {
     zoom, setZoom,
     zoomMin = 0.5, zoomMax = 8, zoomStep = 0.1,
     brushSize, setBrushSize,
-    brushMin = 1, brushMax = 100,
+    brushMin = 1, brushMax = 100, brushStep = 1,
     enabled = true,
     workspaceRef,
     contentRef,
@@ -453,7 +454,9 @@ const useModalWheelControls = (opts: {
 
       if (e.altKey && setBrushSize) {
         const cur = brushRef.current ?? brushMin;
-        setBrushSize(Math.min(brushMax, Math.max(brushMin, cur + dir)));
+        const raw = cur + dir * brushStep;
+        const next = brushStep < 1 ? Math.round(raw * 2) / 2 : Math.round(raw);
+        setBrushSize(Math.min(brushMax, Math.max(brushMin, next)));
         return;
       }
 
@@ -484,7 +487,7 @@ const useModalWheelControls = (opts: {
     return () => window.removeEventListener('wheel', onWheel, { capture: true });
   }, [
     enabled, setZoom, zoomMin, zoomMax, zoomStep,
-    setBrushSize, brushMin, brushMax, workspaceRef, contentRef,
+    setBrushSize, brushMin, brushMax, brushStep, workspaceRef, contentRef,
   ]);
 
   useLayoutEffect(() => {
@@ -3787,6 +3790,113 @@ const autoAlignSpriteToFixedBottom = (moving: SpriteData, fixed: SpriteData): Sp
   return nudgeSpriteContent(moving, fixedPt.x - movingPt.x, fixedPt.y - movingPt.y);
 };
 
+/** Zona del overlay que Igualar paleta no debe tocar. Coordenadas del lienzo Full. */
+type PaletteProtectZone = {
+  id: string;
+  kind: 'circle' | 'square';
+  cx: number;
+  cy: number;
+  r: number;
+};
+
+const overlayPointInProtectZone = (x: number, y: number, zone: PaletteProtectZone, pad = 0) => {
+  const reach = zone.r + pad;
+  if (zone.kind === 'circle') {
+    const dx = x - zone.cx;
+    const dy = y - zone.cy;
+    return dx * dx + dy * dy <= reach * reach;
+  }
+  return Math.abs(x - zone.cx) <= reach && Math.abs(y - zone.cy) <= reach;
+};
+
+const protectZoneAtPoint = (zones: PaletteProtectZone[], x: number, y: number) => {
+  for (let i = zones.length - 1; i >= 0; i--) {
+    if (overlayPointInProtectZone(x, y, zones[i], 3)) return zones[i];
+  }
+  return null;
+};
+
+/** Píxel del PNG → coordenada del overlay (mismo transform que al dibujar el sprite). */
+const imagePixelToOverlayPoint = (
+  sprite: SpriteData,
+  ix: number,
+  iy: number,
+  fx: number,
+  fy: number,
+) => {
+  const scale = sprite.scale || 1;
+  const stretchX = sprite.stretchX || 1;
+  const stretchY = sprite.stretchY || 1;
+  const sw = sprite.img.width * scale * stretchX;
+  const sh = sprite.img.height * scale * stretchY;
+  const ox = sprite.offsetX || 0;
+  const oy = sprite.offsetY || 0;
+  const rot = ((sprite.rotation || 0) * Math.PI) / 180;
+  let lx = ((ix + fx) / sprite.img.width) * sw - sw / 2;
+  let ly = ((iy + fy) / sprite.img.height) * sh - sh / 2;
+  lx *= sprite.flipH ? -1 : 1;
+  ly *= sprite.flipV ? -1 : 1;
+  const cos = Math.cos(rot);
+  const sin = Math.sin(rot);
+  return {
+    x: lx * cos - ly * sin + sprite.padding.left + sw / 2 + ox,
+    y: lx * sin + ly * cos + sprite.padding.top + sh / 2 + oy,
+  };
+};
+
+const restorePixelsInProtectZones = (
+  original: HTMLImageElement,
+  transferred: HTMLImageElement,
+  sprite: SpriteData,
+  zones: PaletteProtectZone[],
+): Promise<HTMLImageElement> => {
+  if (zones.length === 0) return Promise.resolve(transferred);
+  const w = original.naturalWidth || original.width;
+  const h = original.naturalHeight || original.height;
+  const srcCanvas = document.createElement('canvas');
+  srcCanvas.width = w;
+  srcCanvas.height = h;
+  const srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true })!;
+  srcCtx.drawImage(original, 0, 0);
+  const dstCanvas = document.createElement('canvas');
+  dstCanvas.width = transferred.naturalWidth || transferred.width;
+  dstCanvas.height = transferred.naturalHeight || transferred.height;
+  const dstCtx = dstCanvas.getContext('2d', { willReadFrequently: true })!;
+  dstCtx.drawImage(transferred, 0, 0);
+  if (dstCanvas.width !== w || dstCanvas.height !== h) return Promise.resolve(transferred);
+
+  const src = srcCtx.getImageData(0, 0, w, h);
+  const dst = dstCtx.getImageData(0, 0, w, h);
+  const samples: Array<[number, number]> = [
+    [0.5, 0.5],
+    [0.08, 0.08],
+    [0.92, 0.08],
+    [0.08, 0.92],
+    [0.92, 0.92],
+  ];
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const hit = samples.some(([fx, fy]) => {
+        const p = imagePixelToOverlayPoint(sprite, x, y, fx, fy);
+        return zones.some((z) => overlayPointInProtectZone(p.x, p.y, z));
+      });
+      if (!hit) continue;
+      const i = (y * w + x) * 4;
+      dst.data[i] = src.data[i];
+      dst.data[i + 1] = src.data[i + 1];
+      dst.data[i + 2] = src.data[i + 2];
+      dst.data[i + 3] = src.data[i + 3];
+    }
+  }
+  dstCtx.putImageData(dst, 0, 0);
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('No se pudo reponer las zonas protegidas.'));
+    img.src = dstCanvas.toDataURL('image/png');
+  });
+};
+
 const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, onChangeSprite, onClose, isWhiteBg }) => {
   const others = sprites.filter((s) => s.id !== sprite.id);
   const [sourceId, setSourceId] = useState<string | null>(() => {
@@ -3796,15 +3906,21 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
     return remembered?.id ?? null;
   });
   const source = others.find((s) => s.id === sourceId) || null;
-  const prefs = loadPref<{ zoom?: number; opacity?: number; targetOpacity?: number; editSource?: boolean; paletteForce?: number }>(GHOST_COMPARE_PREFS_KEY, {});
+  const prefs = loadPref<{ zoom?: number; opacity?: number; targetOpacity?: number; editSource?: boolean; paletteForce?: number; protectShape?: 'circle' | 'square' }>(GHOST_COMPARE_PREFS_KEY, {});
   const [zoom, setZoom] = useState(() => clampNum(prefs.zoom, 0.5, 8, 1));
   const [opacity, setOpacity] = useState(() => Math.round(clampNum(prefs.opacity, 5, 100, 40)));
   const [targetOpacity, setTargetOpacity] = useState(() => Math.round(clampNum(prefs.targetOpacity, 5, 100, 100)));
   const [editSource, setEditSource] = useState(() => prefs.editSource === true);
   const [paletteForce, setPaletteForce] = useState(() => Math.round(clampNum(prefs.paletteForce, 5, 100, 100)));
   const [paletteBusy, setPaletteBusy] = useState(false);
+  const [protectMode, setProtectMode] = useState(false);
+  const [protectShape, setProtectShape] = useState<'circle' | 'square'>(() => (prefs.protectShape === 'square' ? 'square' : 'circle'));
+  const [protectZones, setProtectZones] = useState<PaletteProtectZone[]>([]);
+  const [protectDraft, setProtectDraft] = useState<PaletteProtectZone | null>(null);
+  const [overlayPx, setOverlayPx] = useState({ w: 1, h: 1 });
   const [nudgeStep, setNudgeStep] = useState(() => Math.round(clampNum(loadPref('joa-content-nudge-step', 1), 1, 512, 1)));
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const protectDragRef = useRef<{ id: string; cx: number; cy: number } | null>(null);
   const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-ghost-compare-scroll', sprite.name);
   useModalWheelControls({ zoom, setZoom, workspaceRef });
 
@@ -3813,8 +3929,14 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
   }, [source]);
 
   useEffect(() => {
-    savePref(GHOST_COMPARE_PREFS_KEY, { zoom, opacity, targetOpacity, editSource, paletteForce });
-  }, [zoom, opacity, targetOpacity, editSource, paletteForce]);
+    setProtectZones([]);
+    setProtectDraft(null);
+    protectDragRef.current = null;
+  }, [sourceId]);
+
+  useEffect(() => {
+    savePref(GHOST_COMPARE_PREFS_KEY, { zoom, opacity, targetOpacity, editSource, paletteForce, protectShape });
+  }, [zoom, opacity, targetOpacity, editSource, paletteForce, protectShape]);
 
   useEffect(() => {
     savePref('joa-content-nudge-step', nudgeStep);
@@ -3836,6 +3958,7 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
     ctx.drawImage(bg, 0, 0);
     ctx.globalAlpha = targetOpacity / 100;
     ctx.drawImage(fg, 0, 0);
+    setOverlayPx({ w, h });
   }, [sprite, source, opacity, targetOpacity]);
 
   const spriteRef = useRef(sprite);
@@ -3847,11 +3970,33 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
   const onChangeRef = useRef(onChangeSprite);
   onChangeRef.current = onChangeSprite;
 
+  const protectModeRef = useRef(protectMode);
+  protectModeRef.current = protectMode;
+  const protectDraftRef = useRef(protectDraft);
+  protectDraftRef.current = protectDraft;
+
   useEffect(() => {
     if (!source) return;
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
       if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+      if (protectModeRef.current) {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          if (protectDraftRef.current || protectDragRef.current) {
+            protectDragRef.current = null;
+            setProtectDraft(null);
+          } else {
+            setProtectMode(false);
+          }
+          return;
+        }
+        if (e.key === 'Backspace' || e.key === 'Delete') {
+          e.preventDefault();
+          setProtectZones((prev) => prev.slice(0, -1));
+          return;
+        }
+      }
       const step = e.shiftKey ? Math.max(1, nudgeStep * 5) : nudgeStep;
       let dx = 0;
       let dy = 0;
@@ -3934,10 +4079,13 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
     setPaletteBusy(true);
     try {
       const newImg = await transferImageColorsToReference(target.img, reference.img, paletteForce);
+      const protectedImg = protectZones.length > 0
+        ? await restorePixelsInProtectZones(target.img, newImg, target, protectZones)
+        : newImg;
       onChangeSprite({
         ...target,
-        img: newImg,
-        originalImg: target.originalImg === target.img ? newImg : target.originalImg,
+        img: protectedImg,
+        originalImg: target.originalImg === target.img ? protectedImg : target.originalImg,
       });
     } catch (err) {
       console.error(err);
@@ -3946,6 +4094,68 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
       setPaletteBusy(false);
     }
   };
+
+  const overlayPointFromEvent = (e: React.PointerEvent<SVGSVGElement>) => {
+    const svg = e.currentTarget;
+    const rect = svg.getBoundingClientRect();
+    return {
+      x: ((e.clientX - rect.left) / Math.max(1, rect.width)) * overlayPx.w,
+      y: ((e.clientY - rect.top) / Math.max(1, rect.height)) * overlayPx.h,
+    };
+  };
+
+  const radiusFromDrag = (kind: 'circle' | 'square', cx: number, cy: number, x: number, y: number) => {
+    const dx = x - cx;
+    const dy = y - cy;
+    if (kind === 'circle') return Math.hypot(dx, dy);
+    return Math.max(Math.abs(dx), Math.abs(dy));
+  };
+
+  const onProtectPointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (!protectMode || e.button !== 0) return;
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const p = overlayPointFromEvent(e);
+    const hit = protectZoneAtPoint(protectZones, p.x, p.y);
+    if (hit) {
+      setProtectZones((prev) => prev.filter((z) => z.id !== hit.id));
+      protectDragRef.current = null;
+      setProtectDraft(null);
+      return;
+    }
+    const id = generateId();
+    protectDragRef.current = { id, cx: p.x, cy: p.y };
+    setProtectDraft({ id, kind: protectShape, cx: p.x, cy: p.y, r: 0 });
+  };
+
+  const onProtectPointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const drag = protectDragRef.current;
+    if (!drag) return;
+    const p = overlayPointFromEvent(e);
+    setProtectDraft({
+      id: drag.id,
+      kind: protectShape,
+      cx: drag.cx,
+      cy: drag.cy,
+      r: radiusFromDrag(protectShape, drag.cx, drag.cy, p.x, p.y),
+    });
+  };
+
+  const onProtectPointerUp = (e: React.PointerEvent<SVGSVGElement>) => {
+    const drag = protectDragRef.current;
+    protectDragRef.current = null;
+    if (!drag) {
+      setProtectDraft(null);
+      return;
+    }
+    const p = overlayPointFromEvent(e);
+    const r = radiusFromDrag(protectShape, drag.cx, drag.cy, p.x, p.y);
+    setProtectDraft(null);
+    if (r < 3) return;
+    setProtectZones((prev) => [...prev, { id: drag.id, kind: protectShape, cx: drag.cx, cy: drag.cy, r }]);
+  };
+
+  const visibleProtectZones = protectDraft ? [...protectZones, protectDraft] : protectZones;
 
   const nudgeBtn = (dx: number, dy: number, title: string, icon: React.ReactNode) => (
     <button
@@ -4001,7 +4211,44 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
                 display: 'block',
               }}
             />
+            {(protectMode || visibleProtectZones.length > 0) && (
+              <svg
+                className={`palette-protect-overlay${protectMode ? ' is-draw' : ''}`}
+                viewBox={`0 0 ${overlayPx.w} ${overlayPx.h}`}
+                preserveAspectRatio="none"
+                onPointerDown={onProtectPointerDown}
+                onPointerMove={onProtectPointerMove}
+                onPointerUp={onProtectPointerUp}
+                onPointerCancel={onProtectPointerUp}
+              >
+                {visibleProtectZones.map((zone) => (
+                  zone.kind === 'circle' ? (
+                    <circle
+                      key={zone.id}
+                      className={`palette-protect-zone${protectDraft?.id === zone.id ? ' is-draft' : ''}`}
+                      cx={zone.cx}
+                      cy={zone.cy}
+                      r={Math.max(0.5, zone.r)}
+                    />
+                  ) : (
+                    <rect
+                      key={zone.id}
+                      className={`palette-protect-zone${protectDraft?.id === zone.id ? ' is-draft' : ''}`}
+                      x={zone.cx - zone.r}
+                      y={zone.cy - zone.r}
+                      width={Math.max(1, zone.r * 2)}
+                      height={Math.max(1, zone.r * 2)}
+                    />
+                  )
+                ))}
+              </svg>
+            )}
           </div>
+          {protectMode && (
+            <div className="palette-protect-hint">
+              Arrastrá un círculo o un cuadrado sobre lo que Igualar paleta no tiene que tocar. Clic en una marca para quitarla.
+            </div>
+          )}
         </div>
         <div className="modal-footer" style={{ padding: '16px 20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '16px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
           <label
@@ -4116,13 +4363,60 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
                 title="Qué tan fuerte se acerca cada color a la paleta de referencia (100% = snap exacto)"
               />
             </div>
+            <div className="palette-protect-tools">
+              <button
+                type="button"
+                className="btn btn-outline"
+                style={{
+                  borderColor: protectMode ? 'var(--accent)' : undefined,
+                  color: protectMode ? 'var(--accent)' : undefined,
+                  background: protectMode ? 'rgba(107,102,255,0.12)' : undefined,
+                }}
+                title="Marcá círculos o cuadrados sobre el overlay: esas zonas no se tocan al igualar paleta"
+                onClick={() => setProtectMode((v) => !v)}
+              >
+                <ShieldOff size={14} /> Proteger{protectZones.length > 0 ? ` (${protectZones.length})` : ''}
+              </button>
+              {protectMode && (
+                <>
+                  <button
+                    type="button"
+                    className="btn btn-outline"
+                    style={{ width: '34px', height: '34px', padding: 0, borderColor: protectShape === 'circle' ? 'var(--accent)' : undefined, color: protectShape === 'circle' ? 'var(--accent)' : undefined }}
+                    title="Marca circular"
+                    onClick={() => setProtectShape('circle')}
+                  >
+                    <Circle size={16} fill={protectShape === 'circle' ? 'currentColor' : 'none'} />
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-outline"
+                    style={{ width: '34px', height: '34px', padding: 0, borderColor: protectShape === 'square' ? 'var(--accent)' : undefined, color: protectShape === 'square' ? 'var(--accent)' : undefined }}
+                    title="Marca cuadrada"
+                    onClick={() => setProtectShape('square')}
+                  >
+                    <Square size={16} fill={protectShape === 'square' ? 'currentColor' : 'none'} />
+                  </button>
+                </>
+              )}
+              {protectZones.length > 0 && (
+                <button
+                  type="button"
+                  className="btn btn-outline"
+                  title="Quitar todas las zonas protegidas"
+                  onClick={() => { setProtectZones([]); setProtectDraft(null); protectDragRef.current = null; }}
+                >
+                  <X size={14} /> Limpiar
+                </button>
+              )}
+            </div>
             <button
               type="button"
               className="btn btn-outline"
               disabled={paletteBusy}
               title={editSource
-                ? `Transfiere la tonalidad/paleta de ${sprite.name} hacia la fuente (${source.name}): corrige casts (rojizos, etc.) y encaja en los colores de referencia`
-                : `Transfiere la tonalidad/paleta de la fuente (${source.name}) hacia ${sprite.name}: corrige casts (rojizos, etc.) y encaja en los colores de referencia`}
+                ? `Transfiere la tonalidad/paleta de ${sprite.name} hacia la fuente (${source.name}). Las zonas protegidas (círculos/cuadrados) no se modifican.`
+                : `Transfiere la tonalidad/paleta de la fuente (${source.name}) hacia ${sprite.name}. Las zonas protegidas (círculos/cuadrados) no se modifican.`}
               onClick={() => { void matchPaletteToReference(); }}
             >
               <Droplets size={14} /> {paletteBusy ? 'Igualando…' : 'Igualar paleta'}
@@ -6680,11 +6974,14 @@ const paintGridCellsOnLine = (
 
 const PAINT_PREFS_KEY = 'joa-paint-prefs';
 
+const snapPaintBrushSize = (v: number) =>
+  Math.min(100, Math.max(1, Math.round(clampNum(v, 1, 100, 10) * 2) / 2));
+
 const loadPaintPrefs = (): PaintPrefs => {
   const saved = loadPref<Partial<PaintPrefs>>(PAINT_PREFS_KEY, {});
   return {
     zoom: clampNum(saved.zoom, 0.5, 8, 1),
-    brushSize: Math.round(clampNum(saved.brushSize, 1, 100, 10)),
+    brushSize: snapPaintBrushSize(saved.brushSize ?? 10),
     brushShape: saved.brushShape === 'square' ? 'square' : 'circle',
     paintColor: normalizeHexColor(saved.paintColor, loadLastColor('#ff0000')) || '#ff0000',
     paintOpacity: Math.round(clampNum(saved.paintOpacity, 1, 100, 100)),
@@ -6726,7 +7023,9 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
   const [mousePos, setMousePos] = useState<{ x: number, y: number } | null>(null);
   const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-paint-scroll', sprite.name);
   const paintStageRef = useRef<HTMLDivElement>(null);
-  useModalWheelControls({ zoom, setZoom, brushSize, setBrushSize, workspaceRef, contentRef: paintStageRef });
+  useModalWheelControls({
+    zoom, setZoom, brushSize, setBrushSize, brushStep: 0.5, workspaceRef, contentRef: paintStageRef,
+  });
   const [historyLen, setHistoryLen] = useState(0);
   const lastPos = useRef<{ x: number, y: number } | null>(null);
   /** Historial local del lienzo de este modal (no toca el undo global ni otros sprites). */
@@ -6743,6 +7042,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     canvas.width = sprite.img.width;
     canvas.height = sprite.img.height;
+    ctx.imageSmoothingEnabled = false;
     ctx.drawImage(sprite.img, 0, 0);
     historyRef.current = [];
     setHistoryLen(0);
@@ -6760,7 +7060,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
   }, [zoom, brushSize, brushShape, paintColor, paintOpacity, brushSoftness, brushNoise, previewOpacity, paintBehind, gridLock, showPixelGrid, ditherPattern, ditherColorB, ditherEmpty, paletteLock]);
 
   useEffect(() => {
-    const size = Math.max(1, Math.round(brushSize));
+    const size = Math.max(1, brushSize);
     const current = gridOriginRef.current;
     // La grilla medida automáticamente no depende del pincel: solo se suelta al apagar Grilla.
     if (!gridLock || (current && !current.auto && current.size !== size)) {
@@ -6964,6 +7264,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     const tctx = tip.getContext('2d', { willReadFrequently: true })!;
     tctx.setTransform(1, 0, 0, 1, 0, 0);
     tctx.globalCompositeOperation = 'source-over';
+    tctx.imageSmoothingEnabled = false;
     tctx.clearRect(0, 0, tw, th);
     tctx.save();
     tctx.translate(pad, pad);
@@ -6973,7 +7274,8 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
       const blurred = boxBlurImageData(tctx.getImageData(0, 0, tw, th), blurR);
       tctx.putImageData(blurred, 0, 0);
     }
-    dest.drawImage(tip, Math.floor(destX) - pad, Math.floor(destY) - pad);
+    dest.imageSmoothingEnabled = false;
+    dest.drawImage(tip, Math.round(destX) - pad, Math.round(destY) - pad);
   };
 
   const stampBrush = (
@@ -6984,43 +7286,39 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     styleA: PaintStyle,
     styleB: PaintStyle,
   ) => {
-    // Anclar al píxel: si el centro queda fraccionario, el cuadrado/círculo
-    // cambia de márgenes entre clics en el "mismo" punto.
     const cx = Math.floor(px);
     const cy = Math.floor(py);
     const r = brushSize;
     if (r <= 0) return;
+    // Aunque el radio sea .5, el dab se pinta en píxeles enteros. Si no, fillRect
+    // cae a medio píxel y el trazo se ve sucio/corrido con Sucio y Difuminar en 0.
+    const x0 = Math.floor(cx - r);
+    const y0 = Math.floor(cy - r);
+    const x1 = Math.ceil(cx + r);
+    const y1 = Math.ceil(cy + r);
+    const r2 = r * r;
 
-    const paintHardAt = (target: CanvasRenderingContext2D, ox: number, oy: number, trackPixels: boolean) => {
-      // Cobertura estable de exactamente 2r × 2r (enteros).
-      const x0 = ox - r;
-      const y0 = oy - r;
-      const x1 = ox + r;
-      const y1 = oy + r;
-      const r2 = r * r;
+    const paintHardAt = (target: CanvasRenderingContext2D, originX: number, originY: number, trackPixels: boolean) => {
       for (let y = y0; y < y1; y++) {
         for (let x = x0; x < x1; x++) {
           if (brushShape === 'circle') {
-            const dx = x + 0.5 - ox;
-            const dy = y + 0.5 - oy;
+            const dx = x + 0.5 - cx;
+            const dy = y + 0.5 - cy;
             if (dx * dx + dy * dy > r2) continue;
           }
-          // Coordenada real del lienzo: dither y suciedad no deben moverse con el trazo.
-          const ax = x - ox + cx;
-          const ay = y - oy + cy;
           if (trackPixels && painted) {
-            const pkey = `${ax},${ay}`;
+            const pkey = `${x},${y}`;
             if (painted.has(pkey)) continue;
             painted.add(pkey);
           }
-          if (!applyDitherStyle(target, ax, ay, styleA, styleB)) continue;
-          target.fillRect(x, y, 1, 1);
+          if (!applyDitherStyle(target, x, y, styleA, styleB)) continue;
+          target.fillRect(x - originX, y - originY, 1, 1);
         }
       }
     };
 
     if (brushSoftness <= 0) {
-      paintHardAt(ctx, cx, cy, true);
+      paintHardAt(ctx, 0, 0, true);
       return;
     }
 
@@ -7030,9 +7328,8 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
       painted.add(dabKey);
     }
 
-    const size = r * 2;
-    stampHardThenBlur(ctx, size, size, cx - r, cy - r, (tctx) => {
-      paintHardAt(tctx, r, r, false);
+    stampHardThenBlur(ctx, x1 - x0, y1 - y0, x0, y0, (tctx) => {
+      paintHardAt(tctx, x0, y0, false);
     });
   };
 
@@ -7084,7 +7381,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
 
   const ensureGridOrigin = (px: number, py: number): PaintGridOrigin => {
     if (gridOriginRef.current) return gridOriginRef.current;
-    const size = Math.max(1, Math.round(brushSize));
+    const size = Math.max(1, brushSize);
     const origin: PaintGridOrigin = {
       x: Math.floor(px) - Math.floor(size / 2),
       y: Math.floor(py) - Math.floor(size / 2),
@@ -7147,6 +7444,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     if (!canvas) return;
     
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    ctx.imageSmoothingEnabled = false;
     const rect = canvas.getBoundingClientRect();
     // Coordenada de píxel estable (sin subpíxeles → márgenes del dab no bailan).
     const currX = Math.floor((e.clientX - rect.left) * (canvas.width / Math.max(1, rect.width)));
@@ -7222,6 +7520,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     pushHistory();
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     ctx.globalCompositeOperation = 'source-over';
+    ctx.imageSmoothingEnabled = false;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(sprite.img, 0, 0);
     extractPalette();
@@ -7247,7 +7546,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     if (!gridLock) return null;
     if (gridOrigin) return gridOrigin;
     if (!mousePos) return null;
-    const size = Math.max(1, Math.round(brushSize));
+    const size = Math.max(1, brushSize);
     return {
       x: Math.floor(mousePos.x) - Math.floor(size / 2),
       y: Math.floor(mousePos.y) - Math.floor(size / 2),
@@ -7372,7 +7671,11 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
                const canvas = canvasRef.current!;
                const scale = canvas.offsetWidth / canvas.width;
                const previewBg = ditherPreviewBg();
-               const fillOpacity = Math.max(0, Math.min(1, previewOpacity / 100));
+               const refOpacity = Math.max(0, Math.min(1, previewOpacity / 100));
+               // Todo el marcador (contorno incluido) sigue a la barra, pero el borde
+               // conserva un mínimo visible: sin él se pintaría a ciegas.
+               const outlineOpacity = Math.max(0.18, refOpacity);
+               const fillOpacity = refOpacity / outlineOpacity;
                const blurPx = brushSoftness > 0
                  ? Math.max(0.5, brushBlurRadius(brushSoftness, brushSize) * scale * 0.45)
                  : 0;
@@ -7386,6 +7689,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
                      width: w,
                      height: h,
                      borderRadius: shapeRadius,
+                     opacity: outlineOpacity,
                    }}
                  >
                    <div
@@ -7400,7 +7704,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
                  </div>
                );
                if (gridLock) {
-                 const size = Math.max(1, Math.round(brushSize));
+                 const size = Math.max(1, brushSize);
                  const origin: PaintGridOrigin = gridOrigin ?? {
                    x: Math.floor(mousePos.x) - Math.floor(size / 2),
                    y: Math.floor(mousePos.y) - Math.floor(size / 2),
@@ -7496,19 +7800,27 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
                     className="paint-num"
                     min={1}
                     max={100}
-                    step={1}
+                    step={0.5}
                     value={brushSize}
                     onChange={(e) => {
-                      const v = parseInt(e.target.value, 10);
+                      const v = parseFloat(e.target.value);
                       if (!Number.isFinite(v)) return;
-                      setBrushSize(Math.min(100, Math.max(1, v)));
+                      setBrushSize(snapPaintBrushSize(v));
                     }}
                   />
                   px
                 </span>
               </div>
               <div className="paint-dock-controls">
-                <input type="range" min="1" max="100" value={brushSize} onChange={(e) => setBrushSize(parseInt(e.target.value))} style={{ flex: 1, minWidth: '80px' }} />
+                <input
+                  type="range"
+                  min="1"
+                  max="100"
+                  step="0.5"
+                  value={brushSize}
+                  onChange={(e) => setBrushSize(snapPaintBrushSize(parseFloat(e.target.value)))}
+                  style={{ flex: 1, minWidth: '80px' }}
+                />
                 <button className={`btn-ghost ${brushShape === 'circle' ? 'active' : ''}`} onClick={() => setBrushShape('circle')} title="Círculo">
                   <Circle size={16} fill={brushShape === 'circle' ? 'currentColor' : 'none'} />
                 </button>
@@ -7574,7 +7886,7 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
                 max="100"
                 value={previewOpacity}
                 onChange={(e) => setPreviewOpacity(parseInt(e.target.value, 10))}
-                title="Transparencia del cuadrante de referencia bajo el mouse (no afecta el trazo)"
+                title="Transparencia del marcador bajo el mouse, contorno incluido (no afecta el trazo). En 0% queda solo un contorno tenue para no perder el cursor"
               />
             </div>
 

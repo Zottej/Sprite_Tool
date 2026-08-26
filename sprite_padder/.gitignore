@@ -13,6 +13,7 @@ dist-ssr
 *.local
 release/
 release-fresh/
+tmp/
 
 # Editor directories and files
 .vscode/*
