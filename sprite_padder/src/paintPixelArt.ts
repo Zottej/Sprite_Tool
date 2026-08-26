@@ -92,6 +92,8 @@ export const hexToRgbaCss = (hex: string, opacityPct: number): string => {
   const g = m ? parseInt(m[1].slice(2, 4), 16) : 0;
   const b = m ? parseInt(m[1].slice(4, 6), 16) : 0;
   const a = Math.max(0, Math.min(1, opacityPct / 100));
+  // A 100% hay que pintar con hex opaco: rgba(...,1) en canvas a veces termina con alfa < 255.
+  if (a >= 1) return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
   return `rgba(${r}, ${g}, ${b}, ${a})`;
 };
 

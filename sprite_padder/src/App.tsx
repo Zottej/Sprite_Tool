@@ -7271,7 +7271,13 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     paintHard(tctx);
     tctx.restore();
     if (blurR > 0) {
-      const blurred = boxBlurImageData(tctx.getImageData(0, 0, tw, th), blurR);
+      const hard = tctx.getImageData(0, 0, tw, th);
+      const blurred = boxBlurImageData(hard, blurR);
+      // El blur no tiene que volverse transparencia: se mezcla el color, el alfa
+      // del dab queda como se pintó (opaco si Opacidad está al 100%).
+      const src = hard.data;
+      const dst = blurred.data;
+      for (let i = 3; i < dst.length; i += 4) dst[i] = src[i];
       tctx.putImageData(blurred, 0, 0);
     }
     dest.imageSmoothingEnabled = false;
@@ -7349,24 +7355,39 @@ const PaintModal: React.FC<PaintModalProps> = ({ sprite, onSave, onClose, isWhit
     }
     const rect = paintGridCellRect(origin, ix, iy);
 
+    // El dither se decide por celda de arte; el "Sucio" va por píxel de lienzo dentro
+    // de la celda. Si no, con Grilla activa el bloque quedaba plano aunque Sucio > 0.
+    let cellStyle: PaintStyle | null = styleA;
+    if (ditherPattern !== 'off') {
+      const pick = ditherPick(ix, iy, ditherPattern);
+      if (pick === 'b' && ditherEmpty) return;
+      cellStyle = pick === 'b' ? styleB : styleA;
+    }
+
     const paintCellHard = (target: CanvasRenderingContext2D, ox: number, oy: number) => {
-      if (!applyDitherStyle(target, ix, iy, styleA, styleB)) return;
-      if (brushShape === 'circle') {
-        const rx = rect.w / 2;
-        const ry = rect.h / 2;
-        const cx = ox + rx;
-        const cy = oy + ry;
-        for (let y = oy; y < oy + rect.h; y++) {
-          for (let x = ox; x < ox + rect.w; x++) {
+      const solid = brushNoise <= 0 && brushShape === 'square';
+      if (solid) {
+        target.fillStyle = cellStyle!(ix, iy);
+        target.fillRect(ox, oy, rect.w, rect.h);
+        return;
+      }
+      const rx = rect.w / 2;
+      const ry = rect.h / 2;
+      const cx = ox + rx;
+      const cy = oy + ry;
+      for (let y = oy; y < oy + rect.h; y++) {
+        for (let x = ox; x < ox + rect.w; x++) {
+          if (brushShape === 'circle') {
             const dx = (x + 0.5 - cx) / rx;
             const dy = (y + 0.5 - cy) / ry;
             if (dx * dx + dy * dy > 1) continue;
-            target.fillRect(x, y, 1, 1);
           }
+          const ax = x - ox + rect.x;
+          const ay = y - oy + rect.y;
+          target.fillStyle = cellStyle!(ax, ay);
+          target.fillRect(x, y, 1, 1);
         }
-        return;
       }
-      target.fillRect(ox, oy, rect.w, rect.h);
     };
 
     if (brushSoftness <= 0) {
