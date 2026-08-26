@@ -1957,9 +1957,30 @@ input[type="range"] { accent-color: var(--accent); height: 4px; }
   vector-effect: non-scaling-stroke;
 }
 
+.palette-protect-zone.role-protect {
+  fill: rgba(255, 86, 86, 0.28);
+  stroke: #ff7a7a;
+}
+
+.palette-protect-zone.role-matchSrc {
+  fill: rgba(94, 200, 255, 0.28);
+  stroke: #5ec8ff;
+}
+
+.palette-protect-zone.role-matchDst {
+  fill: rgba(125, 255, 125, 0.28);
+  stroke: #7dff7d;
+}
+
 .palette-protect-zone.is-draft {
   fill: rgba(255, 204, 102, 0.32);
   stroke: #ffcc66;
+}
+
+.palette-protect-zone.is-selected {
+  stroke-width: 2.5;
+  stroke-dasharray: none;
+  filter: drop-shadow(0 0 2px rgba(255, 255, 255, 0.55));
 }
 
 .palette-protect-hint {

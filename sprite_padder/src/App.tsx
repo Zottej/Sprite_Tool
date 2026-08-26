@@ -3790,16 +3790,19 @@ const autoAlignSpriteToFixedBottom = (moving: SpriteData, fixed: SpriteData): Sp
   return nudgeSpriteContent(moving, fixedPt.x - movingPt.x, fixedPt.y - movingPt.y);
 };
 
-/** Zona del overlay que Igualar paleta no debe tocar. Coordenadas del lienzo Full. */
-type PaletteProtectZone = {
+/** Marca del overlay (proteger o igualar solo una zona). Coordenadas del lienzo Full. */
+type OverlayMarkZone = {
   id: string;
   kind: 'circle' | 'square';
+  role: 'protect' | 'matchSrc' | 'matchDst';
   cx: number;
   cy: number;
   r: number;
 };
 
-const overlayPointInProtectZone = (x: number, y: number, zone: PaletteProtectZone, pad = 0) => {
+type ZoneMarkMode = 'off' | 'protect' | 'matchSrc' | 'matchDst';
+
+const overlayPointInMarkZone = (x: number, y: number, zone: OverlayMarkZone, pad = 0) => {
   const reach = zone.r + pad;
   if (zone.kind === 'circle') {
     const dx = x - zone.cx;
@@ -3809,9 +3812,11 @@ const overlayPointInProtectZone = (x: number, y: number, zone: PaletteProtectZon
   return Math.abs(x - zone.cx) <= reach && Math.abs(y - zone.cy) <= reach;
 };
 
-const protectZoneAtPoint = (zones: PaletteProtectZone[], x: number, y: number) => {
+const markZoneAtPoint = (zones: OverlayMarkZone[], x: number, y: number, role?: OverlayMarkZone['role']) => {
   for (let i = zones.length - 1; i >= 0; i--) {
-    if (overlayPointInProtectZone(x, y, zones[i], 3)) return zones[i];
+    const z = zones[i];
+    if (role && z.role !== role) continue;
+    if (overlayPointInMarkZone(x, y, z, 4)) return z;
   }
   return null;
 };
@@ -3844,11 +3849,46 @@ const imagePixelToOverlayPoint = (
   };
 };
 
-const restorePixelsInProtectZones = (
+const ZONE_SAMPLE_OFFSETS: Array<[number, number]> = [
+  [0.5, 0.5],
+  [0.08, 0.08],
+  [0.92, 0.08],
+  [0.08, 0.92],
+  [0.92, 0.92],
+];
+
+const imagePixelHitsZones = (
+  sprite: SpriteData,
+  x: number,
+  y: number,
+  zones: OverlayMarkZone[],
+) => {
+  if (zones.length === 0) return false;
+  return ZONE_SAMPLE_OFFSETS.some(([fx, fy]) => {
+    const p = imagePixelToOverlayPoint(sprite, x, y, fx, fy);
+    return zones.some((z) => overlayPointInMarkZone(p.x, p.y, z));
+  });
+};
+
+const imageFromCanvasDataUrl = (canvas: HTMLCanvasElement, errMsg: string) =>
+  new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error(errMsg));
+    img.src = canvas.toDataURL('image/png');
+  });
+
+/**
+ * Restaura píxeles del original según las zonas:
+ * - inside: solo dentro de las marcas (proteger)
+ * - outside: todo lo que no está marcado (igualar solo una región)
+ */
+const restorePixelsByZones = (
   original: HTMLImageElement,
   transferred: HTMLImageElement,
   sprite: SpriteData,
-  zones: PaletteProtectZone[],
+  zones: OverlayMarkZone[],
+  mode: 'inside' | 'outside',
 ): Promise<HTMLImageElement> => {
   if (zones.length === 0) return Promise.resolve(transferred);
   const w = original.naturalWidth || original.width;
@@ -3867,20 +3907,11 @@ const restorePixelsInProtectZones = (
 
   const src = srcCtx.getImageData(0, 0, w, h);
   const dst = dstCtx.getImageData(0, 0, w, h);
-  const samples: Array<[number, number]> = [
-    [0.5, 0.5],
-    [0.08, 0.08],
-    [0.92, 0.08],
-    [0.08, 0.92],
-    [0.92, 0.92],
-  ];
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
-      const hit = samples.some(([fx, fy]) => {
-        const p = imagePixelToOverlayPoint(sprite, x, y, fx, fy);
-        return zones.some((z) => overlayPointInProtectZone(p.x, p.y, z));
-      });
-      if (!hit) continue;
+      const hit = imagePixelHitsZones(sprite, x, y, zones);
+      const restore = mode === 'inside' ? hit : !hit;
+      if (!restore) continue;
       const i = (y * w + x) * 4;
       dst.data[i] = src.data[i];
       dst.data[i + 1] = src.data[i + 1];
@@ -3889,12 +3920,32 @@ const restorePixelsInProtectZones = (
     }
   }
   dstCtx.putImageData(dst, 0, 0);
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error('No se pudo reponer las zonas protegidas.'));
-    img.src = dstCanvas.toDataURL('image/png');
-  });
+  return imageFromCanvasDataUrl(dstCanvas, 'No se pudieron aplicar las zonas de paleta.');
+};
+
+/** Deja solo los píxeles dentro de las zonas (el resto transparente) para tomar paleta de ahí. */
+const maskImageToZones = (
+  img: HTMLImageElement,
+  sprite: SpriteData,
+  zones: OverlayMarkZone[],
+): Promise<HTMLImageElement> => {
+  if (zones.length === 0) return Promise.resolve(img);
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+  ctx.drawImage(img, 0, 0);
+  const data = ctx.getImageData(0, 0, w, h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (imagePixelHitsZones(sprite, x, y, zones)) continue;
+      data.data[(y * w + x) * 4 + 3] = 0;
+    }
+  }
+  ctx.putImageData(data, 0, 0);
+  return imageFromCanvasDataUrl(canvas, 'No se pudo recortar la zona de referencia.');
 };
 
 const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, onChangeSprite, onClose, isWhiteBg }) => {
@@ -3906,21 +3957,26 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
     return remembered?.id ?? null;
   });
   const source = others.find((s) => s.id === sourceId) || null;
-  const prefs = loadPref<{ zoom?: number; opacity?: number; targetOpacity?: number; editSource?: boolean; paletteForce?: number; protectShape?: 'circle' | 'square' }>(GHOST_COMPARE_PREFS_KEY, {});
+  const prefs = loadPref<{ zoom?: number; opacity?: number; targetOpacity?: number; editSource?: boolean; paletteForce?: number; markShape?: 'circle' | 'square' }>(GHOST_COMPARE_PREFS_KEY, {});
   const [zoom, setZoom] = useState(() => clampNum(prefs.zoom, 0.5, 8, 1));
   const [opacity, setOpacity] = useState(() => Math.round(clampNum(prefs.opacity, 5, 100, 40)));
   const [targetOpacity, setTargetOpacity] = useState(() => Math.round(clampNum(prefs.targetOpacity, 5, 100, 100)));
   const [editSource, setEditSource] = useState(() => prefs.editSource === true);
   const [paletteForce, setPaletteForce] = useState(() => Math.round(clampNum(prefs.paletteForce, 5, 100, 100)));
   const [paletteBusy, setPaletteBusy] = useState(false);
-  const [protectMode, setProtectMode] = useState(false);
-  const [protectShape, setProtectShape] = useState<'circle' | 'square'>(() => (prefs.protectShape === 'square' ? 'square' : 'circle'));
-  const [protectZones, setProtectZones] = useState<PaletteProtectZone[]>([]);
-  const [protectDraft, setProtectDraft] = useState<PaletteProtectZone | null>(null);
+  const [zoneMarkMode, setZoneMarkMode] = useState<ZoneMarkMode>('off');
+  const [markShape, setMarkShape] = useState<'circle' | 'square'>(() => (prefs.markShape === 'square' ? 'square' : 'circle'));
+  const [markZones, setMarkZones] = useState<OverlayMarkZone[]>([]);
+  const [markDraft, setMarkDraft] = useState<OverlayMarkZone | null>(null);
+  const [selectedMarkId, setSelectedMarkId] = useState<string | null>(null);
   const [overlayPx, setOverlayPx] = useState({ w: 1, h: 1 });
   const [nudgeStep, setNudgeStep] = useState(() => Math.round(clampNum(loadPref('joa-content-nudge-step', 1), 1, 512, 1)));
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const protectDragRef = useRef<{ id: string; cx: number; cy: number } | null>(null);
+  const markDragRef = useRef<
+    | { type: 'create'; id: string; cx: number; cy: number; role: OverlayMarkZone['role'] }
+    | { type: 'move'; id: string; startX: number; startY: number; origCx: number; origCy: number }
+    | null
+  >(null);
   const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-ghost-compare-scroll', sprite.name);
   useModalWheelControls({ zoom, setZoom, workspaceRef });
 
@@ -3929,14 +3985,16 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
   }, [source]);
 
   useEffect(() => {
-    setProtectZones([]);
-    setProtectDraft(null);
-    protectDragRef.current = null;
+    setMarkZones([]);
+    setMarkDraft(null);
+    setSelectedMarkId(null);
+    markDragRef.current = null;
+    setZoneMarkMode('off');
   }, [sourceId]);
 
   useEffect(() => {
-    savePref(GHOST_COMPARE_PREFS_KEY, { zoom, opacity, targetOpacity, editSource, paletteForce, protectShape });
-  }, [zoom, opacity, targetOpacity, editSource, paletteForce, protectShape]);
+    savePref(GHOST_COMPARE_PREFS_KEY, { zoom, opacity, targetOpacity, editSource, paletteForce, markShape });
+  }, [zoom, opacity, targetOpacity, editSource, paletteForce, markShape]);
 
   useEffect(() => {
     savePref('joa-content-nudge-step', nudgeStep);
@@ -3970,30 +4028,44 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
   const onChangeRef = useRef(onChangeSprite);
   onChangeRef.current = onChangeSprite;
 
-  const protectModeRef = useRef(protectMode);
-  protectModeRef.current = protectMode;
-  const protectDraftRef = useRef(protectDraft);
-  protectDraftRef.current = protectDraft;
+  const zoneMarkModeRef = useRef(zoneMarkMode);
+  zoneMarkModeRef.current = zoneMarkMode;
+  const markDraftRef = useRef(markDraft);
+  markDraftRef.current = markDraft;
+  const selectedMarkIdRef = useRef(selectedMarkId);
+  selectedMarkIdRef.current = selectedMarkId;
 
   useEffect(() => {
     if (!source) return;
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
       if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
-      if (protectModeRef.current) {
+      if (zoneMarkModeRef.current !== 'off') {
         if (e.key === 'Escape') {
           e.preventDefault();
-          if (protectDraftRef.current || protectDragRef.current) {
-            protectDragRef.current = null;
-            setProtectDraft(null);
+          if (markDraftRef.current || markDragRef.current) {
+            markDragRef.current = null;
+            setMarkDraft(null);
           } else {
-            setProtectMode(false);
+            setZoneMarkMode('off');
+            setSelectedMarkId(null);
           }
           return;
         }
         if (e.key === 'Backspace' || e.key === 'Delete') {
           e.preventDefault();
-          setProtectZones((prev) => prev.slice(0, -1));
+          const sel = selectedMarkIdRef.current;
+          if (sel) {
+            setMarkZones((prev) => prev.filter((z) => z.id !== sel));
+            setSelectedMarkId(null);
+          } else {
+            const role = zoneMarkModeRef.current as Exclude<ZoneMarkMode, 'off'>;
+            setMarkZones((prev) => {
+              const idx = [...prev].map((z, i) => ({ z, i })).reverse().find((x) => x.z.role === role);
+              if (!idx) return prev;
+              return prev.filter((_, i) => i !== idx.i);
+            });
+          }
           return;
         }
       }
@@ -4072,20 +4144,30 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
   const stageH = Math.max(fgSize.h, bgSize.h);
   const internalScale = editTarget.scale || 1;
 
+  const protectZones = markZones.filter((z) => z.role === 'protect');
+  const matchSrcZones = markZones.filter((z) => z.role === 'matchSrc');
+  const matchDstZones = markZones.filter((z) => z.role === 'matchDst');
+
   const matchPaletteToReference = async () => {
     if (!source || paletteBusy) return;
     const target = editSource ? source : sprite;
     const reference = editSource ? sprite : source;
     setPaletteBusy(true);
     try {
-      const newImg = await transferImageColorsToReference(target.img, reference.img, paletteForce);
-      const protectedImg = protectZones.length > 0
-        ? await restorePixelsInProtectZones(target.img, newImg, target, protectZones)
-        : newImg;
+      const refForPalette = matchSrcZones.length > 0
+        ? await maskImageToZones(reference.img, reference, matchSrcZones)
+        : reference.img;
+      let newImg = await transferImageColorsToReference(target.img, refForPalette, paletteForce);
+      if (matchDstZones.length > 0) {
+        newImg = await restorePixelsByZones(target.img, newImg, target, matchDstZones, 'outside');
+      }
+      if (protectZones.length > 0) {
+        newImg = await restorePixelsByZones(target.img, newImg, target, protectZones, 'inside');
+      }
       onChangeSprite({
         ...target,
-        img: protectedImg,
-        originalImg: target.originalImg === target.img ? protectedImg : target.originalImg,
+        img: newImg,
+        originalImg: target.originalImg === target.img ? newImg : target.originalImg,
       });
     } catch (err) {
       console.error(err);
@@ -4111,51 +4193,117 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
     return Math.max(Math.abs(dx), Math.abs(dy));
   };
 
-  const onProtectPointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
-    if (!protectMode || e.button !== 0) return;
+  const toggleZoneMarkMode = (mode: Exclude<ZoneMarkMode, 'off'>) => {
+    markDragRef.current = null;
+    setMarkDraft(null);
+    setZoneMarkMode((cur) => (cur === mode ? 'off' : mode));
+  };
+
+  const onMarkPointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (zoneMarkMode === 'off' || e.button !== 0) return;
     e.preventDefault();
     e.currentTarget.setPointerCapture(e.pointerId);
     const p = overlayPointFromEvent(e);
-    const hit = protectZoneAtPoint(protectZones, p.x, p.y);
+    const role = zoneMarkMode;
+    const hit = markZoneAtPoint(markZones, p.x, p.y, role);
     if (hit) {
-      setProtectZones((prev) => prev.filter((z) => z.id !== hit.id));
-      protectDragRef.current = null;
-      setProtectDraft(null);
+      setSelectedMarkId(hit.id);
+      if (e.altKey) {
+        setMarkZones((prev) => prev.filter((z) => z.id !== hit.id));
+        setSelectedMarkId(null);
+        markDragRef.current = null;
+        setMarkDraft(null);
+        return;
+      }
+      markDragRef.current = {
+        type: 'move',
+        id: hit.id,
+        startX: p.x,
+        startY: p.y,
+        origCx: hit.cx,
+        origCy: hit.cy,
+      };
+      setMarkDraft(null);
       return;
     }
+    setSelectedMarkId(null);
     const id = generateId();
-    protectDragRef.current = { id, cx: p.x, cy: p.y };
-    setProtectDraft({ id, kind: protectShape, cx: p.x, cy: p.y, r: 0 });
+    markDragRef.current = { type: 'create', id, cx: p.x, cy: p.y, role };
+    setMarkDraft({ id, kind: markShape, role, cx: p.x, cy: p.y, r: 0 });
   };
 
-  const onProtectPointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
-    const drag = protectDragRef.current;
+  const onMarkPointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const drag = markDragRef.current;
     if (!drag) return;
     const p = overlayPointFromEvent(e);
-    setProtectDraft({
+    if (drag.type === 'move') {
+      const dx = p.x - drag.startX;
+      const dy = p.y - drag.startY;
+      setMarkZones((prev) => prev.map((z) => (
+        z.id === drag.id
+          ? { ...z, cx: drag.origCx + dx, cy: drag.origCy + dy }
+          : z
+      )));
+      return;
+    }
+    setMarkDraft({
       id: drag.id,
-      kind: protectShape,
+      kind: markShape,
+      role: drag.role,
       cx: drag.cx,
       cy: drag.cy,
-      r: radiusFromDrag(protectShape, drag.cx, drag.cy, p.x, p.y),
+      r: radiusFromDrag(markShape, drag.cx, drag.cy, p.x, p.y),
     });
   };
 
-  const onProtectPointerUp = (e: React.PointerEvent<SVGSVGElement>) => {
-    const drag = protectDragRef.current;
-    protectDragRef.current = null;
+  const onMarkPointerUp = (e: React.PointerEvent<SVGSVGElement>) => {
+    const drag = markDragRef.current;
+    markDragRef.current = null;
     if (!drag) {
-      setProtectDraft(null);
+      setMarkDraft(null);
+      return;
+    }
+    if (drag.type === 'move') {
+      setMarkDraft(null);
       return;
     }
     const p = overlayPointFromEvent(e);
-    const r = radiusFromDrag(protectShape, drag.cx, drag.cy, p.x, p.y);
-    setProtectDraft(null);
+    const r = radiusFromDrag(markShape, drag.cx, drag.cy, p.x, p.y);
+    setMarkDraft(null);
     if (r < 3) return;
-    setProtectZones((prev) => [...prev, { id: drag.id, kind: protectShape, cx: drag.cx, cy: drag.cy, r }]);
+    const zone: OverlayMarkZone = {
+      id: drag.id,
+      kind: markShape,
+      role: drag.role,
+      cx: drag.cx,
+      cy: drag.cy,
+      r,
+    };
+    setMarkZones((prev) => [...prev, zone]);
+    setSelectedMarkId(zone.id);
   };
 
-  const visibleProtectZones = protectDraft ? [...protectZones, protectDraft] : protectZones;
+  const visibleMarkZones = markDraft ? [...markZones, markDraft] : markZones;
+  const marksActive = zoneMarkMode !== 'off';
+  const clearMarksForMode = () => {
+    if (zoneMarkMode === 'off') {
+      setMarkZones([]);
+    } else {
+      setMarkZones((prev) => prev.filter((z) => z.role !== zoneMarkMode));
+    }
+    setMarkDraft(null);
+    setSelectedMarkId(null);
+    markDragRef.current = null;
+  };
+
+  const modeHint =
+    zoneMarkMode === 'protect'
+      ? 'Arrastrá varios círculos/cuadrados para formar la zona protegida. Arrastrá una marca para moverla; Alt+clic o Supr para borrarla.'
+      : zoneMarkMode === 'matchSrc'
+        ? 'Marcá en la fuente (fondo) de dónde sacar la paleta. Varias marcas se suman. Arrastrá para mover; Alt+clic o Supr para borrar.'
+        : zoneMarkMode === 'matchDst'
+          ? 'Marcá en el destino (el que se edita) qué zona igualar. Varias marcas se suman. Arrastrá para mover; Alt+clic o Supr para borrar.'
+          : '';
 
   const nudgeBtn = (dx: number, dy: number, title: string, icon: React.ReactNode) => (
     <button
@@ -4211,21 +4359,26 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
                 display: 'block',
               }}
             />
-            {(protectMode || visibleProtectZones.length > 0) && (
+            {(marksActive || visibleMarkZones.length > 0) && (
               <svg
-                className={`palette-protect-overlay${protectMode ? ' is-draw' : ''}`}
+                className={`palette-protect-overlay${marksActive ? ' is-draw' : ''}`}
                 viewBox={`0 0 ${overlayPx.w} ${overlayPx.h}`}
                 preserveAspectRatio="none"
-                onPointerDown={onProtectPointerDown}
-                onPointerMove={onProtectPointerMove}
-                onPointerUp={onProtectPointerUp}
-                onPointerCancel={onProtectPointerUp}
+                onPointerDown={onMarkPointerDown}
+                onPointerMove={onMarkPointerMove}
+                onPointerUp={onMarkPointerUp}
+                onPointerCancel={onMarkPointerUp}
               >
-                {visibleProtectZones.map((zone) => (
+                {visibleMarkZones.map((zone) => (
                   zone.kind === 'circle' ? (
                     <circle
                       key={zone.id}
-                      className={`palette-protect-zone${protectDraft?.id === zone.id ? ' is-draft' : ''}`}
+                      className={[
+                        'palette-protect-zone',
+                        `role-${zone.role}`,
+                        markDraft?.id === zone.id ? 'is-draft' : '',
+                        selectedMarkId === zone.id ? 'is-selected' : '',
+                      ].filter(Boolean).join(' ')}
                       cx={zone.cx}
                       cy={zone.cy}
                       r={Math.max(0.5, zone.r)}
@@ -4233,7 +4386,12 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
                   ) : (
                     <rect
                       key={zone.id}
-                      className={`palette-protect-zone${protectDraft?.id === zone.id ? ' is-draft' : ''}`}
+                      className={[
+                        'palette-protect-zone',
+                        `role-${zone.role}`,
+                        markDraft?.id === zone.id ? 'is-draft' : '',
+                        selectedMarkId === zone.id ? 'is-selected' : '',
+                      ].filter(Boolean).join(' ')}
                       x={zone.cx - zone.r}
                       y={zone.cy - zone.r}
                       width={Math.max(1, zone.r * 2)}
@@ -4244,10 +4402,8 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
               </svg>
             )}
           </div>
-          {protectMode && (
-            <div className="palette-protect-hint">
-              Arrastrá un círculo o un cuadrado sobre lo que Igualar paleta no tiene que tocar. Clic en una marca para quitarla.
-            </div>
+          {marksActive && modeHint && (
+            <div className="palette-protect-hint">{modeHint}</div>
           )}
         </div>
         <div className="modal-footer" style={{ padding: '16px 20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '16px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
@@ -4368,43 +4524,69 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
                 type="button"
                 className="btn btn-outline"
                 style={{
-                  borderColor: protectMode ? 'var(--accent)' : undefined,
-                  color: protectMode ? 'var(--accent)' : undefined,
-                  background: protectMode ? 'rgba(107,102,255,0.12)' : undefined,
+                  borderColor: zoneMarkMode === 'protect' ? 'var(--accent)' : undefined,
+                  color: zoneMarkMode === 'protect' ? 'var(--accent)' : undefined,
+                  background: zoneMarkMode === 'protect' ? 'rgba(107,102,255,0.12)' : undefined,
                 }}
-                title="Marcá círculos o cuadrados sobre el overlay: esas zonas no se tocan al igualar paleta"
-                onClick={() => setProtectMode((v) => !v)}
+                title="Marcá varias zonas que Igualar paleta no debe tocar. Arrastrá para mover; Alt+clic o Supr para borrar."
+                onClick={() => toggleZoneMarkMode('protect')}
               >
                 <ShieldOff size={14} /> Proteger{protectZones.length > 0 ? ` (${protectZones.length})` : ''}
               </button>
-              {protectMode && (
+              <button
+                type="button"
+                className="btn btn-outline"
+                style={{
+                  borderColor: zoneMarkMode === 'matchSrc' ? '#5ec8ff' : undefined,
+                  color: zoneMarkMode === 'matchSrc' ? '#5ec8ff' : undefined,
+                  background: zoneMarkMode === 'matchSrc' ? 'rgba(94,200,255,0.12)' : undefined,
+                }}
+                title="Zona(s) de la fuente: de ahí se toma la paleta al igualar"
+                onClick={() => toggleZoneMarkMode('matchSrc')}
+              >
+                <Crop size={14} /> Zona fuente{matchSrcZones.length > 0 ? ` (${matchSrcZones.length})` : ''}
+              </button>
+              <button
+                type="button"
+                className="btn btn-outline"
+                style={{
+                  borderColor: zoneMarkMode === 'matchDst' ? '#7dff7d' : undefined,
+                  color: zoneMarkMode === 'matchDst' ? '#7dff7d' : undefined,
+                  background: zoneMarkMode === 'matchDst' ? 'rgba(125,255,125,0.12)' : undefined,
+                }}
+                title="Zona(s) del destino: solo ahí se aplica la igualación de paleta"
+                onClick={() => toggleZoneMarkMode('matchDst')}
+              >
+                <Target size={14} /> Zona destino{matchDstZones.length > 0 ? ` (${matchDstZones.length})` : ''}
+              </button>
+              {marksActive && (
                 <>
                   <button
                     type="button"
                     className="btn btn-outline"
-                    style={{ width: '34px', height: '34px', padding: 0, borderColor: protectShape === 'circle' ? 'var(--accent)' : undefined, color: protectShape === 'circle' ? 'var(--accent)' : undefined }}
+                    style={{ width: '34px', height: '34px', padding: 0, borderColor: markShape === 'circle' ? 'var(--accent)' : undefined, color: markShape === 'circle' ? 'var(--accent)' : undefined }}
                     title="Marca circular"
-                    onClick={() => setProtectShape('circle')}
+                    onClick={() => setMarkShape('circle')}
                   >
-                    <Circle size={16} fill={protectShape === 'circle' ? 'currentColor' : 'none'} />
+                    <Circle size={16} fill={markShape === 'circle' ? 'currentColor' : 'none'} />
                   </button>
                   <button
                     type="button"
                     className="btn btn-outline"
-                    style={{ width: '34px', height: '34px', padding: 0, borderColor: protectShape === 'square' ? 'var(--accent)' : undefined, color: protectShape === 'square' ? 'var(--accent)' : undefined }}
+                    style={{ width: '34px', height: '34px', padding: 0, borderColor: markShape === 'square' ? 'var(--accent)' : undefined, color: markShape === 'square' ? 'var(--accent)' : undefined }}
                     title="Marca cuadrada"
-                    onClick={() => setProtectShape('square')}
+                    onClick={() => setMarkShape('square')}
                   >
-                    <Square size={16} fill={protectShape === 'square' ? 'currentColor' : 'none'} />
+                    <Square size={16} fill={markShape === 'square' ? 'currentColor' : 'none'} />
                   </button>
                 </>
               )}
-              {protectZones.length > 0 && (
+              {markZones.length > 0 && (
                 <button
                   type="button"
                   className="btn btn-outline"
-                  title="Quitar todas las zonas protegidas"
-                  onClick={() => { setProtectZones([]); setProtectDraft(null); protectDragRef.current = null; }}
+                  title={marksActive ? 'Quitar las marcas del modo actual' : 'Quitar todas las marcas'}
+                  onClick={clearMarksForMode}
                 >
                   <X size={14} /> Limpiar
                 </button>
@@ -4414,9 +4596,14 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
               type="button"
               className="btn btn-outline"
               disabled={paletteBusy}
-              title={editSource
-                ? `Transfiere la tonalidad/paleta de ${sprite.name} hacia la fuente (${source.name}). Las zonas protegidas (círculos/cuadrados) no se modifican.`
-                : `Transfiere la tonalidad/paleta de la fuente (${source.name}) hacia ${sprite.name}. Las zonas protegidas (círculos/cuadrados) no se modifican.`}
+              title={[
+                editSource
+                  ? `Transfiere la tonalidad/paleta de ${sprite.name} hacia la fuente (${source.name}).`
+                  : `Transfiere la tonalidad/paleta de la fuente (${source.name}) hacia ${sprite.name}.`,
+                matchSrcZones.length > 0 ? 'Paleta tomada solo de Zona fuente.' : '',
+                matchDstZones.length > 0 ? 'Se aplica solo en Zona destino.' : '',
+                protectZones.length > 0 ? 'Las zonas Proteger no se modifican.' : '',
+              ].filter(Boolean).join(' ')}
               onClick={() => { void matchPaletteToReference(); }}
             >
               <Droplets size={14} /> {paletteBusy ? 'Igualando…' : 'Igualar paleta'}
