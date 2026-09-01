@@ -106,10 +106,10 @@ ipcMain.handle('desktop:clearWorkingFolder', async () => {
   return null;
 });
 
-ipcMain.handle('desktop:pickFolder', async () => {
+ipcMain.handle('desktop:pickFolder', async (_event, options = {}) => {
   const current = getWorkingFolder();
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: 'Elegir carpeta de trabajo',
+    title: options.title || 'Elegir carpeta de trabajo',
     properties: ['openDirectory', 'createDirectory'],
     defaultPath: current?.path,
   });

@@ -11,7 +11,7 @@ export type DesktopApi = {
   getWorkingFolder: () => Promise<DesktopFolder | null>;
   setWorkingFolder: (folderPath: string | null) => Promise<DesktopFolder | null>;
   clearWorkingFolder: () => Promise<null>;
-  pickFolder: () => Promise<DesktopFolder | null>;
+  pickFolder: (options?: { title?: string }) => Promise<DesktopFolder | null>;
   pickOpenFiles: (options?: {
     title?: string;
     multiple?: boolean;

@@ -324,12 +324,97 @@ const confirmLastBool = (
   });
 };
 
+type AutosaveMode = 'overwrite' | 'strip';
+
+type AutosaveStripConfig = {
+  cols: number;
+  rows: number;
+  includeGrid: boolean;
+  fileName: string;
+  filePath: string;
+};
+
+/** Elige modo de autoguardado: sobrescribir PNGs sueltos o exportar como tira. */
+const promptAutosaveModeChoice = (): Promise<AutosaveMode | null> =>
+  new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay joa-confirm-overlay';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+
+    const box = document.createElement('div');
+    box.className = 'joa-confirm-box';
+    box.addEventListener('click', (e) => e.stopPropagation());
+
+    const heading = document.createElement('h3');
+    heading.className = 'joa-confirm-title';
+    heading.textContent = 'Autoguardado';
+
+    const body = document.createElement('p');
+    body.className = 'joa-confirm-message';
+    body.textContent = '¿Cómo querés guardar automáticamente con cada cambio?';
+
+    const hint = document.createElement('p');
+    hint.className = 'joa-confirm-hint';
+    hint.textContent = 'Podés desactivarlo cuando quieras desde la barra superior.';
+
+    const actions = document.createElement('div');
+    actions.className = 'joa-confirm-actions';
+    actions.style.flexWrap = 'wrap';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.className = 'btn btn-outline';
+    cancelBtn.textContent = 'Cancelar';
+
+    const overwriteBtn = document.createElement('button');
+    overwriteBtn.type = 'button';
+    overwriteBtn.className = 'btn btn-primary';
+    overwriteBtn.textContent = 'Sobrescribir PNGs en carpeta';
+
+    const stripBtn = document.createElement('button');
+    stripBtn.type = 'button';
+    stripBtn.className = 'btn btn-outline';
+    stripBtn.textContent = 'Exportar como tira';
+
+    const finish = (value: AutosaveMode | null) => {
+      window.removeEventListener('keydown', onKey, true);
+      overlay.remove();
+      resolve(value);
+    };
+
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(null);
+      }
+    };
+
+    cancelBtn.addEventListener('click', () => finish(null));
+    overwriteBtn.addEventListener('click', () => finish('overwrite'));
+    stripBtn.addEventListener('click', () => finish('strip'));
+    overlay.addEventListener('click', () => finish(null));
+
+    actions.append(cancelBtn, overwriteBtn, stripBtn);
+    box.append(heading, body, hint, actions);
+    overlay.append(box);
+    document.body.append(overlay);
+    window.addEventListener('keydown', onKey, true);
+    requestAnimationFrame(() => overwriteBtn.focus());
+  });
+
 const LAST_COLOR_KEY = 'joa-last-color';
 const LAST_SLICE_COLS_KEY = 'joa-last-slice-cols';
 const LAST_SLICE_ROWS_KEY = 'joa-last-slice-rows';
 const LAST_EXPORT_STRIP_COLS_KEY = 'joa-last-export-strip-cols';
 const LAST_EXPORT_STRIP_ROWS_KEY = 'joa-last-export-strip-rows';
 const LAST_EXPORT_STRIP_GRID_KEY = 'joa-last-export-strip-grid';
+const AUTOSAVE_ENABLED_KEY = 'joa-autosave-enabled';
+const AUTOSAVE_MODE_KEY = 'joa-autosave-mode';
+const AUTOSAVE_STRIP_FILE_KEY = 'joa-autosave-strip-file';
+const AUTOSAVE_STRIP_PATH_KEY = 'joa-autosave-strip-path';
+const AUTOSAVE_OVERWRITE_FOLDER_KEY = 'joa-autosave-overwrite-folder';
 const LAST_BG_BLACK_SMART_TOL_KEY = 'joa-last-bg-black-smart-tol';
 const LAST_BG_BLACK_PRECISE_TOL_KEY = 'joa-last-bg-black-precise-tol';
 const LAST_REMOVE_TEXT_TOL_KEY = 'joa-last-remove-text-tol';
@@ -743,6 +828,53 @@ const openSaveDestination = async (
   return downloadDestination(suggestedName);
 };
 
+const fileBaseName = (filePath: string) => {
+  const parts = filePath.replace(/\\/g, '/').split('/');
+  return parts[parts.length - 1] || filePath;
+};
+
+const desktopFileDestination = (filePath: string): SaveDestination => ({
+  kind: 'desktop',
+  write: async (blob) => {
+    const data = await blobToUint8Array(blob);
+    if (data.byteLength === 0) throw new Error('El archivo generado quedó vacío.');
+    const ok = await writeDesktopFileBytes(filePath, data);
+    if (!ok) throw new Error(`No se pudo escribir el archivo:\n${filePath}`);
+    return true;
+  },
+});
+
+const pickAutosaveStripDestination = async (
+  suggestedName: string,
+): Promise<{ dest: SaveDestination; filePath: string; fileName: string } | null> => {
+  const desktop = getDesktop();
+  if (desktop) {
+    const filePath = await desktop.pickSaveFile({
+      title: 'Autoguardado — elegí dónde guardar la tira (se sobrescribirá con cada cambio)',
+      suggestedName,
+      filters: [{ name: 'PNG Image', extensions: ['png'] }],
+    });
+    if (!filePath) return null;
+    const fileName = fileBaseName(filePath);
+    return { dest: desktopFileDestination(filePath), filePath, fileName };
+  }
+  if ('showSaveFilePicker' in window) {
+    try {
+      const handle = await (window as any).showSaveFilePicker({
+        id: SAVE_FILE_PICKER_ID,
+        suggestedName,
+        types: pickerTypesForSave(suggestedName, [{ name: 'PNG Image', extensions: ['png'] }]),
+      });
+      const fileName = handle.name || suggestedName;
+      return { dest: pickerFromHandle(handle), filePath: fileName, fileName };
+    } catch (err: unknown) {
+      if (err && typeof err === 'object' && 'name' in err && (err as { name?: string }).name === 'AbortError') return null;
+    }
+  }
+  alert('Para autoguardar en una carpeta específica usá la app de escritorio (.exe).');
+  return null;
+};
+
 /** Escribe el blob; si falla el destino elegido, fuerza descarga y avisa. */
 const writeBlobWithFallback = async (
   dest: SaveDestination,
@@ -820,6 +952,8 @@ interface SpriteData {
   originalImg?: HTMLImageElement; // Store original for reset
   scale?: number;
   rotation?: number;
+  /** Si true, rota alrededor del centro del contenido pintado (píxeles opacos). */
+  rotateAtAnchor?: boolean;
   offsetX?: number;
   offsetY?: number;
   flipH?: boolean;
@@ -1592,6 +1726,76 @@ const drawMaskedEffectsReplacing = (
   ctx.drawImage(effectsLayer, -sw / 2, -sh / 2, sw, sh);
 };
 
+const paintedCenterCache = new WeakMap<HTMLImageElement, { x: number; y: number }>();
+
+/** Centro de masa de los píxeles pintados (alpha > 0) dentro del PNG. */
+const getPaintedContentCenter = (img: HTMLImageElement): { x: number; y: number } => {
+  const cached = paintedCenterCache.get(img);
+  if (cached) return cached;
+
+  const w = img.width;
+  const h = img.height;
+  if (w <= 0 || h <= 0) {
+    const fallback = { x: 0, y: 0 };
+    paintedCenterCache.set(img, fallback);
+    return fallback;
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+  ctx.drawImage(img, 0, 0);
+  const data = ctx.getImageData(0, 0, w, h).data;
+
+  let sumX = 0;
+  let sumY = 0;
+  let weight = 0;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const a = data[(y * w + x) * 4 + 3];
+      if (a > 0) {
+        sumX += (x + 0.5) * a;
+        sumY += (y + 0.5) * a;
+        weight += a;
+      }
+    }
+  }
+
+  const center = weight > 0
+    ? { x: sumX / weight, y: sumY / weight }
+    : { x: w / 2, y: h / 2 };
+  paintedCenterCache.set(img, center);
+  return center;
+};
+
+const getSpriteRotationPivot = (sprite: SpriteData, sw: number, sh: number) => {
+  const scale = sprite.scale || 1;
+  const stretchX = sprite.stretchX || 1;
+  const stretchY = sprite.stretchY || 1;
+  const painted = getPaintedContentCenter(sprite.img);
+  const px = sprite.rotateAtAnchor ? painted.x : sprite.img.width / 2;
+  const py = sprite.rotateAtAnchor ? painted.y : sprite.img.height / 2;
+  if (sprite.rotateAtAnchor) {
+    return {
+      pivotX: sprite.padding.left + px * scale * stretchX,
+      pivotY: sprite.padding.top + py * scale * stretchY,
+      preDrawX: sw / 2 - px * scale * stretchX,
+      preDrawY: sh / 2 - py * scale * stretchY,
+      imageAx: px,
+      imageAy: py,
+    };
+  }
+  return {
+    pivotX: sprite.padding.left + sw / 2,
+    pivotY: sprite.padding.top + sh / 2,
+    preDrawX: 0,
+    preDrawY: 0,
+    imageAx: sprite.img.width / 2,
+    imageAy: sprite.img.height / 2,
+  };
+};
+
 const renderSpriteToContext = (ctx: CanvasRenderingContext2D, sprite: SpriteData, isExport = false) => {
   const { padding } = sprite;
   const scale = sprite.scale || 1;
@@ -1604,14 +1808,18 @@ const renderSpriteToContext = (ctx: CanvasRenderingContext2D, sprite: SpriteData
   const rot = (sprite.rotation || 0) * Math.PI / 180;
   const hSign = sprite.flipH ? -1 : 1;
   const vSign = sprite.flipV ? -1 : 1;
+  const pivot = getSpriteRotationPivot(sprite, sw, sh);
 
   ctx.imageSmoothingEnabled = false;
   ctx.clearRect(0, 0, Math.max(1, sw + padding.left + padding.right), Math.max(1, sh + padding.top + padding.bottom));
 
   ctx.save();
-  ctx.translate(padding.left + sw / 2 + ox, padding.top + sh / 2 + oy);
+  ctx.translate(pivot.pivotX + ox, pivot.pivotY + oy);
   ctx.rotate(rot);
   ctx.scale(hSign, vSign);
+  if (pivot.preDrawX || pivot.preDrawY) {
+    ctx.translate(pivot.preDrawX, pivot.preDrawY);
+  }
 
   if (!hasActiveEffectMask(sprite)) {
     drawSpriteImageLayer(ctx, sprite, 'full', isExport);
@@ -1669,6 +1877,45 @@ const renderSpriteToCanvas = (sprite: SpriteData, isExport = true): HTMLCanvasEl
   return canvas;
 };
 
+const buildStripSpritesheetCanvas = (
+  sprites: SpriteData[],
+  cols: number,
+  rows: number,
+  includeGrid: boolean,
+): HTMLCanvasElement => {
+  let maxW = 0;
+  let maxH = 0;
+  const processedCanvases: HTMLCanvasElement[] = [];
+
+  for (const s of sprites) {
+    const canvas = renderSpriteToCanvas(s, true);
+    maxW = Math.max(maxW, canvas.width);
+    maxH = Math.max(maxH, canvas.height);
+    processedCanvases.push(canvas);
+  }
+
+  const compiledCanvas = document.createElement('canvas');
+  compiledCanvas.width = maxW * cols;
+  compiledCanvas.height = maxH * rows;
+  const ctx = compiledCanvas.getContext('2d')!;
+
+  for (let i = 0; i < processedCanvases.length && i < rows * cols; i++) {
+    const c = i % cols;
+    const r = Math.floor(i / cols);
+    const cellCanvas = processedCanvases[i];
+    const dx = (c * maxW) + Math.floor((maxW - cellCanvas.width) / 2);
+    const dy = (r * maxH) + Math.floor((maxH - cellCanvas.height) / 2);
+    ctx.drawImage(cellCanvas, dx, dy);
+    if (includeGrid) {
+      ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(c * maxW + 0.5, r * maxH + 0.5, maxW - 1, maxH - 1);
+    }
+  }
+
+  return compiledCanvas;
+};
+
 
 const getEffectMaskOverlayPercents = (sprite: SpriteData, mask: Region) => {
   const scX = (sprite.scale || 1) * (sprite.stretchX || 1);
@@ -1708,6 +1955,14 @@ const COMPARE_NUMBER_SIZE_MAX = 160;
 
 type SpriteColumn = { id: string; name: string };
 type SpriteRow = { id: string; name: string };
+
+const defaultGridSpriteOrder = (sprites: SpriteData[], gridSplitActive: boolean): string[] => {
+  if (gridSplitActive) {
+    return sprites.filter((s) => !s.belowSplit).map((s) => s.id)
+      .concat(sprites.filter((s) => !!s.belowSplit).map((s) => s.id));
+  }
+  return sprites.map((s) => s.id);
+};
 
 const normalizeSpriteColumns = (saved: unknown): SpriteColumn[] => {
   if (!Array.isArray(saved)) return [];
@@ -2340,10 +2595,12 @@ const loadJoaProjectFromBlob = async (blob: Blob): Promise<LoadedJoaProject> => 
 
 
 // --- Sprite Module Component ---
+type SpriteSelectMode = 'replace' | 'toggle' | 'range';
+
 interface SpriteModuleProps {
   sprite: SpriteData;
   isSelected: boolean;
-  onToggleSelect: (id: string, multi: boolean) => void;
+  onToggleSelect: (id: string, mode: SpriteSelectMode) => void;
   onRemove: (id: string) => void;
   onSetAnchor: (id: string, x: number, y: number) => void;
   onSetReference: (id: string) => void;
@@ -2364,10 +2621,11 @@ interface SpriteModuleProps {
   isReference?: boolean;
   isWhiteBg?: boolean;
   quadrantView?: boolean;
+  quadrantPicking?: boolean;
   onOpenQuadrantPreview?: (id: string) => void;
 }
 
-const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggleSelect, onRemove, onSetAnchor, onSetReference, onOpenEraser, onOpenGhostCompare, onOpenReplace, onOpenCopyRect, onOpenPixelEditor, onOpenTransform, onOpenTagging, onOpenPaint, onOpenBucket, onOpenStretch, onOpenComposite, onExport, onFocusResolution, onUpdateSprite, isReference, isWhiteBg, quadrantView, onOpenQuadrantPreview }) => {
+const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggleSelect, onRemove, onSetAnchor, onSetReference, onOpenEraser, onOpenGhostCompare, onOpenReplace, onOpenCopyRect, onOpenPixelEditor, onOpenTransform, onOpenTagging, onOpenPaint, onOpenBucket, onOpenStretch, onOpenComposite, onExport, onFocusResolution, onUpdateSprite, isReference, isWhiteBg, quadrantView, quadrantPicking, onOpenQuadrantPreview }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const quadrantPointerRef = useRef<{ x: number; y: number } | null>(null);
@@ -2549,7 +2807,8 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
            const { clientX, clientY, shiftKey, ctrlKey, metaKey } = e;
            rightClickTimerRef.current = window.setTimeout(() => {
              rightClickTimerRef.current = null;
-             onToggleSelect(sprite.id, shiftKey || ctrlKey || metaKey);
+             const mode: SpriteSelectMode = shiftKey ? 'range' : (ctrlKey || metaKey) ? 'toggle' : 'replace';
+             onToggleSelect(sprite.id, mode);
              openToolsMenuAt(clientX, clientY);
            }, 500);
          }}
@@ -2564,8 +2823,17 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
            onFocusResolution?.(sprite.id);
          }}
          onClick={(e) => {
-           if (e.shiftKey || e.ctrlKey || e.metaKey) {
-             onToggleSelect(sprite.id, true);
+           if (quadrantPicking && onOpenQuadrantPreview) {
+             e.stopPropagation();
+             onOpenQuadrantPreview(sprite.id);
+             return;
+           }
+           if (e.shiftKey) {
+             onToggleSelect(sprite.id, 'range');
+             return;
+           }
+           if (e.ctrlKey || e.metaKey) {
+             onToggleSelect(sprite.id, 'toggle');
              return;
            }
            if (e.detail > 1) return;
@@ -2579,18 +2847,18 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
                if (leftClickTimerRef.current) window.clearTimeout(leftClickTimerRef.current);
                leftClickTimerRef.current = window.setTimeout(() => {
                  leftClickTimerRef.current = null;
-                 onToggleSelect(sprite.id, false);
+                 onToggleSelect(sprite.id, 'replace');
                  onOpenQuadrantPreview(sprite.id);
                }, 280);
                return;
              }
            }
-           onToggleSelect(sprite.id, false);
+           onToggleSelect(sprite.id, 'replace');
          }}>
       <div className="module-header">
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
           {isSelected ? <CheckSquare size={14} color="#6b66ff" /> : <Square size={14} color="var(--text-muted)" />}
-          <span className="module-title">{sprite.name}</span>
+          <span className="module-title" title={sprite.name}>{sprite.name}</span>
         </div>
         <div style={{ display: 'flex', gap: '4px', position: 'relative' }}>
           <button className={`btn-ghost ${toolsMenu ? 'active' : ''}`}
@@ -2728,7 +2996,7 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
             <MapPin size={12} /> Zonas (Tags)
           </button>
           <button type="button" className="dropdown-item" onClick={() => { onOpenTransform(sprite.id); closeTools(); }}>
-            <RotateCcw size={12} /> Transformar
+            <RotateCcw size={12} /> Rotar
           </button>
           <button type="button" className="dropdown-item" onClick={() => { onOpenEraser(sprite.id); closeTools(); }}>
             <Eraser size={12} /> Goma (Borrador)
@@ -2916,7 +3184,7 @@ const QuadrantPreviewOverlay: React.FC<{
     <div
       className={`quadrant-preview-overlay${pair ? ' is-pair' : ''}${picking ? ' is-picking' : ''}`}
       role="dialog"
-      aria-label={picking ? 'Elegir sprite para comparar' : 'Vista grande del cuadrante'}
+      aria-label={picking ? 'Elegir sprite para comparar' : 'Vista grande del sprite'}
       onClick={picking ? undefined : onClose}
     >
       {canBrowse && neighbors.prev && (
@@ -3837,15 +4105,18 @@ const imagePixelToOverlayPoint = (
   const ox = sprite.offsetX || 0;
   const oy = sprite.offsetY || 0;
   const rot = ((sprite.rotation || 0) * Math.PI) / 180;
-  let lx = ((ix + fx) / sprite.img.width) * sw - sw / 2;
-  let ly = ((iy + fy) / sprite.img.height) * sh - sh / 2;
+  const pivot = getSpriteRotationPivot(sprite, sw, sh);
+  const px = ix + fx;
+  const py = iy + fy;
+  let lx = (px - pivot.imageAx) * scale * stretchX;
+  let ly = (py - pivot.imageAy) * scale * stretchY;
   lx *= sprite.flipH ? -1 : 1;
   ly *= sprite.flipV ? -1 : 1;
   const cos = Math.cos(rot);
   const sin = Math.sin(rot);
   return {
-    x: lx * cos - ly * sin + sprite.padding.left + sw / 2 + ox,
-    y: lx * sin + ly * cos + sprite.padding.top + sh / 2 + oy,
+    x: lx * cos - ly * sin + pivot.pivotX + ox,
+    y: lx * sin + ly * cos + pivot.pivotY + oy,
   };
 };
 
@@ -5966,7 +6237,7 @@ const CopyRectModal: React.FC<CopyRectModalProps> = ({ sprite, sprites, onSave, 
   );
 };
 
-// --- Transform Modal Component ---
+// --- Rotate Modal Component ---
 interface TransformModalProps {
   sprite: SpriteData;
   onSave: (id: string, updates: Partial<SpriteData>) => void;
@@ -5976,12 +6247,9 @@ interface TransformModalProps {
 
 const TransformModal: React.FC<TransformModalProps> = ({ sprite, onSave, onClose, isWhiteBg }) => {
   const [rotation, setRotation] = useState(sprite.rotation || 0);
-  const [offsetX, setOffsetX] = useState(sprite.offsetX || 0);
-  const [offsetY, setOffsetY] = useState(sprite.offsetY || 0);
+  const [rotateAtAnchor, setRotateAtAnchor] = useState(sprite.rotateAtAnchor === true);
   const [zoom, setZoom] = useState(() => clampNum(loadPref('joa-transform-zoom', 1), 0.5, 8, 1));
   useModalWheelControls({ zoom, setZoom });
-  const [isDragging, setIsDragging] = useState(false);
-  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -5989,10 +6257,17 @@ const TransformModal: React.FC<TransformModalProps> = ({ sprite, onSave, onClose
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d')!;
-    const scX = (sprite.scale || 1) * (sprite.stretchX || 1) * 0.8 * zoom;
-    const scY = (sprite.scale || 1) * (sprite.stretchY || 1) * 0.8 * zoom;
+    const scale = sprite.scale || 1;
+    const stretchX = sprite.stretchX || 1;
+    const stretchY = sprite.stretchY || 1;
+    const previewScale = 0.8 * zoom;
+    const scX = scale * stretchX * previewScale;
+    const scY = scale * stretchY * previewScale;
     const sw = sprite.img.width * scX;
     const sh = sprite.img.height * scY;
+    const previewSprite: SpriteData = { ...sprite, rotateAtAnchor };
+    const pivot = getSpriteRotationPivot(previewSprite, sw, sh);
+    const painted = getPaintedContentCenter(sprite.img);
     
     canvas.width = 800;
     canvas.height = 800;
@@ -6000,26 +6275,37 @@ const TransformModal: React.FC<TransformModalProps> = ({ sprite, onSave, onClose
     ctx.imageSmoothingEnabled = false;
 
     ctx.save();
-    ctx.translate(400 + offsetX * zoom, 400 + offsetY * zoom);
+    ctx.translate(400, 400);
     ctx.rotate(rotation * Math.PI / 180);
-    ctx.drawImage(sprite.img, -sw/2, -sh/2, sw, sh);
+    if (pivot.preDrawX || pivot.preDrawY) {
+      ctx.translate(pivot.preDrawX, pivot.preDrawY);
+    }
+    ctx.drawImage(sprite.img, -sw / 2, -sh / 2, sw, sh);
     ctx.restore();
-  }, [sprite, rotation, offsetX, offsetY, zoom]);
+
+    const drawCross = (x: number, y: number, color: string, size = 5, lineWidth = 2) => {
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = lineWidth;
+      ctx.beginPath();
+      ctx.moveTo(x - size, y);
+      ctx.lineTo(x + size, y);
+      ctx.moveTo(x, y - size);
+      ctx.lineTo(x, y + size);
+      ctx.stroke();
+      ctx.restore();
+    };
+
+    if (rotateAtAnchor) {
+      drawCross(400, 400, '#6b66ff');
+    } else {
+      drawCross(400 + (painted.x * scX - sw / 2), 400 + (painted.y * scY - sh / 2), 'rgba(107, 102, 255, 0.55)', 5, 1.5);
+    }
+  }, [sprite, rotation, rotateAtAnchor, zoom]);
 
   useEffect(() => {
     savePref('joa-transform-zoom', zoom);
   }, [zoom]);
-
-  const handleMouseDown = (e: React.MouseEvent) => {
-    setIsDragging(true);
-    setDragStart({ x: e.clientX - offsetX * zoom, y: e.clientY - offsetY * zoom });
-  };
-
-  const handleMouseMove = (e: React.MouseEvent) => {
-    if (!isDragging) return;
-    setOffsetX((e.clientX - dragStart.x) / zoom);
-    setOffsetY((e.clientY - dragStart.y) / zoom);
-  };
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -6027,34 +6313,40 @@ const TransformModal: React.FC<TransformModalProps> = ({ sprite, onSave, onClose
         <div className="modal-header">
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
             <RotateCcw size={18} color="var(--accent)" />
-            <h3 style={{ fontSize: '1rem' }}>Transformar: {sprite.name}</h3>
+            <h3 style={{ fontSize: '1rem' }}>Rotar: {sprite.name}</h3>
           </div>
           <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
         </div>
-        <div className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`} 
-          onMouseDown={handleMouseDown}
-          onMouseMove={handleMouseMove}
-          onMouseUp={() => setIsDragging(false)}
-          onMouseLeave={() => setIsDragging(false)}
-          style={{ cursor: isDragging ? 'grabbing' : 'grab', position: 'relative' }}
-        >
+        <div className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`} style={{ position: 'relative' }}>
            <canvas ref={canvasRef} />
-           <div style={{ position: 'absolute', bottom: '20px', left: '50%', transform: 'translateX(-50%)', background: 'rgba(0,0,0,0.7)', padding: '8px 16px', borderRadius: '20px', fontSize: '0.7rem', color: 'white', pointerEvents: 'none' }}>
-             Arrastra para mover la imagen dentro del contenedor
+           <div style={{ position: 'absolute', bottom: '20px', left: '50%', transform: 'translateX(-50%)', background: 'rgba(0,0,0,0.7)', padding: '8px 16px', borderRadius: '20px', fontSize: '0.7rem', color: 'white', pointerEvents: 'none', textAlign: 'center', maxWidth: '90%' }}>
+             {rotateAtAnchor
+               ? 'Rota en su lugar sobre el centro del dibujo detectado (cruz violeta)'
+               : 'Rota alrededor del centro del PNG; el dibujo puede desplazarse si hay vacío'}
            </div>
         </div>
-        <div className="modal-footer" style={{ padding: '20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '24px' }}>
-          <div className="slider-item" style={{ flex: 1, marginBottom: 0 }}>
-            <div className="slider-label"><span><Search size={14} /> Zoom</span><span>{zoom.toFixed(1)}x</span></div>
-            <input type="range" min="0.5" max="8" step="0.1" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
-          </div>
-          <div className="slider-item" style={{ flex: 1, marginBottom: 0 }}>
-            <div className="slider-label"><span>Rotación</span><span>{rotation}°</span></div>
-            <input type="range" min="0" max="360" value={rotation} onChange={(e) => setRotation(parseInt(e.target.value))} />
-          </div>
-          <div style={{ display: 'flex', gap: '12px' }}>
-            <button className="btn btn-outline" onClick={() => { setRotation(0); setOffsetX(0); setOffsetY(0); setZoom(1); }}>Reiniciar</button>
-            <button className="btn btn-primary" style={{ paddingLeft: '24px', paddingRight: '24px' }} onClick={() => onSave(sprite.id, { rotation, offsetX, offsetY })}>Guardar Cambios</button>
+        <div className="modal-footer" style={{ padding: '20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '16px', flexDirection: 'column', alignItems: 'stretch' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.82rem', cursor: 'pointer', userSelect: 'none' }}>
+            <input
+              type="checkbox"
+              checked={rotateAtAnchor}
+              onChange={(e) => setRotateAtAnchor(e.target.checked)}
+            />
+            Rotar en su lugar (centro del dibujo fijo, no se desplaza en el PNG)
+          </label>
+          <div style={{ display: 'flex', gap: '24px', flexWrap: 'wrap', alignItems: 'center' }}>
+            <div className="slider-item" style={{ flex: 1, minWidth: '180px', marginBottom: 0 }}>
+              <div className="slider-label"><span><Search size={14} /> Zoom</span><span>{zoom.toFixed(1)}x</span></div>
+              <input type="range" min="0.5" max="8" step="0.1" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
+            </div>
+            <div className="slider-item" style={{ flex: 1, minWidth: '180px', marginBottom: 0 }}>
+              <div className="slider-label"><span>Rotación</span><span>{rotation}°</span></div>
+              <input type="range" min="0" max="360" value={rotation} onChange={(e) => setRotation(parseInt(e.target.value))} />
+            </div>
+            <div style={{ display: 'flex', gap: '12px' }}>
+              <button className="btn btn-outline" onClick={() => { setRotation(0); setRotateAtAnchor(false); setZoom(1); }}>Reiniciar</button>
+              <button className="btn btn-primary" style={{ paddingLeft: '24px', paddingRight: '24px' }} onClick={() => onSave(sprite.id, { rotation, rotateAtAnchor })}>Guardar Cambios</button>
+            </div>
           </div>
         </div>
       </div>
@@ -9034,7 +9326,9 @@ const App: React.FC = () => {
         const copies = duplicateClipboardSprites();
         if (copies.length === 0) return;
         commitSprites([...sprites, ...copies]);
-        setSelection(copies.map((s) => s.id));
+        const copyIds = copies.map((s) => s.id);
+        selectionAnchorRef.current = copyIds[copyIds.length - 1] ?? null;
+        setSelection(copyIds);
         return;
       }
 
@@ -9044,6 +9338,7 @@ const App: React.FC = () => {
       const remove = new Set(selection);
       commitSprites(sprites.filter((s) => !remove.has(s.id)));
       if (referenceId && remove.has(referenceId)) setReferenceId(null);
+      selectionAnchorRef.current = null;
       setSelection([]);
     };
     window.addEventListener('keydown', onKey);
@@ -9073,13 +9368,6 @@ const App: React.FC = () => {
   useEffect(() => {
     savePref(QUADRANT_VIEW_KEY, quadrantView);
   }, [quadrantView]);
-
-  useEffect(() => {
-    if (!columnView) {
-      setQuadrantPreviewIds([]);
-      setQuadrantPicking(false);
-    }
-  }, [columnView]);
 
   useEffect(() => {
     if (!emptyCellMenu) return;
@@ -9179,6 +9467,25 @@ const App: React.FC = () => {
   const [batchExportFormat, setBatchExportFormat] = useState<'png' | 'jpg' | 'dds' | null>(null);
   const [showGridlines, setShowGridlines] = useState(false);
   const [isWhiteBg, setIsWhiteBg] = useState(false);
+  const [autosaveEnabled, setAutosaveEnabled] = useState(() => loadPref<boolean>(AUTOSAVE_ENABLED_KEY, false) === true);
+  const [autosaveStatus, setAutosaveStatus] = useState<'idle' | 'saving' | 'ok' | 'error'>('idle');
+  const [autosaveTarget, setAutosaveTarget] = useState<string | null>(() => {
+    const mode = loadPref<string>(AUTOSAVE_MODE_KEY, '');
+    if (mode === 'strip') return loadPref<string>(AUTOSAVE_STRIP_PATH_KEY, '') || null;
+    if (mode === 'overwrite') return loadPref<string>(AUTOSAVE_OVERWRITE_FOLDER_KEY, '') || null;
+    return null;
+  });
+  const autosaveModeRef = useRef<AutosaveMode | null>((() => {
+    const saved = loadPref<string>(AUTOSAVE_MODE_KEY, '');
+    return saved === 'overwrite' || saved === 'strip' ? saved : null;
+  })());
+  const autosaveStripConfigRef = useRef<AutosaveStripConfig | null>(null);
+  const autosaveStripDestRef = useRef<SaveDestination | null>(null);
+  const autosaveOverwriteFolderRef = useRef<string | null>(loadPref<string>(AUTOSAVE_OVERWRITE_FOLDER_KEY, '') || null);
+  const autosaveBusyRef = useRef(false);
+  const autosaveQueuedRef = useRef(false);
+  const autosaveSkipSpritesRef = useRef(true);
+  const autosaveStatusTimerRef = useRef<number | null>(null);
   const [highlightedYs, setHighlightedYs] = useState<number[]>([]);
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
   const [draggedSpriteId, setDraggedSpriteId] = useState<string | null>(null);
@@ -9208,6 +9515,7 @@ const App: React.FC = () => {
     activated: boolean;
   } | null>(null);
   const suppressSpriteClickRef = useRef(false);
+  const selectionAnchorRef = useRef<string | null>(null);
   const dragPointerPosRef = useRef({ x: 0, y: 0 });
   const spritesRef = useRef(sprites);
   spritesRef.current = sprites;
@@ -9455,6 +9763,20 @@ const App: React.FC = () => {
     const empty = { prev: null as string | null, next: null as string | null, up: null as string | null, down: null as string | null };
     const currentId = quadrantPreviewIds[0];
     if (!currentId) return empty;
+
+    if (!columnView) {
+      const order = defaultGridSpriteOrder(sprites, gridSplitActive);
+      const i = order.indexOf(currentId);
+      if (i < 0 || order.length < 2) return empty;
+      const n = order.length;
+      return {
+        prev: order[(i - 1 + n) % n],
+        next: order[(i + 1) % n],
+        up: null,
+        down: null,
+      };
+    }
+
     const order: { id: string; col: string; row: string }[] = [];
     for (const row of spriteRows) {
       for (const col of visibleSpriteColumns) {
@@ -9624,6 +9946,7 @@ const App: React.FC = () => {
       data-drop-row={dropRowId || ''}
       data-split-band={splitBand || ''}
       onPointerDown={(e) => {
+        if (quadrantPicking) return;
         if (e.button !== 0) return;
         if ((e.target as HTMLElement).closest('input, textarea, button, a')) return;
         // Anchor crosshair and similar interactive bits stop their own propagation.
@@ -9745,7 +10068,8 @@ const App: React.FC = () => {
         onFocusResolution={focusSpriteResolution}
         isWhiteBg={isWhiteBg}
         quadrantView={quadrantBoard}
-        onOpenQuadrantPreview={columnView ? openQuadrantPreview : undefined}
+        quadrantPicking={quadrantPicking}
+        onOpenQuadrantPreview={openQuadrantPreview}
         onUpdateSprite={(id, updates) => {
           const next = sprites.map((item: SpriteData) => item.id === id ? { ...item, ...updates } : item);
           commitSprites(next);
@@ -9822,7 +10146,9 @@ const App: React.FC = () => {
     if (newSprites.length > 0) {
       const merged = [...sprites, ...newSprites];
       commitSprites(merged);
-      setSelection(newSprites.map((s: SpriteData) => s.id));
+      const ids = newSprites.map((s: SpriteData) => s.id);
+      selectionAnchorRef.current = ids[ids.length - 1] ?? null;
+      setSelection(ids);
     }
     if (importErrors.length > 0) {
       alert(`No se pudieron importar: ${importErrors.join(', ')}`);
@@ -9859,6 +10185,7 @@ const App: React.FC = () => {
     setRowLabelsCollapsed(loaded.rowLabelsCollapsed);
     setColumnView(loaded.columnView);
     setReferenceId(loaded.referenceId);
+    selectionAnchorRef.current = null;
     setSelection([]);
     const orderedSprites = buildSpritesInBoardOrder(loaded.sprites, loaded.rows, loaded.columns);
     setSprites(orderedSprites);
@@ -10150,23 +10477,48 @@ const App: React.FC = () => {
     if (newSprites.length > 0) {
       const merged = [...sprites, ...newSprites];
       commitSprites(merged);
-      setSelection(newSprites.map((s: SpriteData) => s.id));
+      const ids = newSprites.map((s: SpriteData) => s.id);
+      selectionAnchorRef.current = ids[ids.length - 1] ?? null;
+      setSelection(ids);
     }
   };
 
-  const toggleSelect = (id: string, multi: boolean) => {
-    if (multi) {
-      setSelection(prev => {
+  const getDefaultGridSpriteOrder = (): string[] =>
+    defaultGridSpriteOrder(spritesRef.current, gridSplitActiveRef.current);
+
+  const toggleSelect = (id: string, mode: SpriteSelectMode) => {
+    if (mode === 'range' && !columnViewRef.current) {
+      const order = getDefaultGridSpriteOrder();
+      const anchor = selectionAnchorRef.current;
+      const anchorIdx = anchor ? order.indexOf(anchor) : -1;
+      const clickIdx = order.indexOf(id);
+      if (anchorIdx < 0 || clickIdx < 0) {
+        selectionAnchorRef.current = id;
+        setSelection([id]);
+        return;
+      }
+      const lo = Math.min(anchorIdx, clickIdx);
+      const hi = Math.max(anchorIdx, clickIdx);
+      setSelection(order.slice(lo, hi + 1));
+      return;
+    }
+
+    if (mode === 'toggle' || (mode === 'range' && columnViewRef.current)) {
+      selectionAnchorRef.current = id;
+      setSelection((prev) => {
         const newSel = prev.includes(id) ? prev.filter((i: string) => i !== id) : [...prev, id];
         if (!newSel.includes(id) && referenceId === id) setReferenceId(null);
         return newSel;
       });
-    } else {
-      setSelection([id]);
+      return;
     }
+
+    selectionAnchorRef.current = id;
+    setSelection([id]);
   };
 
   const focusSpriteResolution = (id: string) => {
+    selectionAnchorRef.current = id;
     setSelection([id]);
     setQuadrantPreviewIds([]);
     setQuadrantPicking(false);
@@ -10222,6 +10574,279 @@ const App: React.FC = () => {
       console.error('Directory selection failed:', err);
     }
   };
+
+  const restoreAutosaveStripConfig = () => {
+    if (autosaveModeRef.current !== 'strip') return;
+    const filePath = String(loadPref<string>(AUTOSAVE_STRIP_PATH_KEY, '') || '');
+    autosaveStripConfigRef.current = {
+      cols: Math.round(clampNum(loadPref<number>(LAST_EXPORT_STRIP_COLS_KEY, 10), 1, 1024, 10)),
+      rows: Math.round(clampNum(loadPref<number>(LAST_EXPORT_STRIP_ROWS_KEY, 1), 1, 1024, 1)),
+      includeGrid: loadPref<boolean>(LAST_EXPORT_STRIP_GRID_KEY, false) === true,
+      fileName: String(loadPref<string>(AUTOSAVE_STRIP_FILE_KEY, 'spritesheet_export.png') || 'spritesheet_export.png'),
+      filePath,
+    };
+    if (filePath && getDesktop()) {
+      autosaveStripDestRef.current = desktopFileDestination(filePath);
+      setAutosaveTarget(filePath);
+    }
+  };
+
+  const restoreAutosaveFromPrefs = () => {
+    if (!autosaveEnabled) return;
+    if (autosaveModeRef.current === 'strip') {
+      restoreAutosaveStripConfig();
+    } else if (autosaveModeRef.current === 'overwrite') {
+      const folderPath = autosaveOverwriteFolderRef.current || loadPref<string>(AUTOSAVE_OVERWRITE_FOLDER_KEY, '') || null;
+      if (folderPath) {
+        autosaveOverwriteFolderRef.current = folderPath;
+        setAutosaveTarget(folderPath);
+      }
+    }
+  };
+
+  const clearAutosaveSession = () => {
+    autosaveModeRef.current = null;
+    autosaveStripConfigRef.current = null;
+    autosaveStripDestRef.current = null;
+    autosaveOverwriteFolderRef.current = null;
+    autosaveQueuedRef.current = false;
+    autosaveSkipSpritesRef.current = true;
+    setAutosaveTarget(null);
+    setAutosaveStatus('idle');
+    if (autosaveStatusTimerRef.current) {
+      window.clearTimeout(autosaveStatusTimerRef.current);
+      autosaveStatusTimerRef.current = null;
+    }
+    savePref(AUTOSAVE_MODE_KEY, '');
+    savePref(AUTOSAVE_STRIP_PATH_KEY, '');
+    savePref(AUTOSAVE_OVERWRITE_FOLDER_KEY, '');
+    savePref(AUTOSAVE_STRIP_FILE_KEY, 'spritesheet_export.png');
+  };
+
+  useEffect(() => {
+    restoreAutosaveFromPrefs();
+  }, []);
+
+  useEffect(() => {
+    if (autosaveEnabled && !autosaveModeRef.current) {
+      setAutosaveEnabled(false);
+      savePref(AUTOSAVE_ENABLED_KEY, false);
+    }
+  }, []);
+
+  const configureAutosave = async (): Promise<boolean> => {
+    const mode = await promptAutosaveModeChoice();
+    if (!mode) return false;
+
+    if (mode === 'overwrite') {
+      const desktop = getDesktop();
+      if (desktop) {
+        const folder = await desktop.pickFolder({
+          title: 'Autoguardado — carpeta donde están los PNG (se sobrescriben por nombre)',
+        });
+        if (!folder) return false;
+        setWorkingFolder(folder);
+        autosaveOverwriteFolderRef.current = folder.path;
+        savePref(AUTOSAVE_OVERWRITE_FOLDER_KEY, folder.path);
+        setAutosaveTarget(folder.path);
+      } else {
+        let folderHandle = dirHandle;
+        try {
+          folderHandle = await (window as any).showDirectoryPicker({
+            id: WORKING_PICKER_ID,
+            mode: 'readwrite',
+            startIn: dirHandle || undefined,
+          });
+          updateDirHandle(folderHandle);
+        } catch {
+          return false;
+        }
+        if (!folderHandle || !(await ensureHandlePermission(folderHandle, 'readwrite'))) {
+          alert('No hay permiso de escritura sobre la carpeta elegida.');
+          return false;
+        }
+        setAutosaveTarget(folderHandle.name);
+      }
+      autosaveModeRef.current = 'overwrite';
+      savePref(AUTOSAVE_MODE_KEY, 'overwrite');
+      autosaveStripDestRef.current = null;
+      autosaveStripConfigRef.current = null;
+      return true;
+    }
+
+    const cols = promptLastInt(
+      LAST_EXPORT_STRIP_COLS_KEY,
+      '¿Cuántas columnas deseas para el spritesheet al exportar?',
+      10,
+      { min: 1, max: 1024, invalidMessage: 'Número de filas o columnas inválido.' },
+    );
+    if (cols === null) return false;
+
+    const rows = promptLastInt(
+      LAST_EXPORT_STRIP_ROWS_KEY,
+      '¿Cuántas filas deseas para el spritesheet al exportar?',
+      1,
+      { min: 1, max: 1024, invalidMessage: 'Número de filas o columnas inválido.' },
+    );
+    if (rows === null) return false;
+
+    const includeGrid = await confirmLastBool(
+      LAST_EXPORT_STRIP_GRID_KEY,
+      '¿Deseas dibujar una cuadrícula guía sobre las imágenes exportadas?',
+      false,
+      { yes: 'Sí, con guía', no: 'No', title: 'Exportar como Tira' },
+    );
+
+    const picked = await pickAutosaveStripDestination('spritesheet_export.png');
+    if (!picked) return false;
+
+    savePref(AUTOSAVE_STRIP_FILE_KEY, picked.fileName);
+    savePref(AUTOSAVE_STRIP_PATH_KEY, picked.filePath);
+
+    autosaveModeRef.current = 'strip';
+    savePref(AUTOSAVE_MODE_KEY, 'strip');
+    autosaveStripConfigRef.current = { cols, rows, includeGrid, fileName: picked.fileName, filePath: picked.filePath };
+    autosaveStripDestRef.current = picked.dest;
+    setAutosaveTarget(picked.filePath);
+    return true;
+  };
+
+  const ensureAutosaveStripDestination = async (): Promise<boolean> => {
+    if (autosaveStripDestRef.current) return true;
+    restoreAutosaveStripConfig();
+    const cfg = autosaveStripConfigRef.current;
+    if (cfg?.filePath && getDesktop()) {
+      autosaveStripDestRef.current = desktopFileDestination(cfg.filePath);
+      setAutosaveTarget(cfg.filePath);
+      return true;
+    }
+    const picked = await pickAutosaveStripDestination(cfg?.fileName || 'spritesheet_export.png');
+    if (!picked) return false;
+    savePref(AUTOSAVE_STRIP_FILE_KEY, picked.fileName);
+    savePref(AUTOSAVE_STRIP_PATH_KEY, picked.filePath);
+    if (cfg) {
+      autosaveStripConfigRef.current = { ...cfg, fileName: picked.fileName, filePath: picked.filePath };
+    }
+    autosaveStripDestRef.current = picked.dest;
+    setAutosaveTarget(picked.filePath);
+    return true;
+  };
+
+  const writeSpritesOverwrite = async (spriteList: SpriteData[]) => {
+    const desktop = getDesktop();
+    if (desktop) {
+      const folderPath = autosaveOverwriteFolderRef.current || loadPref<string>(AUTOSAVE_OVERWRITE_FOLDER_KEY, '');
+      let folder = folderPath ? { path: folderPath, name: fileBaseName(folderPath) } : null;
+      if (!folder) {
+        folder = workingFolder || await desktop.getWorkingFolder();
+      }
+      if (!folder) {
+        folder = await desktop.pickFolder({
+          title: 'Autoguardado — carpeta donde están los PNG (se sobrescriben por nombre)',
+        });
+        if (!folder) throw new Error('No se eligió carpeta para autoguardado.');
+        setWorkingFolder(folder);
+        autosaveOverwriteFolderRef.current = folder.path;
+        savePref(AUTOSAVE_OVERWRITE_FOLDER_KEY, folder.path);
+        setAutosaveTarget(folder.path);
+      }
+      const files: { name: string; data: ArrayBuffer }[] = [];
+      for (const s of spriteList) {
+        const canvas = renderSpriteToCanvas(s, true);
+        const blob = await canvasToPngBlob(canvas);
+        if (!blob.size) throw new Error(`No se pudo generar PNG de «${s.name}».`);
+        files.push({
+          name: sanitizeExportFileName(s.name, '.png'),
+          data: await arrayBufferFromBlob(blob),
+        });
+      }
+      await desktop.writeFilesToFolder(folder.path, files);
+      return;
+    }
+
+    if (!dirHandle || !(await ensureHandlePermission(dirHandle, 'readwrite'))) {
+      throw new Error('No hay permiso de escritura sobre la carpeta vinculada.');
+    }
+    for (const s of spriteList) {
+      const canvas = renderSpriteToCanvas(s, true);
+      const blob = await canvasToPngBlob(canvas);
+      if (!blob.size) throw new Error(`No se pudo generar PNG de «${s.name}».`);
+      const fileName = sanitizeExportFileName(s.name, '.png');
+      const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+    }
+  };
+
+  const writeSpritesStrip = async (spriteList: SpriteData[]) => {
+    if (!(await ensureAutosaveStripDestination())) {
+      throw new Error('No se eligió archivo de tira para autoguardado.');
+    }
+    const cfg = autosaveStripConfigRef.current!;
+    const dest = autosaveStripDestRef.current!;
+    const canvas = buildStripSpritesheetCanvas(spriteList, cfg.cols, cfg.rows, cfg.includeGrid);
+    const blob = await canvasToPngBlob(canvas);
+    if (!blob.size) throw new Error('No se pudo generar la tira PNG.');
+    const result = await writeBlobWithFallback(dest, blob, cfg.fileName);
+    if (result === 'failed') throw new Error('No se pudo escribir la tira PNG.');
+  };
+
+  const runAutosave = async () => {
+    if (!autosaveEnabled || spritesRef.current.length === 0 || !autosaveModeRef.current) return;
+    if (autosaveBusyRef.current) {
+      autosaveQueuedRef.current = true;
+      return;
+    }
+    autosaveBusyRef.current = true;
+    setAutosaveStatus('saving');
+    try {
+      if (autosaveModeRef.current === 'overwrite') {
+        await writeSpritesOverwrite(spritesRef.current);
+      } else {
+        await writeSpritesStrip(spritesRef.current);
+      }
+      setAutosaveStatus('ok');
+      if (autosaveStatusTimerRef.current) window.clearTimeout(autosaveStatusTimerRef.current);
+      autosaveStatusTimerRef.current = window.setTimeout(() => setAutosaveStatus('idle'), 2500);
+    } catch (err) {
+      console.error('Autosave failed:', err);
+      setAutosaveStatus('error');
+    } finally {
+      autosaveBusyRef.current = false;
+      if (autosaveQueuedRef.current) {
+        autosaveQueuedRef.current = false;
+        void runAutosave();
+      }
+    }
+  };
+
+  const handleAutosaveToggle = async (checked: boolean) => {
+    if (!checked) {
+      clearAutosaveSession();
+      setAutosaveEnabled(false);
+      savePref(AUTOSAVE_ENABLED_KEY, false);
+      return;
+    }
+    clearAutosaveSession();
+    const ok = await configureAutosave();
+    if (!ok) return;
+    setAutosaveEnabled(true);
+    savePref(AUTOSAVE_ENABLED_KEY, true);
+    autosaveSkipSpritesRef.current = true;
+    void runAutosave();
+  };
+
+  useEffect(() => {
+    if (!autosaveEnabled) return;
+    if (sprites.length === 0) return;
+    if (autosaveSkipSpritesRef.current) {
+      autosaveSkipSpritesRef.current = false;
+      return;
+    }
+    const timer = window.setTimeout(() => { void runAutosave(); }, 500);
+    return () => window.clearTimeout(timer);
+  }, [sprites, autosaveEnabled]);
 
   const overwriteAll = async () => {
     const desktop = getDesktop();
@@ -11258,53 +11883,16 @@ const App: React.FC = () => {
     );
 
     setIsSaving(true);
-    let maxW = 0;
-    let maxH = 0;
-    
-    // First pass to determine cell dimensions
-    const processedCanvases: HTMLCanvasElement[] = [];
-
-    for (const s of sprites) {
-      const canvas = renderSpriteToCanvas(s, true);
-      maxW = Math.max(maxW, canvas.width);
-      maxH = Math.max(maxH, canvas.height);
-      processedCanvases.push(canvas);
-    }
-
-    const compiledCanvas = document.createElement('canvas');
-    compiledCanvas.width = maxW * cols;
-    compiledCanvas.height = maxH * rows;
-    const ctx = compiledCanvas.getContext('2d')!;
-
-    for (let i = 0; i < processedCanvases.length && i < rows * cols; i++) {
-        const c = i % cols;
-        const r = Math.floor(i / cols);
-        const cellCanvas = processedCanvases[i];
-        
-        const dx = (c * maxW) + Math.floor((maxW - cellCanvas.width) / 2);
-        const dy = (r * maxH) + Math.floor((maxH - cellCanvas.height) / 2);
-        
-        ctx.drawImage(cellCanvas, dx, dy);
-        
-        if (includeGrid) {
-            ctx.strokeStyle = 'rgba(0,0,0,0.4)';
-            ctx.lineWidth = 1;
-            ctx.strokeRect(c * maxW + 0.5, r * maxH + 0.5, maxW - 1, maxH - 1);
-        }
-    }
-
-    const blob = await new Promise<Blob | null>(resolve => compiledCanvas.toBlob(resolve, 'image/png'));
-    if (!blob) {
-      setIsSaving(false);
-      return;
-    }
-
     try {
+      const compiledCanvas = buildStripSpritesheetCanvas(sprites, cols, rows, includeGrid);
+      const blob = await canvasToPngBlob(compiledCanvas);
+      if (!blob.size) return;
       await saveBlobToDisk(blob, 'spritesheet_export.png', [{ name: 'PNG Image', extensions: ['png'] }]);
     } catch (err) {
       console.error(err);
+    } finally {
+      setIsSaving(false);
     }
-    setIsSaving(false);
   };
 
   const spriteNameToPng = (name: string) => name.replace(/\.[^.]+$/i, '') + '.png';
@@ -11443,6 +12031,27 @@ const App: React.FC = () => {
               <input type="checkbox" checked={gridSplitActive} onChange={(e) => setGridSplitActive(e.target.checked)} style={{ marginRight: '6px', cursor: 'pointer' }} />
               Separar
             </label>
+            <label style={{ marginLeft: '12px', fontSize: '0.7rem', display: 'inline-flex', alignItems: 'center', cursor: 'pointer', fontWeight: 'normal', color: autosaveEnabled ? 'var(--accent)' : 'var(--text-muted)', userSelect: 'none' }}
+              title={autosaveEnabled && autosaveTarget
+                ? `Autoguardado activo → ${autosaveTarget}`
+                : 'Guarda automáticamente con cada cambio. Al activarlo elegís carpeta (PNG sueltos) o archivo (tira).'}
+            >
+              <input
+                type="checkbox"
+                checked={autosaveEnabled}
+                onChange={(e) => { void handleAutosaveToggle(e.target.checked); }}
+                style={{ marginRight: '6px', cursor: 'pointer', flexShrink: 0 }}
+              />
+              Autoguardado
+              {autosaveStatus === 'saving' && <span style={{ marginLeft: '6px', opacity: 0.85 }}>…</span>}
+              {autosaveStatus === 'ok' && <span style={{ marginLeft: '6px', opacity: 0.85 }}>✓</span>}
+              {autosaveStatus === 'error' && <span style={{ marginLeft: '6px', color: '#ff6b6b' }}>!</span>}
+              {autosaveEnabled && autosaveTarget && (
+                <span style={{ marginLeft: '6px', opacity: 0.9, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '200px' }} title={autosaveTarget}>
+                  → {autosaveTarget}
+                </span>
+              )}
+            </label>
             <label style={{ marginLeft: '12px', fontSize: '0.7rem', display: 'inline-flex', alignItems: 'center', cursor: 'pointer', fontWeight: 'normal', color: 'var(--text-muted)', userSelect: 'none' }}>
               <input type="checkbox" checked={isWhiteBg} onChange={(e) => setIsWhiteBg(e.target.checked)} style={{ marginRight: '6px', cursor: 'pointer' }} />
               Fondo Blanco
@@ -11554,12 +12163,17 @@ const App: React.FC = () => {
              <Film size={16} /> Probar Animación
            </button>
            <div style={{ height: '24px', width: '1px', background: 'var(--border)', margin: '0 2px', flexShrink: 0 }} />
-           <button className="btn btn-outline" onClick={() => setSelection(sprites.map((s: SpriteData) => s.id))}>
+           <button className="btn btn-outline" onClick={() => {
+             const order = getDefaultGridSpriteOrder();
+             selectionAnchorRef.current = order[order.length - 1] ?? null;
+             setSelection(order);
+           }}>
              <CheckSquare size={16} /> Todos
            </button>
            <button className="btn btn-danger" onClick={() => { 
              const next = sprites.filter((s: SpriteData) => !selection.includes(s.id));
              commitSprites(next);
+             selectionAnchorRef.current = null;
              setSelection([]); 
            }}>
              <Trash2 size={16} /> Eliminar

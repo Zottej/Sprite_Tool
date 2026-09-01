@@ -5,7 +5,7 @@ contextBridge.exposeInMainWorld('joaDesktop', {
   getWorkingFolder: () => ipcRenderer.invoke('desktop:getWorkingFolder'),
   setWorkingFolder: (folderPath) => ipcRenderer.invoke('desktop:setWorkingFolder', folderPath),
   clearWorkingFolder: () => ipcRenderer.invoke('desktop:clearWorkingFolder'),
-  pickFolder: () => ipcRenderer.invoke('desktop:pickFolder'),
+  pickFolder: (options) => ipcRenderer.invoke('desktop:pickFolder', options || {}),
   pickOpenFiles: (options) => ipcRenderer.invoke('desktop:pickOpenFiles', options || {}),
   pickSaveFile: (options) => ipcRenderer.invoke('desktop:pickSaveFile', options || {}),
   writeFile: (filePath, data) => ipcRenderer.invoke('desktop:writeFile', filePath, data),
