@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { 
   Trash2, Plus, Archive, CheckSquare, Square, 
   Target, FolderSync, Save, AlertTriangle, Eraser, RotateCcw, Search, MapPin, Pencil, MoreHorizontal, FlipHorizontal, FlipVertical, Droplets, Grid, Circle, Maximize, Layers, Play, Pause, Film, PaintBucket, Scissors, Type, Crop, Brush, ChevronLeft, ChevronRight,
-  ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Pipette, Stamp, Lock, Columns2, FolderOpen, Rows3, Hash, ChevronDown, Maximize2, X, ShieldOff
+  ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Pipette, Stamp, Lock, Columns2, FolderOpen, Rows3, Hash, ChevronDown, Maximize2, X, ShieldOff, Boxes
 } from 'lucide-react';
 import JSZip from 'jszip';
 import { canvasToBc7Dds, spriteNameToDds } from './ddsExport';
@@ -1454,6 +1454,339 @@ const getNeutralSprite = (sprite: SpriteData): SpriteData => ({
   scale: 1,
 });
 
+type PixelArtSource = HTMLImageElement | HTMLCanvasElement;
+
+const intrinsicPixelSizeCache = new WeakMap<PixelArtSource, number>();
+const pixelatedLayerCache = new WeakMap<PixelArtSource, Map<string, HTMLCanvasElement>>();
+
+const readSourcePixelData = (source: PixelArtSource) => {
+  const w = source.width;
+  const h = source.height;
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return null;
+  ctx.drawImage(source, 0, 0);
+  return { w, h, data: ctx.getImageData(0, 0, w, h).data };
+};
+
+/**
+ * Tamaño del “píxel de arte” del dibujo (no la resolución del archivo).
+ * - MAE: mayor N donde promediar bloques N×N casi no cambia la imagen (upscale limpio)
+ * - Runs: longitud típica entre cambios fuertes de color (pixel art grueso nativo)
+ */
+const detectIntrinsicPixelSizeFromData = (data: Uint8ClampedArray, w: number, h: number): number => {
+  if (w < 2 || h < 2) return 1;
+
+  const maxN = Math.min(48, Math.floor(Math.min(w, h) / 3));
+
+  const maeForN = (n: number): number => {
+    let err = 0;
+    let count = 0;
+    for (let by = 0; by + n <= h; by += n) {
+      for (let bx = 0; bx + n <= w; bx += n) {
+        let r = 0;
+        let g = 0;
+        let b = 0;
+        let op = 0;
+        for (let dy = 0; dy < n; dy++) {
+          for (let dx = 0; dx < n; dx++) {
+            const i = ((by + dy) * w + (bx + dx)) * 4;
+            if (data[i + 3] < 12) continue;
+            r += data[i];
+            g += data[i + 1];
+            b += data[i + 2];
+            op++;
+          }
+        }
+        if (op < n * n * 0.35) continue;
+        r = (r / op) | 0;
+        g = (g / op) | 0;
+        b = (b / op) | 0;
+        for (let dy = 0; dy < n; dy++) {
+          for (let dx = 0; dx < n; dx++) {
+            const i = ((by + dy) * w + (bx + dx)) * 4;
+            if (data[i + 3] < 12) continue;
+            err += Math.abs(data[i] - r) + Math.abs(data[i + 1] - g) + Math.abs(data[i + 2] - b);
+            count++;
+          }
+        }
+      }
+    }
+    return count ? err / (count * 3) : 999;
+  };
+
+  const detectByMae = (): number => {
+    const T = 8;
+    for (let n = maxN; n >= 2; n--) {
+      if (maeForN(n) <= T) return n;
+    }
+    return 1;
+  };
+
+  const detectByStrongRuns = (): number => {
+    const strongDiff = (i: number, j: number) =>
+      Math.abs(data[i] - data[j]) +
+        Math.abs(data[i + 1] - data[j + 1]) +
+        Math.abs(data[i + 2] - data[j + 2]) >
+      45;
+
+    const runs: number[] = [];
+    const push = (len: number) => {
+      if (len >= 1) runs.push(Math.min(len, maxN * 2));
+    };
+
+    const rowStep = Math.max(1, Math.floor(h / 60));
+    for (let y = 0; y < h; y += rowStep) {
+      let x = 0;
+      while (x < w) {
+        const i0 = (y * w + x) * 4;
+        if (data[i0 + 3] < 12) {
+          x++;
+          continue;
+        }
+        let len = 1;
+        while (x + len < w) {
+          const iPrev = (y * w + x + len - 1) * 4;
+          const i1 = (y * w + x + len) * 4;
+          if (data[i1 + 3] < 12 || strongDiff(iPrev, i1)) break;
+          len++;
+        }
+        push(len);
+        x += len;
+      }
+    }
+
+    const colStep = Math.max(1, Math.floor(w / 60));
+    for (let x = 0; x < w; x += colStep) {
+      let y = 0;
+      while (y < h) {
+        const i0 = (y * w + x) * 4;
+        if (data[i0 + 3] < 12) {
+          y++;
+          continue;
+        }
+        let len = 1;
+        while (y + len < h) {
+          const iPrev = ((y + len - 1) * w + x) * 4;
+          const i1 = ((y + len) * w + x) * 4;
+          if (data[i1 + 3] < 12 || strongDiff(iPrev, i1)) break;
+          len++;
+        }
+        push(len);
+        y += len;
+      }
+    }
+
+    if (runs.length < 24) return 1;
+    runs.sort((a, b) => a - b);
+    return Math.max(1, Math.min(maxN, runs[Math.floor(runs.length * 0.35)] || 1));
+  };
+
+  return Math.max(detectByMae(), detectByStrongRuns());
+};
+
+const detectIntrinsicPixelSize = (source: PixelArtSource): number => {
+  if (source.width < 2 || source.height < 2) return 1;
+  const pixels = readSourcePixelData(source);
+  if (!pixels) return 1;
+  return detectIntrinsicPixelSizeFromData(pixels.data, pixels.w, pixels.h);
+};
+
+const getIntrinsicPixelSize = (source: PixelArtSource): number => {
+  const cached = intrinsicPixelSizeCache.get(source);
+  if (cached !== undefined) return cached;
+  const size = detectIntrinsicPixelSize(source);
+  intrinsicPixelSizeCache.set(source, size);
+  return size;
+};
+
+const snapBlockSizeToArtGrid = (rawBlock: number, intrinsic: number): number => {
+  if (rawBlock <= 1.05) return 1;
+  if (rawBlock <= intrinsic * 1.15) return intrinsic;
+  return Math.max(intrinsic, Math.round(rawBlock / intrinsic) * intrinsic);
+};
+
+const colorEdgeStrength = (
+  data: Uint8ClampedArray,
+  w: number,
+  h: number,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+): number => {
+  if (x1 < 0 || y1 < 0 || x2 >= w || y2 >= h) return 0;
+  const i1 = (y1 * w + x1) * 4;
+  const i2 = (y2 * w + x2) * 4;
+  if (data[i1 + 3] < 12 && data[i2 + 3] < 12) return 0;
+  return Math.abs(data[i1] - data[i2]) + Math.abs(data[i1 + 1] - data[i2 + 1]) + Math.abs(data[i1 + 2] - data[i2 + 2]);
+};
+
+const findBestPixelGridOffset = (
+  data: Uint8ClampedArray,
+  w: number,
+  h: number,
+  bw: number,
+  bh: number,
+  searchMax: number,
+): { ox: number; oy: number } => {
+  const rangeX = Math.min(searchMax, bw);
+  const rangeY = Math.min(searchMax, bh);
+  let bestOx = 0;
+  let bestOy = 0;
+  let best = -1;
+
+  for (let oy = 0; oy < rangeY; oy++) {
+    for (let ox = 0; ox < rangeX; ox++) {
+      let score = 0;
+      for (let x = ox + bw; x < w; x += bw) {
+        for (let y = 0; y < h; y++) {
+          score += colorEdgeStrength(data, w, h, x - 1, y, x, y);
+        }
+      }
+      for (let y = oy + bh; y < h; y += bh) {
+        for (let x = 0; x < w; x++) {
+          score += colorEdgeStrength(data, w, h, x, y - 1, x, y);
+        }
+      }
+      if (score > best) {
+        best = score;
+        bestOx = ox;
+        bestOy = oy;
+      }
+    }
+  }
+  return { ox: bestOx, oy: bestOy };
+};
+
+const getBlockRepresentativeColor = (
+  data: Uint8ClampedArray,
+  w: number,
+  h: number,
+  bx: number,
+  by: number,
+  bw: number,
+  bh: number,
+): [number, number, number, number] => {
+  const x0 = Math.max(0, bx);
+  const y0 = Math.max(0, by);
+  const x1 = Math.min(w, bx + bw);
+  const y1 = Math.min(h, by + bh);
+  const counts = new Map<number, { count: number; r: number; g: number; b: number; a: number }>();
+
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const i = (y * w + x) * 4;
+      const a = data[i + 3];
+      if (a < 12) continue;
+      const rq = data[i] >> 3;
+      const gq = data[i + 1] >> 3;
+      const bq = data[i + 2] >> 3;
+      const key = (rq << 20) | (gq << 10) | bq;
+      const entry = counts.get(key);
+      if (entry) {
+        entry.count++;
+        entry.a = Math.max(entry.a, a);
+      } else {
+        counts.set(key, { count: 1, r: data[i], g: data[i + 1], b: data[i + 2], a });
+      }
+    }
+  }
+
+  if (counts.size === 0) return [0, 0, 0, 0];
+
+  let best = { count: 0, r: 0, g: 0, b: 0, a: 0 };
+  for (const v of counts.values()) {
+    if (v.count > best.count) best = v;
+  }
+  return [best.r, best.g, best.b, best.a];
+};
+
+const buildPixelArtPixelatedCanvas = (
+  source: PixelArtSource,
+  displayBlockPx: number,
+  scale: number,
+  stretchX: number,
+  stretchY: number,
+): HTMLCanvasElement => {
+  const cacheKey = `${displayBlockPx}|${scale}|${stretchX}|${stretchY}`;
+  let imgCache = pixelatedLayerCache.get(source);
+  if (imgCache?.has(cacheKey)) return imgCache.get(cacheKey)!;
+
+  const w = source.width;
+  const h = source.height;
+  const intrinsic = getIntrinsicPixelSize(source);
+  const blockSrcX = snapBlockSizeToArtGrid(displayBlockPx / Math.max(0.001, scale * stretchX), intrinsic);
+  const blockSrcY = snapBlockSizeToArtGrid(displayBlockPx / Math.max(0.001, scale * stretchY), intrinsic);
+
+  if (blockSrcX <= 1 && blockSrcY <= 1) {
+    const passthrough = document.createElement('canvas');
+    passthrough.width = w;
+    passthrough.height = h;
+    const pctx = passthrough.getContext('2d')!;
+    pctx.imageSmoothingEnabled = false;
+    pctx.drawImage(source, 0, 0);
+    if (!imgCache) {
+      imgCache = new Map();
+      pixelatedLayerCache.set(source, imgCache);
+    }
+    imgCache.set(cacheKey, passthrough);
+    return passthrough;
+  }
+
+  const pixels = readSourcePixelData(source);
+  if (!pixels) {
+    const fallback = document.createElement('canvas');
+    fallback.width = w;
+    fallback.height = h;
+    fallback.getContext('2d')!.drawImage(source, 0, 0);
+    return fallback;
+  }
+  const { data } = pixels;
+
+  const { ox, oy } = findBestPixelGridOffset(data, w, h, blockSrcX, blockSrcY, intrinsic);
+
+  const out = document.createElement('canvas');
+  out.width = w;
+  out.height = h;
+  const outData = out.getContext('2d', { willReadFrequently: true })!.createImageData(w, h);
+  const od = outData.data;
+
+  const startBx = ((ox % blockSrcX) + blockSrcX) % blockSrcX - blockSrcX;
+  const startBy = ((oy % blockSrcY) + blockSrcY) % blockSrcY - blockSrcY;
+
+  for (let bx = startBx; bx < w; bx += blockSrcX) {
+    for (let by = startBy; by < h; by += blockSrcY) {
+      const [r, g, b, a] = getBlockRepresentativeColor(data, w, h, bx, by, blockSrcX, blockSrcY);
+      if (a < 12) continue;
+      const x0 = Math.max(0, bx);
+      const y0 = Math.max(0, by);
+      const x1 = Math.min(w, bx + blockSrcX);
+      const y1 = Math.min(h, by + blockSrcY);
+      for (let y = y0; y < y1; y++) {
+        for (let x = x0; x < x1; x++) {
+          const i = (y * w + x) * 4;
+          od[i] = r;
+          od[i + 1] = g;
+          od[i + 2] = b;
+          od[i + 3] = a;
+        }
+      }
+    }
+  }
+
+  out.getContext('2d')!.putImageData(outData, 0, 0);
+
+  if (!imgCache) {
+    imgCache = new Map();
+    pixelatedLayerCache.set(source, imgCache);
+  }
+  imgCache.set(cacheKey, out);
+  return out;
+};
+
 /** Contorno pixel-art: dilata la silueta en la grilla actual (Chebyshev) y pinta debajo del sprite. */
 const applyPixelOutlineToCanvas = (
   source: HTMLCanvasElement,
@@ -1518,31 +1851,19 @@ const drawSpriteImageLayer = (
 
   if (effective.pixelation && effective.pixelation > 1) {
     const p = effective.pixelation;
-    const tw = Math.max(1, Math.floor(sw / p));
-    const th = Math.max(1, Math.floor(sh / p));
-    const tempCanvas = document.createElement('canvas');
-    tempCanvas.width = tw;
-    tempCanvas.height = th;
-    const tctx = tempCanvas.getContext('2d')!;
-    tctx.imageSmoothingEnabled = false;
-    // Filtros de color se aplican al upscale; acá solo rasterizamos la fuente.
-    // Para contorno pixelado: primero dibujamos con filtro a un buffer a tamaño final,
-    // pero el contorno se calcula en la grilla de pixelación.
-    tctx.filter = 'none';
-    tctx.drawImage(imgSource, 0, 0, tw, th);
+    const pixelated = buildPixelArtPixelatedCanvas(imgSource, p, scale, stretchX, stretchY);
 
     if (usePixelOutline) {
-      // Grosor en "bloques" de pixelación (misma unidad visual que el sprite pixelado)
       const outlined = applyPixelOutlineToCanvas(
-        tempCanvas,
+        pixelated,
         effective.outlineColor!,
         effective.outlineWidth!
       );
       ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(outlined, 0, 0, tw, th, -sw / 2, -sh / 2, sw, sh);
+      ctx.drawImage(outlined, -sw / 2, -sh / 2, sw, sh);
     } else {
       ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(tempCanvas, 0, 0, tw, th, -sw / 2, -sh / 2, sw, sh);
+      ctx.drawImage(pixelated, -sw / 2, -sh / 2, sw, sh);
     }
   } else if (usePixelOutline) {
     const layer = document.createElement('canvas');
@@ -1962,6 +2283,21 @@ const defaultGridSpriteOrder = (sprites: SpriteData[], gridSplitActive: boolean)
       .concat(sprites.filter((s) => !!s.belowSplit).map((s) => s.id));
   }
   return sprites.map((s) => s.id);
+};
+
+/** Orden visual de sprites en la pantalla principal (grilla o tablero por columnas). */
+const getAppSpriteDisplayOrder = (
+  sprites: SpriteData[],
+  columnView: boolean,
+  gridSplitActive: boolean,
+  spriteRows: SpriteRow[],
+  spriteColumns: SpriteColumn[],
+): SpriteData[] => {
+  if (columnView) {
+    return buildSpritesInBoardOrder(sprites, spriteRows, spriteColumns);
+  }
+  const ids = defaultGridSpriteOrder(sprites, gridSplitActive);
+  return ids.map((id) => sprites.find((s) => s.id === id)).filter((s): s is SpriteData => !!s);
 };
 
 const normalizeSpriteColumns = (saved: unknown): SpriteColumn[] => {
@@ -2608,6 +2944,7 @@ interface SpriteModuleProps {
   onOpenGhostCompare: (id: string) => void;
   onOpenReplace: (id: string) => void;
   onOpenCopyRect: (id: string) => void;
+  onOpenSplitParts: (id: string) => void;
   onOpenPixelEditor: (id: string) => void;
   onOpenTransform: (id: string) => void;
   onOpenTagging: (id: string) => void;
@@ -2625,7 +2962,7 @@ interface SpriteModuleProps {
   onOpenQuadrantPreview?: (id: string) => void;
 }
 
-const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggleSelect, onRemove, onSetAnchor, onSetReference, onOpenEraser, onOpenGhostCompare, onOpenReplace, onOpenCopyRect, onOpenPixelEditor, onOpenTransform, onOpenTagging, onOpenPaint, onOpenBucket, onOpenStretch, onOpenComposite, onExport, onFocusResolution, onUpdateSprite, isReference, isWhiteBg, quadrantView, quadrantPicking, onOpenQuadrantPreview }) => {
+const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggleSelect, onRemove, onSetAnchor, onSetReference, onOpenEraser, onOpenGhostCompare, onOpenReplace, onOpenCopyRect, onOpenSplitParts, onOpenPixelEditor, onOpenTransform, onOpenTagging, onOpenPaint, onOpenBucket, onOpenStretch, onOpenComposite, onExport, onFocusResolution, onUpdateSprite, isReference, isWhiteBg, quadrantView, quadrantPicking, onOpenQuadrantPreview }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const quadrantPointerRef = useRef<{ x: number; y: number } | null>(null);
@@ -3009,6 +3346,9 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
           </button>
           <button type="button" className="dropdown-item" onClick={() => { onOpenCopyRect(sprite.id); closeTools(); }}>
             <Crop size={12} /> Copiar recorte
+          </button>
+          <button type="button" className="dropdown-item" onClick={() => { onOpenSplitParts(sprite.id); closeTools(); }}>
+            <Boxes size={12} /> Separar partes...
           </button>
           <button type="button" className="dropdown-item" onClick={() => { onOpenPixelEditor(sprite.id); closeTools(); }}>
             <Grid size={12} /> Editor Pixel Art
@@ -6237,6 +6577,419 @@ const CopyRectModal: React.FC<CopyRectModalProps> = ({ sprite, sprites, onSave, 
   );
 };
 
+type CropRect = { x: number; y: number; w: number; h: number };
+type CropHandle = 'n' | 's' | 'e' | 'w' | 'nw' | 'ne' | 'sw' | 'se' | 'move';
+
+const clampCropRect = (r: CropRect, maxW: number, maxH: number): CropRect => {
+  let x1 = r.x;
+  let y1 = r.y;
+  let x2 = r.x + r.w - 1;
+  let y2 = r.y + r.h - 1;
+  if (x2 < x1) [x1, x2] = [x2, x1];
+  if (y2 < y1) [y1, y2] = [y2, y1];
+  x1 = Math.max(0, Math.min(maxW - 1, x1));
+  y1 = Math.max(0, Math.min(maxH - 1, y1));
+  x2 = Math.max(0, Math.min(maxW - 1, x2));
+  y2 = Math.max(0, Math.min(maxH - 1, y2));
+  return { x: x1, y: y1, w: Math.max(1, x2 - x1 + 1), h: Math.max(1, y2 - y1 + 1) };
+};
+
+const applyCropHandle = (
+  start: CropRect,
+  mode: CropHandle | 'draw',
+  px: number,
+  py: number,
+  maxW: number,
+  maxH: number,
+  moveFrom?: { x: number; y: number },
+): CropRect => {
+  if (mode === 'draw') {
+    return clampCropRect({
+      x: Math.min(start.x, px),
+      y: Math.min(start.y, py),
+      w: Math.abs(px - start.x) + 1,
+      h: Math.abs(py - start.y) + 1,
+    }, maxW, maxH);
+  }
+  let x1 = start.x;
+  let y1 = start.y;
+  let x2 = start.x + start.w - 1;
+  let y2 = start.y + start.h - 1;
+  if (mode === 'move' && moveFrom) {
+    const dx = px - moveFrom.x;
+    const dy = py - moveFrom.y;
+    const nx = Math.max(0, Math.min(maxW - start.w, start.x + dx));
+    const ny = Math.max(0, Math.min(maxH - start.h, start.y + dy));
+    return { x: nx, y: ny, w: start.w, h: start.h };
+  }
+  if (mode.includes('w')) x1 = px;
+  if (mode.includes('e')) x2 = px;
+  if (mode.includes('n')) y1 = py;
+  if (mode.includes('s')) y2 = py;
+  return clampCropRect({ x: x1, y: y1, w: x2 - x1 + 1, h: y2 - y1 + 1 }, maxW, maxH);
+};
+
+const cropImageRegion = async (img: HTMLImageElement, rect: CropRect): Promise<HTMLImageElement> => {
+  const c = document.createElement('canvas');
+  c.width = rect.w;
+  c.height = rect.h;
+  const ctx = c.getContext('2d')!;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(img, rect.x, rect.y, rect.w, rect.h, 0, 0, rect.w, rect.h);
+  return new Promise((res, rej) => {
+    const image = new Image();
+    image.onload = () => res(image);
+    image.onerror = rej;
+    image.src = c.toDataURL('image/png');
+  });
+};
+
+const eraseRectsFromImage = async (img: HTMLImageElement, rects: CropRect[]): Promise<HTMLImageElement> => {
+  const c = document.createElement('canvas');
+  c.width = img.width;
+  c.height = img.height;
+  const ctx = c.getContext('2d')!;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(img, 0, 0);
+  for (const r of rects) ctx.clearRect(r.x, r.y, r.w, r.h);
+  return new Promise((res, rej) => {
+    const image = new Image();
+    image.onload = () => res(image);
+    image.onerror = rej;
+    image.src = c.toDataURL('image/png');
+  });
+};
+
+const SPLIT_PART_COLORS = ['#6b66ff', '#ff6b6b', '#51cf66', '#ffd43b', '#339af0', '#ff922b'];
+
+type SplitPart = { id: string; rect: CropRect; name: string };
+
+interface SplitPartsModalProps {
+  sprite: SpriteData;
+  usedNames: string[];
+  onSplit: (parts: SplitPart[], removeFromSource: boolean) => void | Promise<void>;
+  onClose: () => void;
+  isWhiteBg?: boolean;
+}
+
+const SplitPartsModal: React.FC<SplitPartsModalProps> = ({ sprite, usedNames, onSplit, onClose, isWhiteBg }) => {
+  const [zoom, setZoom] = useState(() => clampNum(loadPref('joa-split-parts-zoom', 1), 0.5, 8, 1));
+  const [parts, setParts] = useState<SplitPart[]>([]);
+  const [crop, setCrop] = useState<CropRect | null>(null);
+  const [draft, setDraft] = useState<CropRect | null>(null);
+  const [selectedPartId, setSelectedPartId] = useState<string | null>(null);
+  const [removeFromSource, setRemoveFromSource] = useState(true);
+  const [adjusting, setAdjusting] = useState(false);
+  const [splitting, setSplitting] = useState(false);
+
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const adjustRef = useRef<{
+    mode: CropHandle | 'draw';
+    startPx: number;
+    startPy: number;
+    startRect: CropRect;
+  } | null>(null);
+  const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-split-parts-scroll', sprite.name);
+  useModalWheelControls({ zoom, setZoom, workspaceRef });
+
+  useEffect(() => {
+    savePref('joa-split-parts-zoom', zoom);
+  }, [zoom]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.width = sprite.img.width;
+    canvas.height = sprite.img.height;
+    const ctx = canvas.getContext('2d')!;
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(sprite.img, 0, 0);
+  }, [sprite]);
+
+  const imgCoordsFromClient = (clientX: number, clientY: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return { x: 0, y: 0 };
+    const rect = canvas.getBoundingClientRect();
+    const x = Math.floor((clientX - rect.left) / zoom);
+    const y = Math.floor((clientY - rect.top) / zoom);
+    return {
+      x: Math.max(0, Math.min(sprite.img.width - 1, x)),
+      y: Math.max(0, Math.min(sprite.img.height - 1, y)),
+    };
+  };
+
+  const beginAdjust = (mode: CropHandle | 'draw', clientX: number, clientY: number, startRect: CropRect) => {
+    const p = imgCoordsFromClient(clientX, clientY);
+    adjustRef.current = { mode, startPx: p.x, startPy: p.y, startRect };
+    setDraft(startRect);
+    setAdjusting(true);
+    setSelectedPartId(null);
+  };
+
+  const onCanvasDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const p = imgCoordsFromClient(e.clientX, e.clientY);
+    const active = crop;
+    if (active && p.x >= active.x && p.x < active.x + active.w && p.y >= active.y && p.y < active.y + active.h) {
+      beginAdjust('move', e.clientX, e.clientY, active);
+      return;
+    }
+    beginAdjust('draw', e.clientX, e.clientY, { x: p.x, y: p.y, w: 1, h: 1 });
+    setCrop(null);
+  };
+
+  const onHandleDown = (mode: CropHandle, e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!crop) return;
+    beginAdjust(mode, e.clientX, e.clientY, crop);
+  };
+
+  useEffect(() => {
+    if (!adjusting) return;
+    const onMove = (e: MouseEvent) => {
+      const adj = adjustRef.current;
+      if (!adj) return;
+      const p = imgCoordsFromClient(e.clientX, e.clientY);
+      setDraft(applyCropHandle(adj.startRect, adj.mode, p.x, p.y, sprite.img.width, sprite.img.height, { x: adj.startPx, y: adj.startPy }));
+    };
+    const onUp = (e: MouseEvent) => {
+      const adj = adjustRef.current;
+      adjustRef.current = null;
+      setAdjusting(false);
+      if (!adj) {
+        setDraft(null);
+        return;
+      }
+      const p = imgCoordsFromClient(e.clientX, e.clientY);
+      const next = applyCropHandle(adj.startRect, adj.mode, p.x, p.y, sprite.img.width, sprite.img.height, { x: adj.startPx, y: adj.startPy });
+      setCrop(next);
+      setDraft(null);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [adjusting, sprite, zoom]);
+
+  const addCurrentPart = () => {
+    const rect = draft || crop;
+    if (!rect || rect.w < 1 || rect.h < 1) return;
+    const clamped = clampCropRect(rect, sprite.img.width, sprite.img.height);
+    const base = sprite.name.replace(/\.[^/.]+$/, '');
+    const ext = sprite.name.match(/\.[^/.]+$/)?.[0] || '.png';
+    let n = parts.length + 1;
+    let name = `${base}_part_${n}${ext}`;
+    const used = new Set([...usedNames, ...parts.map((p) => p.name)]);
+    while (used.has(name)) {
+      n += 1;
+      name = `${base}_part_${n}${ext}`;
+    }
+    setParts((prev) => [...prev, { id: generateId(), rect: clamped, name }]);
+    setCrop(null);
+    setDraft(null);
+    setSelectedPartId(null);
+  };
+
+  const loadPartForEdit = (part: SplitPart) => {
+    setSelectedPartId(part.id);
+    setCrop({ ...part.rect });
+    setDraft(null);
+  };
+
+  const updateSelectedPartRect = () => {
+    if (!selectedPartId || !crop) return;
+    setParts((prev) => prev.map((p) => p.id === selectedPartId ? { ...p, rect: crop } : p));
+  };
+
+  const removePart = (id: string) => {
+    setParts((prev) => prev.filter((p) => p.id !== id));
+    if (selectedPartId === id) {
+      setSelectedPartId(null);
+      setCrop(null);
+    }
+  };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+        return;
+      }
+      if (e.key === 'Enter' && (crop || draft)) {
+        e.preventDefault();
+        addCurrentPart();
+      }
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedPartId) {
+        e.preventDefault();
+        removePart(selectedPartId);
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [crop, draft, selectedPartId, parts]);
+
+  const handleSplit = async () => {
+    if (parts.length === 0 || splitting) return;
+    setSplitting(true);
+    try {
+      await onSplit(parts, removeFromSource);
+    } finally {
+      setSplitting(false);
+    }
+  };
+
+  const shownRect = draft || crop;
+
+  const renderCropOverlay = (rect: CropRect, color: string, editable: boolean, dim = false) => {
+    const hs = Math.max(2, 8 / zoom);
+    const edge = Math.max(2, 6 / zoom);
+    const handleStyle = (extra: React.CSSProperties): React.CSSProperties => ({
+      position: 'absolute',
+      background: color,
+      boxShadow: '0 0 0 1px #fff',
+      pointerEvents: editable ? 'auto' : 'none',
+      zIndex: editable ? 3 : 2,
+      ...extra,
+    });
+    return (
+      <div
+        key={`${rect.x}-${rect.y}-${rect.w}-${rect.h}-${color}`}
+        style={{
+          position: 'absolute',
+          left: rect.x,
+          top: rect.y,
+          width: rect.w,
+          height: rect.h,
+          border: `2px solid ${color}`,
+          boxShadow: dim ? 'none' : '0 0 0 9999px rgba(0,0,0,0.28)',
+          pointerEvents: 'none',
+          imageRendering: 'pixelated',
+        }}
+      >
+        {editable && (
+          <>
+            <div onMouseDown={(e) => onHandleDown('n', e)} style={handleStyle({ left: hs, right: hs, top: -edge / 2, height: edge, cursor: 'ns-resize' })} />
+            <div onMouseDown={(e) => onHandleDown('s', e)} style={handleStyle({ left: hs, right: hs, bottom: -edge / 2, height: edge, cursor: 'ns-resize' })} />
+            <div onMouseDown={(e) => onHandleDown('w', e)} style={handleStyle({ top: hs, bottom: hs, left: -edge / 2, width: edge, cursor: 'ew-resize' })} />
+            <div onMouseDown={(e) => onHandleDown('e', e)} style={handleStyle({ top: hs, bottom: hs, right: -edge / 2, width: edge, cursor: 'ew-resize' })} />
+            <div onMouseDown={(e) => onHandleDown('nw', e)} style={handleStyle({ left: -hs / 2, top: -hs / 2, width: hs, height: hs, cursor: 'nwse-resize' })} />
+            <div onMouseDown={(e) => onHandleDown('ne', e)} style={handleStyle({ right: -hs / 2, top: -hs / 2, width: hs, height: hs, cursor: 'nesw-resize' })} />
+            <div onMouseDown={(e) => onHandleDown('sw', e)} style={handleStyle({ left: -hs / 2, bottom: -hs / 2, width: hs, height: hs, cursor: 'nesw-resize' })} />
+            <div onMouseDown={(e) => onHandleDown('se', e)} style={handleStyle({ right: -hs / 2, bottom: -hs / 2, width: hs, height: hs, cursor: 'nwse-resize' })} />
+          </>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '1100px', maxHeight: '92vh' }}>
+        <div className="modal-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+            <Boxes size={18} color="var(--accent)" />
+            <h3 style={{ fontSize: '1rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              Separar partes: {sprite.name}
+            </h3>
+          </div>
+          <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
+        </div>
+        <div style={{ display: 'flex', gap: '16px', padding: '0 16px 12px', minHeight: 0, flex: 1 }}>
+          <div
+            ref={workspaceRef}
+            className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`}
+            style={{ flex: 1, overflow: 'auto', minWidth: 0 }}
+            onScroll={onWorkspaceScroll}
+          >
+            <div style={{ width: sprite.img.width * zoom, height: sprite.img.height * zoom, position: 'relative' }}>
+              <div style={{
+                position: 'absolute', left: 0, top: 0,
+                width: sprite.img.width, height: sprite.img.height,
+                transform: `scale(${zoom})`, transformOrigin: 'top left', cursor: 'crosshair',
+              }}>
+                <canvas ref={canvasRef} onMouseDown={onCanvasDown} />
+                {parts.map((p, i) => {
+                  if (selectedPartId === p.id && shownRect) return null;
+                  return renderCropOverlay(p.rect, SPLIT_PART_COLORS[i % SPLIT_PART_COLORS.length], false, true);
+                })}
+                {shownRect && renderCropOverlay(shownRect, '#6b66ff', true, parts.length === 0)}
+              </div>
+            </div>
+          </div>
+          <div style={{ width: '240px', flexShrink: 0, display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', lineHeight: 1.45, margin: 0 }}>
+              Marcá rectángulos de cualquier tamaño. Cada uno será un sprite nuevo e independiente.
+            </p>
+            <button type="button" className="btn btn-outline" onClick={addCurrentPart} disabled={!shownRect}>
+              Agregar parte
+            </button>
+            {selectedPartId && crop && (
+              <button type="button" className="btn btn-outline" onClick={updateSelectedPartRect}>
+                Actualizar parte seleccionada
+              </button>
+            )}
+            <div style={{ flex: 1, overflow: 'auto', border: '1px solid var(--border)', borderRadius: '8px', padding: '8px' }}>
+              {parts.length === 0 ? (
+                <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>Sin partes aún</div>
+              ) : (
+                parts.map((p, i) => (
+                  <div
+                    key={p.id}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px',
+                      padding: '6px', borderRadius: '6px',
+                      background: selectedPartId === p.id ? 'rgba(107,102,255,0.15)' : 'rgba(0,0,0,0.15)',
+                      border: `1px solid ${selectedPartId === p.id ? SPLIT_PART_COLORS[i % SPLIT_PART_COLORS.length] : 'var(--border)'}`,
+                      cursor: 'pointer',
+                    }}
+                    onClick={() => loadPartForEdit(p)}
+                  >
+                    <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: SPLIT_PART_COLORS[i % SPLIT_PART_COLORS.length], flexShrink: 0 }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: '0.68rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</div>
+                      <div style={{ fontSize: '0.62rem', color: 'var(--text-muted)' }}>{p.rect.w}×{p.rect.h} @ ({p.rect.x},{p.rect.y})</div>
+                    </div>
+                    <button type="button" className="btn-ghost" style={{ padding: '2px' }} onClick={(e) => { e.stopPropagation(); removePart(p.id); }} title="Quitar">
+                      <X size={12} />
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.75rem', cursor: 'pointer', userSelect: 'none' }}>
+              <input type="checkbox" checked={removeFromSource} onChange={(e) => setRemoveFromSource(e.target.checked)} />
+              Borrar partes del sprite original
+            </label>
+          </div>
+        </div>
+        <div className="modal-footer" style={{ flexDirection: 'column', alignItems: 'stretch', gap: '10px' }}>
+          <div className="slider-item" style={{ marginBottom: 0 }}>
+            <div className="slider-label"><span><Search size={14} /> Zoom</span><span>{zoom.toFixed(1)}x</span></div>
+            <input type="range" min="0.5" max="8" step="0.1" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center' }}>
+            {shownRect && (
+              <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                Recorte {shownRect.w}×{shownRect.h} en ({shownRect.x}, {shownRect.y})
+              </span>
+            )}
+            <div style={{ marginLeft: 'auto', display: 'flex', gap: '8px' }}>
+              <button type="button" className="btn btn-outline" onClick={onClose}>Cancelar</button>
+              <button type="button" className="btn btn-primary" onClick={() => { void handleSplit(); }} disabled={parts.length === 0 || splitting}>
+                {splitting ? 'Separando…' : `Separar ${parts.length} sprite${parts.length === 1 ? '' : 's'}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // --- Rotate Modal Component ---
 interface TransformModalProps {
   sprite: SpriteData;
@@ -8828,10 +9581,12 @@ interface AnimFrame {
 
 interface AnimationModalProps {
   onClose: () => void;
+  initialSprites?: SpriteData[];
 }
 
-const AnimationModal: React.FC<AnimationModalProps> = ({ onClose }) => {
+const AnimationModal: React.FC<AnimationModalProps> = ({ onClose, initialSprites }) => {
   const [frames, setFrames] = useState<AnimFrame[]>([]);
+  const [loadingInitial, setLoadingInitial] = useState(!!initialSprites?.length);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentFrameIdx, setCurrentFrameIdx] = useState(0);
   const [zoom, setZoom] = useState(1);
@@ -8851,6 +9606,38 @@ const AnimationModal: React.FC<AnimationModalProps> = ({ onClose }) => {
   useEffect(() => { idxRef.current = currentFrameIdx; }, [currentFrameIdx]);
   const framesRef = useRef(frames);
   useEffect(() => { framesRef.current = frames; }, [frames]);
+
+  useEffect(() => {
+    if (!initialSprites?.length) return;
+    let cancelled = false;
+    setLoadingInitial(true);
+    void (async () => {
+      const newFrames: AnimFrame[] = [];
+      for (const sprite of initialSprites) {
+        const canvas = renderSpriteToCanvas(sprite, true);
+        const img = await new Promise<HTMLImageElement>((res, rej) => {
+          const image = new Image();
+          image.onload = () => res(image);
+          image.onerror = () => rej(new Error('No se pudo cargar el frame'));
+          image.src = canvas.toDataURL('image/png');
+        });
+        newFrames.push({
+          id: generateId(),
+          img,
+          fileName: sprite.name,
+          durationMs: 100,
+          scale: 1,
+        });
+      }
+      if (!cancelled) {
+        setFrames(newFrames);
+        setCurrentFrameIdx(0);
+        setIsPlaying(false);
+        setLoadingInitial(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [initialSprites]);
 
   useEffect(() => {
     if (!isPlaying || frames.length <= 1) {
@@ -9023,7 +9810,9 @@ const AnimationModal: React.FC<AnimationModalProps> = ({ onClose }) => {
           {/* VISOR PRINCIPAL */}
           <div ref={workspaceRef} className="eraser-workspace" style={{ flex: 1, overflow: 'auto', backgroundColor: 'var(--bg-window, #151515)', position: 'relative' }}>
              
-             {frames.length === 0 ? (
+             {loadingInitial ? (
+                <div className="empty-msg" style={{ opacity: 0.5 }}>Cargando sprites seleccionados…</div>
+             ) : frames.length === 0 ? (
                 <div className="empty-msg" style={{ opacity: 0.5 }}>Añade frames en la barra lateral para ver la animación</div>
              ) : (
                 <div ref={previewContentRef} className={bgClass} style={{ 
@@ -9155,6 +9944,7 @@ const App: React.FC = () => {
   const [ghostCompareTargetId, setGhostCompareTargetId] = useState<string | null>(null);
   const [replaceTargetId, setReplaceTargetId] = useState<string | null>(null);
   const [copyRectTargetId, setCopyRectTargetId] = useState<string | null>(null);
+  const [splitPartsTargetId, setSplitPartsTargetId] = useState<string | null>(null);
   const [pixelEditorTargetId, setPixelEditorTargetId] = useState<string | null>(null);
   const [transformTargetId, setTransformTargetId] = useState<string | null>(null);
   const [taggingTargetId, setTaggingTargetId] = useState<string | null>(null);
@@ -9164,11 +9954,13 @@ const App: React.FC = () => {
   const [stretchTargetId, setStretchTargetId] = useState<string | null>(null);
   const [compositeTarget, setCompositeTarget] = useState<{ id: string, size: number } | null>(null);
   const [showAnimationModal, setShowAnimationModal] = useState(false);
+  const [animationInitialSprites, setAnimationInitialSprites] = useState<SpriteData[] | undefined>(undefined);
+  const [animationModalKey, setAnimationModalKey] = useState(0);
   const [quadrantPreviewIds, setQuadrantPreviewIds] = useState<string[]>([]);
   const [quadrantPicking, setQuadrantPicking] = useState(false);
   const [emptyCellMenu, setEmptyCellMenu] = useState<{ x: number; y: number; columnId: string; rowId: string } | null>(null);
   const anyModalOpen = !!(
-    eraserTargetId || ghostCompareTargetId || replaceTargetId || copyRectTargetId || pixelEditorTargetId || transformTargetId ||
+    eraserTargetId || ghostCompareTargetId || replaceTargetId || copyRectTargetId || splitPartsTargetId || pixelEditorTargetId || transformTargetId ||
     taggingTargetId || effectMaskTargetId || paintTargetId || bucketTargetId ||
     stretchTargetId || compositeTarget || showAnimationModal || (quadrantPreviewIds.length > 0 && !quadrantPicking)
   );
@@ -10057,6 +10849,7 @@ const App: React.FC = () => {
         onOpenGhostCompare={(id) => setGhostCompareTargetId(id)}
         onOpenReplace={(id) => setReplaceTargetId(id)}
         onOpenCopyRect={(id) => setCopyRectTargetId(id)}
+        onOpenSplitParts={(id) => setSplitPartsTargetId(id)}
         onOpenPixelEditor={(id) => setPixelEditorTargetId(id)}
         onOpenTransform={(id) => setTransformTargetId(id)}
         onOpenTagging={(id) => setTaggingTargetId(id)}
@@ -10162,6 +10955,7 @@ const App: React.FC = () => {
     setGhostCompareTargetId(null);
     setReplaceTargetId(null);
     setCopyRectTargetId(null);
+    setSplitPartsTargetId(null);
     setPixelEditorTargetId(null);
     setTransformTargetId(null);
     setTaggingTargetId(null);
@@ -10387,6 +11181,62 @@ const App: React.FC = () => {
       return;
     }
     if (files[0]) await handleSliceFile(files[0]);
+  };
+
+  const handleSplitParts = async (sourceId: string, parts: SplitPart[], removeFromSource: boolean) => {
+    const source = sprites.find((s) => s.id === sourceId);
+    if (!source || parts.length === 0) return;
+
+    const newSprites: SpriteData[] = [];
+    for (const part of parts) {
+      const partImg = await cropImageRegion(source.img, part.rect);
+      newSprites.push({
+        id: generateId(),
+        name: part.name,
+        img: partImg,
+        originalImg: partImg,
+        scale: 1,
+        rotation: 0,
+        offsetX: 0,
+        offsetY: 0,
+        flipH: false,
+        flipV: false,
+        regions: [],
+        padding: { top: 0, bottom: 0, left: 0, right: 0 },
+        anchor: { x: Math.floor(part.rect.w / 2), y: Math.floor(part.rect.h / 2) },
+        pixelation: 1,
+        brightness: 100,
+        contrast: 100,
+        saturation: 100,
+        hue: 0,
+        opacity: 100,
+        tintColor: '#000000',
+        tintOpacity: 0,
+        columnId: source.columnId,
+        rowId: source.rowId,
+        belowSplit: source.belowSplit,
+      });
+    }
+
+    let nextSprites = [...sprites];
+    const sourceIdx = nextSprites.findIndex((s) => s.id === sourceId);
+    if (sourceIdx < 0) return;
+
+    if (removeFromSource) {
+      const newSourceImg = await eraseRectsFromImage(source.img, parts.map((p) => p.rect));
+      nextSprites[sourceIdx] = { ...source, img: newSourceImg, originalImg: newSourceImg };
+    }
+
+    nextSprites = [
+      ...nextSprites.slice(0, sourceIdx + 1),
+      ...newSprites,
+      ...nextSprites.slice(sourceIdx + 1),
+    ];
+    commitSprites(nextSprites);
+    const ids = newSprites.map((s) => s.id);
+    selectionAnchorRef.current = ids[ids.length - 1] ?? null;
+    setSelection(ids);
+    setSplitPartsTargetId(null);
   };
 
   const handleSliceFile = async (file: File) => {
@@ -11527,145 +12377,8 @@ const App: React.FC = () => {
     commitSprites(next);
   };
 
-  /**
-   * Tamaño del “píxel de arte” del dibujo (no la resolución del archivo).
-   * - MAE: mayor N donde promediar bloques N×N casi no cambia la imagen (upscale limpio)
-   * - Runs: longitud típica entre cambios fuertes de color (pixel art grueso nativo)
-   */
-  const detectIntrinsicPixelSize = (img: HTMLImageElement): number => {
-    const w = img.width;
-    const h = img.height;
-    if (w < 2 || h < 2) return 1;
-
-    const canvas = document.createElement('canvas');
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    if (!ctx) return 1;
-    ctx.drawImage(img, 0, 0);
-    const { data } = ctx.getImageData(0, 0, w, h);
-
-    const maxN = Math.min(48, Math.floor(Math.min(w, h) / 3));
-
-    /** Error medio al reemplazar cada bloque N×N por su color promedio. */
-    const maeForN = (n: number): number => {
-      let err = 0;
-      let count = 0;
-      for (let by = 0; by + n <= h; by += n) {
-        for (let bx = 0; bx + n <= w; bx += n) {
-          let r = 0;
-          let g = 0;
-          let b = 0;
-          let op = 0;
-          for (let dy = 0; dy < n; dy++) {
-            for (let dx = 0; dx < n; dx++) {
-              const i = ((by + dy) * w + (bx + dx)) * 4;
-              if (data[i + 3] < 12) continue;
-              r += data[i];
-              g += data[i + 1];
-              b += data[i + 2];
-              op++;
-            }
-          }
-          if (op < n * n * 0.35) continue;
-          r = (r / op) | 0;
-          g = (g / op) | 0;
-          b = (b / op) | 0;
-          for (let dy = 0; dy < n; dy++) {
-            for (let dx = 0; dx < n; dx++) {
-              const i = ((by + dy) * w + (bx + dx)) * 4;
-              if (data[i + 3] < 12) continue;
-              err += Math.abs(data[i] - r) + Math.abs(data[i + 1] - g) + Math.abs(data[i + 2] - b);
-              count++;
-            }
-          }
-        }
-      }
-      return count ? err / (count * 3) : 999;
-    };
-
-    /** Upscale / grilla limpia: el mayor N con error bajo al promediar. */
-    const detectByMae = (): number => {
-      const T = 8;
-      for (let n = maxN; n >= 2; n--) {
-        if (maeForN(n) <= T) return n;
-      }
-      return 1;
-    };
-
-    /**
-     * Grosor visual del trazo: longitud típica de tramos entre saltos fuertes de color.
-     * Tolera ruido interno en rellenos; mide el tamaño de las manchas del pixel art.
-     */
-    const detectByStrongRuns = (): number => {
-      const strongDiff = (i: number, j: number) =>
-        Math.abs(data[i] - data[j]) +
-          Math.abs(data[i + 1] - data[j + 1]) +
-          Math.abs(data[i + 2] - data[j + 2]) >
-        45;
-
-      const runs: number[] = [];
-      const push = (len: number) => {
-        if (len >= 1) runs.push(Math.min(len, maxN * 2));
-      };
-
-      const rowStep = Math.max(1, Math.floor(h / 60));
-      for (let y = 0; y < h; y += rowStep) {
-        let x = 0;
-        while (x < w) {
-          const i0 = (y * w + x) * 4;
-          if (data[i0 + 3] < 12) {
-            x++;
-            continue;
-          }
-          let len = 1;
-          while (x + len < w) {
-            const iPrev = (y * w + x + len - 1) * 4;
-            const i1 = (y * w + x + len) * 4;
-            if (data[i1 + 3] < 12 || strongDiff(iPrev, i1)) break;
-            len++;
-          }
-          push(len);
-          x += len;
-        }
-      }
-
-      const colStep = Math.max(1, Math.floor(w / 60));
-      for (let x = 0; x < w; x += colStep) {
-        let y = 0;
-        while (y < h) {
-          const i0 = (y * w + x) * 4;
-          if (data[i0 + 3] < 12) {
-            y++;
-            continue;
-          }
-          let len = 1;
-          while (y + len < h) {
-            const iPrev = ((y + len - 1) * w + x) * 4;
-            const i1 = ((y + len) * w + x) * 4;
-            if (data[i1 + 3] < 12 || strongDiff(iPrev, i1)) break;
-            len++;
-          }
-          push(len);
-          y += len;
-        }
-      }
-
-      if (runs.length < 24) return 1;
-      runs.sort((a, b) => a - b);
-      // ~percentil 35: tamaño típico de mancha, sin inflar por planos enormes de piel.
-      return Math.max(1, Math.min(maxN, runs[Math.floor(runs.length * 0.35)] || 1));
-    };
-
-    const byMae = detectByMae();
-    const byRuns = detectByStrongRuns();
-    // Ambas estiman el mismo concepto; nos quedamos con la señal más gruesa fiable.
-    return Math.max(byMae, byRuns);
-  };
-
-  /** Tamaño visual de un píxel de arte sobre el canvas ya escalado. */
   const getVisualArtPixelSize = (sprite: SpriteData): number => {
-    const base = detectIntrinsicPixelSize(sprite.img);
+    const base = getIntrinsicPixelSize(sprite.img);
     const scale = sprite.scale || 1;
     const p = sprite.pixelation || 1;
     if (p > 1) return p;
@@ -11687,7 +12400,7 @@ const App: React.FC = () => {
     const next = sprites.map((s: SpriteData) => {
       if (!selection.includes(s.id) || s.id === referenceId) return s;
 
-      const natural = Math.max(1, detectIntrinsicPixelSize(s.img) * (s.scale || 1));
+      const natural = Math.max(1, getIntrinsicPixelSize(s.img) * (s.scale || 1));
 
       // Ya tan grueso (o más) que la REF.
       if (natural >= goal * 0.85) {
@@ -12159,7 +12872,22 @@ const App: React.FC = () => {
           </h1>
         </div>
         <div className="top-actions">
-           <button className="btn btn-outline" onClick={() => setShowAnimationModal(true)}>
+           <button
+             className="btn btn-outline"
+             title={selection.length > 0 ? `Probar animación con ${selection.length} sprite(s) seleccionado(s)` : 'Probar animación (subí frames manualmente)'}
+             onClick={() => {
+               if (selection.length > 0) {
+                 const selected = new Set(selection);
+                 const ordered = getAppSpriteDisplayOrder(sprites, columnView, gridSplitActive, spriteRows, spriteColumns)
+                   .filter((s) => selected.has(s.id));
+                 setAnimationInitialSprites(ordered);
+               } else {
+                 setAnimationInitialSprites(undefined);
+               }
+               setAnimationModalKey((k) => k + 1);
+               setShowAnimationModal(true);
+             }}
+           >
              <Film size={16} /> Probar Animación
            </button>
            <div style={{ height: '24px', width: '1px', background: 'var(--border)', margin: '0 2px', flexShrink: 0 }} />
@@ -13071,7 +13799,7 @@ const App: React.FC = () => {
           <div className="card">
             <span className="card-title">Ajuste Dinámico - Efectos</span>
             <div className="slider-group">
-              <div className="slider-item">
+              <div className="slider-item" title="Alinea bloques a la grilla del pixel art y usa el color dominante de cada celda para evitar mezclas borrosas">
                 <div className="slider-label"><span>Pixelación</span><span>{firstSelected ? (firstSelected.pixelation || 1) : 1}px</span></div>
                 <input type="range" min="1" max="100" value={firstSelected ? (firstSelected.pixelation || 1) : 1}
                   onChange={(e) => updateBulkPixelation(parseInt(e.target.value))} disabled={selection.length === 0}
@@ -13505,6 +14233,15 @@ const App: React.FC = () => {
           }}
         />
       )}
+      {splitPartsTargetId && (
+        <SplitPartsModal
+          sprite={sprites.find((s) => s.id === splitPartsTargetId)!}
+          usedNames={sprites.map((s) => s.name)}
+          onClose={() => setSplitPartsTargetId(null)}
+          isWhiteBg={isWhiteBg}
+          onSplit={(parts, removeFromSource) => handleSplitParts(splitPartsTargetId, parts, removeFromSource)}
+        />
+      )}
       {pixelEditorTargetId && (
         <PixelEditorModal
           sprite={sprites.find(s => s.id === pixelEditorTargetId)!}
@@ -13608,7 +14345,11 @@ const App: React.FC = () => {
         />
       )}
       {showAnimationModal && (
-        <AnimationModal onClose={() => setShowAnimationModal(false)} />
+        <AnimationModal
+          key={animationModalKey}
+          initialSprites={animationInitialSprites}
+          onClose={() => setShowAnimationModal(false)}
+        />
       )}
       {dragGhost && (
         <div
