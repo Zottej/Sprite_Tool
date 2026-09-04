@@ -31,6 +31,8 @@ export type DesktopApi = {
     files: { name: string; data: ArrayBuffer | Uint8Array }[]
   ) => Promise<boolean>;
   revealInFolder: (targetPath: string) => Promise<boolean>;
+  /** Copia PNGs al portapapeles del SO como archivos (varios = archivos separados). */
+  copyImagesToClipboard: (files: { name: string; data: ArrayBuffer }[]) => Promise<boolean>;
 };
 
 declare global {

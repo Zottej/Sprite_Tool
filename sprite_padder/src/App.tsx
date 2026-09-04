@@ -736,6 +736,52 @@ const canvasToImageBlob = async (
 const canvasToPngBlob = (canvas: HTMLCanvasElement): Promise<Blob> =>
   canvasToImageBlob(canvas, 'image/png');
 
+/** Copia uno o varios sprites al portapapeles: en desktop, como archivos PNG separados. */
+const copySpritesToSystemClipboard = async (sprites: SpriteData[]): Promise<boolean> => {
+  if (sprites.length === 0) return false;
+
+  const files: { name: string; data: ArrayBuffer }[] = [];
+  const used = new Set<string>();
+  for (const s of sprites) {
+    const canvas = renderSpriteToCanvas(s, true);
+    const blob = await canvasToPngBlob(canvas);
+    if (!blob || blob.size === 0) continue;
+    let name = sanitizeExportFileName(s.name, '.png');
+    const key = name.toLowerCase();
+    if (used.has(key)) {
+      const stem = name.replace(/\.png$/i, '');
+      let n = 2;
+      while (used.has(`${stem}_${n}.png`.toLowerCase())) n += 1;
+      name = `${stem}_${n}.png`;
+    }
+    used.add(name.toLowerCase());
+    files.push({ name, data: await blob.arrayBuffer() });
+  }
+  if (files.length === 0) return false;
+
+  const desktop = getDesktop();
+  if (desktop?.copyImagesToClipboard) {
+    try {
+      return !!(await desktop.copyImagesToClipboard(files));
+    } catch (err) {
+      console.warn('No se pudo copiar archivos al portapapeles (desktop):', err);
+    }
+  }
+
+  // Web: el SO solo admite bien una imagen; si hay varios, se copia el primero.
+  try {
+    if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') return false;
+    const blob = new Blob([files[0].data], { type: 'image/png' });
+    await navigator.clipboard.write([
+      new ClipboardItem({ 'image/png': Promise.resolve(blob) }),
+    ]);
+    return true;
+  } catch (err) {
+    console.warn('No se pudo copiar la imagen al portapapeles del sistema:', err);
+    return false;
+  }
+};
+
 const canvasToJpegBlob = (canvas: HTMLCanvasElement, quality = JOA_JPEG_QUALITY): Promise<Blob> =>
   canvasToImageBlob(canvas, 'image/jpeg', quality);
 
@@ -4317,7 +4363,7 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
 interface GhostCompareModalProps {
   sprite: SpriteData;
   sprites: SpriteData[];
-  onChangeSprite: (next: SpriteData) => void;
+  onChangeSprites: (next: SpriteData[]) => void;
   onClose: () => void;
   isWhiteBg?: boolean;
 }
@@ -4559,7 +4605,7 @@ const maskImageToZones = (
   return imageFromCanvasDataUrl(canvas, 'No se pudo recortar la zona de referencia.');
 };
 
-const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, onChangeSprite, onClose, isWhiteBg }) => {
+const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, onChangeSprites, onClose, isWhiteBg }) => {
   const others = sprites.filter((s) => s.id !== sprite.id);
   const [sourceId, setSourceId] = useState<string | null>(() => {
     if (others.length === 1) return others[0].id;
@@ -4582,6 +4628,9 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
   const [selectedMarkId, setSelectedMarkId] = useState<string | null>(null);
   const [overlayPx, setOverlayPx] = useState({ w: 1, h: 1 });
   const [nudgeStep, setNudgeStep] = useState(() => Math.round(clampNum(loadPref('joa-content-nudge-step', 1), 1, 512, 1)));
+  /** Sprites ocultos que reciben las mismas ediciones que el destino/fuente activo. */
+  const [linkedIds, setLinkedIds] = useState<string[]>([]);
+  const [showLinkedPicker, setShowLinkedPicker] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const markDragRef = useRef<
     | { type: 'create'; id: string; cx: number; cy: number; role: OverlayMarkZone['role'] }
@@ -4602,6 +4651,10 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
     markDragRef.current = null;
     setZoneMarkMode('off');
   }, [sourceId]);
+
+  useEffect(() => {
+    setLinkedIds((prev) => prev.filter((id) => id !== sprite.id && id !== sourceId));
+  }, [sprite.id, sourceId]);
 
   useEffect(() => {
     savePref(GHOST_COMPARE_PREFS_KEY, { zoom, opacity, targetOpacity, editSource, paletteForce, markShape });
@@ -4636,8 +4689,27 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
   sourceRef.current = source;
   const editSourceRef = useRef(editSource);
   editSourceRef.current = editSource;
-  const onChangeRef = useRef(onChangeSprite);
-  onChangeRef.current = onChangeSprite;
+  const spritesRef = useRef(sprites);
+  spritesRef.current = sprites;
+  const linkedIdsRef = useRef(linkedIds);
+  linkedIdsRef.current = linkedIds;
+  const onChangeSpritesRef = useRef(onChangeSprites);
+  onChangeSpritesRef.current = onChangeSprites;
+
+  const applyToEditAndLinked = (transform: (s: SpriteData) => SpriteData) => {
+    const target = editSourceRef.current ? sourceRef.current : spriteRef.current;
+    if (!target) return;
+    const updates: SpriteData[] = [transform(target)];
+    const seen = new Set<string>([target.id]);
+    for (const id of linkedIdsRef.current) {
+      if (seen.has(id)) continue;
+      const sp = spritesRef.current.find((x) => x.id === id);
+      if (!sp) continue;
+      seen.add(id);
+      updates.push(transform(sp));
+    }
+    onChangeSpritesRef.current(updates);
+  };
 
   const zoneMarkModeRef = useRef(zoneMarkMode);
   zoneMarkModeRef.current = zoneMarkMode;
@@ -4689,9 +4761,7 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
       else if (e.key === 'ArrowDown') dy = step;
       else return;
       e.preventDefault();
-      const moving = editSourceRef.current ? sourceRef.current : spriteRef.current;
-      if (!moving) return;
-      onChangeRef.current(nudgeSpriteContent(moving, dx, dy));
+      applyToEditAndLinked((sp) => nudgeSpriteContent(sp, dx, dy));
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -4768,18 +4838,36 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
       const refForPalette = matchSrcZones.length > 0
         ? await maskImageToZones(reference.img, reference, matchSrcZones)
         : reference.img;
-      let newImg = await transferImageColorsToReference(target.img, refForPalette, paletteForce);
-      if (matchDstZones.length > 0) {
-        newImg = await restorePixelsByZones(target.img, newImg, target, matchDstZones, 'outside');
+
+      const targets: SpriteData[] = [target];
+      const seen = new Set<string>([target.id]);
+      for (const id of linkedIds) {
+        if (seen.has(id)) continue;
+        const sp = sprites.find((x) => x.id === id);
+        if (!sp) continue;
+        seen.add(id);
+        targets.push(sp);
       }
-      if (protectZones.length > 0) {
-        newImg = await restorePixelsByZones(target.img, newImg, target, protectZones, 'inside');
+
+      const updates: SpriteData[] = [];
+      for (const t of targets) {
+        let newImg = await transferImageColorsToReference(t.img, refForPalette, paletteForce);
+        // Zonas de destino/protección solo en el sprite visible del overlay.
+        if (t.id === target.id) {
+          if (matchDstZones.length > 0) {
+            newImg = await restorePixelsByZones(t.img, newImg, t, matchDstZones, 'outside');
+          }
+          if (protectZones.length > 0) {
+            newImg = await restorePixelsByZones(t.img, newImg, t, protectZones, 'inside');
+          }
+        }
+        updates.push({
+          ...t,
+          img: newImg,
+          originalImg: t.originalImg === t.img ? newImg : t.originalImg,
+        });
       }
-      onChangeSprite({
-        ...target,
-        img: newImg,
-        originalImg: target.originalImg === target.img ? newImg : target.originalImg,
-      });
+      onChangeSprites(updates);
     } catch (err) {
       console.error(err);
       alert('No se pudo igualar la paleta.');
@@ -4922,7 +5010,7 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
       className="btn btn-outline"
       style={{ width: '34px', height: '34px', padding: 0 }}
       title={title}
-      onClick={() => onChangeSprite(nudgeSpriteContent(editTarget, dx, dy))}
+      onClick={() => applyToEditAndLinked((sp) => nudgeSpriteContent(sp, dx, dy))}
     >
       {icon}
     </button>
@@ -5018,6 +5106,72 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
           )}
         </div>
         <div className="modal-footer" style={{ padding: '16px 20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '16px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+          {(() => {
+            const linkable = sprites.filter((s) => s.id !== sprite.id && s.id !== sourceId);
+            if (linkable.length === 0) return null;
+            return (
+              <div style={{ flex: '1 1 100%', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                <button
+                  type="button"
+                  className="btn btn-outline"
+                  style={{
+                    alignSelf: 'flex-start',
+                    borderColor: linkedIds.length ? 'var(--accent)' : undefined,
+                    color: linkedIds.length ? 'var(--accent)' : undefined,
+                  }}
+                  title="Elegí otros sprites importados. No se muestran en el overlay, pero reciben las mismas ediciones (mover, escala, autoalinear, paleta)."
+                  onClick={() => setShowLinkedPicker((v) => !v)}
+                >
+                  <CheckSquare size={14} /> También aplicar a{linkedIds.length ? ` (${linkedIds.length})` : '…'}
+                </button>
+                {showLinkedPicker && (
+                  <div
+                    style={{
+                      maxHeight: '140px',
+                      overflow: 'auto',
+                      border: '1px solid var(--border)',
+                      borderRadius: '8px',
+                      padding: '8px 10px',
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))',
+                      gap: '4px 12px',
+                      background: 'rgba(0,0,0,0.2)',
+                    }}
+                  >
+                    {linkable.map((s) => {
+                      const checked = linkedIds.includes(s.id);
+                      return (
+                        <label
+                          key={s.id}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '8px',
+                            fontSize: '0.72rem',
+                            cursor: 'pointer',
+                            userSelect: 'none',
+                            color: checked ? 'var(--text-main)' : 'var(--text-muted)',
+                          }}
+                          title={s.name}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => {
+                              setLinkedIds((prev) => (
+                                checked ? prev.filter((id) => id !== s.id) : [...prev, s.id]
+                              ));
+                            }}
+                          />
+                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.name}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
           <label
             style={{
               display: 'inline-flex',
@@ -5032,7 +5186,7 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
               borderRadius: '8px',
               background: editSource ? 'rgba(255,204,102,0.08)' : 'transparent',
             }}
-            title="Si está activo, mover / escala / autoalinear / igualar paleta modifican la fuente (fondo). Si no, modifican el sprite de arriba. La paleta de referencia es siempre el otro."
+            title="Si está activo, mover / escala / autoalinear / igualar paleta modifican la fuente (fondo). Si no, modifican el sprite de arriba. La paleta de referencia es siempre el otro. Los vinculados reciben lo mismo."
           >
             <input
               type="checkbox"
@@ -5062,7 +5216,16 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
               max="4"
               step="0.01"
               value={internalScale}
-              onChange={(e) => onChangeSprite(setSpriteInternalScale(editTarget, parseFloat(e.target.value)))}
+              onChange={(e) => {
+                const newScaleVal = parseFloat(e.target.value);
+                const oldScaleVal = editTarget.scale || 1;
+                const factor = newScaleVal / Math.max(0.0001, oldScaleVal);
+                applyToEditAndLinked((sp) => {
+                  if (sp.id === editTarget.id) return setSpriteInternalScale(sp, newScaleVal);
+                  const next = Math.max(0.1, Math.min(4, (sp.scale || 1) * factor));
+                  return setSpriteInternalScale(sp, next);
+                });
+              }}
             />
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
@@ -5113,7 +5276,17 @@ const GhostCompareModal: React.FC<GhostCompareModalProps> = ({ sprite, sprites, 
                   alert('No se encontró dibujo en la base de alguno de los dos sprites.');
                   return;
                 }
-                onChangeSprite(aligned);
+                const updates: SpriteData[] = [aligned];
+                const seen = new Set<string>([editTarget.id]);
+                for (const id of linkedIds) {
+                  if (seen.has(id)) continue;
+                  const sp = sprites.find((x) => x.id === id);
+                  if (!sp) continue;
+                  seen.add(id);
+                  const a = autoAlignSpriteToFixedBottom(sp, alignFixed);
+                  if (a) updates.push(a);
+                }
+                onChangeSprites(updates);
               }}
             >
               <Target size={14} /> Autoalinear base
@@ -10109,6 +10282,11 @@ const App: React.FC = () => {
         if (selection.length === 0) return;
         e.preventDefault();
         spriteClipboardRef.current = snapshotSpritesForClipboard(selection);
+        // Portapapeles de Windows: cada sprite como archivo PNG separado (desktop).
+        const selected = new Set(selection);
+        const ordered = getAppSpriteDisplayOrder(sprites, columnView, gridSplitActive, spriteRows, spriteColumns)
+          .filter((s) => selected.has(s.id));
+        void copySpritesToSystemClipboard(ordered);
         return;
       }
 
@@ -10135,7 +10313,7 @@ const App: React.FC = () => {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [anyModalOpen, selection, sprites, referenceId, historyIndex, history]);
+  }, [anyModalOpen, selection, sprites, referenceId, historyIndex, history, columnView, gridSplitActive, spriteRows, spriteColumns]);
 
   useEffect(() => {
     try { localStorage.setItem('joa-controls-width', String(controlsWidth)); } catch { /* ignore */ }
@@ -11162,25 +11340,25 @@ const App: React.FC = () => {
     if (desktop) {
       try {
         const items = await desktop.pickOpenFiles({
-          title: 'Cortar spritesheet',
-          multiple: false,
+          title: 'Cortar spritesheet(s)',
+          multiple: true,
         });
         if (items.length === 0) return;
         const folder = await desktop.getWorkingFolder();
         if (folder) setWorkingFolder(folder);
-        await handleSliceFile(filesFromDesktopOpen(items)[0]);
+        await handleSliceFiles(filesFromDesktopOpen(items));
       } catch (err) {
         console.error(err);
       }
       return;
     }
 
-    const files = await pickImageFiles(false, dirHandle);
+    const files = await pickImageFiles(true, dirHandle);
     if (files === null) {
       document.getElementById('slice-up')?.click();
       return;
     }
-    if (files[0]) await handleSliceFile(files[0]);
+    if (files.length > 0) await handleSliceFiles(files);
   };
 
   const handleSplitParts = async (sourceId: string, parts: SplitPart[], removeFromSource: boolean) => {
@@ -11239,11 +11417,16 @@ const App: React.FC = () => {
     setSplitPartsTargetId(null);
   };
 
-  const handleSliceFile = async (file: File) => {
-    if (!file || !isProbablyImageFile(file)) return;
+  const handleSliceFiles = async (input: File | File[] | FileList) => {
+    const files = (Array.isArray(input) ? input : Array.from(input as FileList | File[]))
+      .filter((f) => f && isProbablyImageFile(f));
+    if (files.length === 0) return;
+
     const cols = promptLastInt(
       LAST_SLICE_COLS_KEY,
-      '¿En cuántas columnas (cortes verticales) deseas dividir la imagen?',
+      files.length > 1
+        ? `Vas a cortar ${files.length} spritesheets con la misma grilla.\n¿En cuántas columnas (cortes verticales)?`
+        : '¿En cuántas columnas (cortes verticales) deseas dividir la imagen?',
       1,
       { min: 1, max: 1024, invalidMessage: 'Número de columnas inválido' },
     );
@@ -11251,85 +11434,109 @@ const App: React.FC = () => {
 
     const rows = promptLastInt(
       LAST_SLICE_ROWS_KEY,
-      '¿En cuántas filas (cortes horizontales) deseas dividir la imagen?',
+      files.length > 1
+        ? `Misma grilla para los ${files.length} archivos.\n¿En cuántas filas (cortes horizontales)?`
+        : '¿En cuántas filas (cortes horizontales) deseas dividir la imagen?',
       1,
       { min: 1, max: 1024, invalidMessage: 'Número de filas o columnas inválido' },
     );
     if (rows === null) return;
 
-    const img = await new Promise<HTMLImageElement>((res, rej) => {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const image = new Image();
-        image.onload = () => res(image);
-        image.onerror = rej;
-        image.src = e.target?.result as string;
-      };
-      reader.readAsDataURL(file);
-    });
-
-    const sliceWidth = Math.floor(img.width / cols);
-    const sliceHeight = Math.floor(img.height / rows);
-    if (sliceWidth === 0 || sliceHeight === 0) {
-      alert('La imagen es demasiado pequeña para cortarse en tantas partes.');
-      return;
-    }
-
+    setIsSaving(true);
     const newSprites: SpriteData[] = [];
-    const baseName = file.name.replace(/\.[^/.]+$/, ""); // Remove extension
-    
-    const canvas = document.createElement('canvas');
-    canvas.width = sliceWidth;
-    canvas.height = sliceHeight;
-    const ctx = canvas.getContext('2d')!;
+    const skipped: string[] = [];
 
-    let counter = 1;
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        ctx.clearRect(0, 0, sliceWidth, sliceHeight);
-        ctx.drawImage(img, c * sliceWidth, r * sliceHeight, sliceWidth, sliceHeight, 0, 0, sliceWidth, sliceHeight);
-        
-        const sliceImg = await new Promise<HTMLImageElement>((res, rej) => {
-          const image = new Image();
-          image.onload = () => res(image);
-          image.onerror = rej;
-          image.src = canvas.toDataURL('image/png');
+    try {
+      for (const file of files) {
+        const img = await new Promise<HTMLImageElement>((res, rej) => {
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            const image = new Image();
+            image.onload = () => res(image);
+            image.onerror = rej;
+            image.src = e.target?.result as string;
+          };
+          reader.onerror = rej;
+          reader.readAsDataURL(file);
         });
 
-        newSprites.push({
-          id: generateId(),
-          name: `${baseName}_frame_${counter}.png`,
-          img: sliceImg,
-          originalImg: sliceImg,
-          scale: 1,
-          rotation: 0,
-          offsetX: 0,
-          offsetY: 0,
-          flipH: false,
-          flipV: false,
-          regions: [],
-          padding: { top: 0, bottom: 0, left: 0, right: 0 },
-          anchor: { x: Math.floor(sliceWidth / 2), y: Math.floor(sliceHeight / 2) },
-          pixelation: 1,
-          brightness: 100,
-          contrast: 100,
-          saturation: 100,
-          hue: 0,
-          opacity: 100,
-          tintColor: '#000000',
-          tintOpacity: 0,
-          belowSplit: gridSplitActive ? true : undefined,
-        });
-        counter++;
+        const sliceWidth = Math.floor(img.width / cols);
+        const sliceHeight = Math.floor(img.height / rows);
+        if (sliceWidth === 0 || sliceHeight === 0) {
+          skipped.push(file.name);
+          continue;
+        }
+
+        const baseName = file.name.replace(/\.[^/.]+$/, '');
+        const canvas = document.createElement('canvas');
+        canvas.width = sliceWidth;
+        canvas.height = sliceHeight;
+        const ctx = canvas.getContext('2d')!;
+
+        let counter = 1;
+        for (let r = 0; r < rows; r++) {
+          for (let c = 0; c < cols; c++) {
+            ctx.clearRect(0, 0, sliceWidth, sliceHeight);
+            ctx.drawImage(img, c * sliceWidth, r * sliceHeight, sliceWidth, sliceHeight, 0, 0, sliceWidth, sliceHeight);
+
+            const sliceImg = await new Promise<HTMLImageElement>((res, rej) => {
+              const image = new Image();
+              image.onload = () => res(image);
+              image.onerror = rej;
+              image.src = canvas.toDataURL('image/png');
+            });
+
+            newSprites.push({
+              id: generateId(),
+              name: `${baseName}_frame_${counter}.png`,
+              img: sliceImg,
+              originalImg: sliceImg,
+              scale: 1,
+              rotation: 0,
+              offsetX: 0,
+              offsetY: 0,
+              flipH: false,
+              flipV: false,
+              regions: [],
+              padding: { top: 0, bottom: 0, left: 0, right: 0 },
+              anchor: { x: Math.floor(sliceWidth / 2), y: Math.floor(sliceHeight / 2) },
+              pixelation: 1,
+              brightness: 100,
+              contrast: 100,
+              saturation: 100,
+              hue: 0,
+              opacity: 100,
+              tintColor: '#000000',
+              tintOpacity: 0,
+              belowSplit: gridSplitActive ? true : undefined,
+            });
+            counter++;
+          }
+        }
       }
-    }
 
-    if (newSprites.length > 0) {
-      const merged = [...sprites, ...newSprites];
-      commitSprites(merged);
-      const ids = newSprites.map((s: SpriteData) => s.id);
-      selectionAnchorRef.current = ids[ids.length - 1] ?? null;
-      setSelection(ids);
+      if (newSprites.length > 0) {
+        const merged = [...sprites, ...newSprites];
+        commitSprites(merged);
+        const ids = newSprites.map((s: SpriteData) => s.id);
+        selectionAnchorRef.current = ids[ids.length - 1] ?? null;
+        setSelection(ids);
+      }
+
+      if (skipped.length > 0) {
+        alert(
+          skipped.length === files.length
+            ? 'Ninguna imagen pudo cortarse: son demasiado pequeñas para esa grilla.'
+            : `Se omitieron ${skipped.length} archivo(s) demasiado pequeños para la grilla:\n${skipped.slice(0, 8).join('\n')}${skipped.length > 8 ? '\n…' : ''}`,
+        );
+      } else if (newSprites.length === 0) {
+        alert('No se generaron frames al cortar.');
+      }
+    } catch (err) {
+      console.error(err);
+      alert('Hubo un error al cortar los spritesheets.');
+    } finally {
+      setIsSaving(false);
     }
   };
 
@@ -12572,6 +12779,31 @@ const App: React.FC = () => {
   const exportGridSpritesheet = async () => {
     if (sprites.length === 0) return;
 
+    // Primero: avisar si hay tamaños Full distintos (lo que realmente entra en la tira).
+    if (sprites.length >= 2) {
+      const groups = new Map<string, string[]>();
+      for (const s of sprites) {
+        const { w, h } = getSpriteFrameSize(s);
+        const key = `${Math.round(w)}×${Math.round(h)}`;
+        const list = groups.get(key);
+        if (list) list.push(s.name);
+        else groups.set(key, [s.name]);
+      }
+      if (groups.size > 1) {
+        const lines = [...groups.entries()]
+          .sort((a, b) => b[1].length - a[1].length)
+          .map(([size, names]) => {
+            const sample = names.slice(0, 3).join(', ');
+            const more = names.length > 3 ? ` (+${names.length - 3})` : '';
+            return `• ${size} — ${names.length} sprite(s): ${sample}${more}`;
+          });
+        const ok = confirm(
+          `Hay sprites con distinta resolución Full (tamaño que entra en la tira):\n\n${lines.join('\n')}\n\n¿Continuar de todos modos?`,
+        );
+        if (!ok) return;
+      }
+    }
+
     const cols = promptLastInt(
       LAST_EXPORT_STRIP_COLS_KEY,
       '¿Cuántas columnas deseas para el spritesheet al exportar?',
@@ -12916,7 +13148,7 @@ const App: React.FC = () => {
            <button className="btn btn-primary" onClick={openImportFiles}>
              <Plus size={16} /> Importar Lote
            </button>
-           <button className="btn btn-primary" onClick={openSliceFile}>
+           <button className="btn btn-primary" onClick={openSliceFile} title="Podés elegir uno o varios spritesheets; se cortan con la misma grilla">
              <Scissors size={16} /> Cortar Spritesheet
            </button>
            <button className="btn btn-outline" onClick={exportGridSpritesheet} disabled={sprites.length === 0}>
@@ -12929,7 +13161,7 @@ const App: React.FC = () => {
              if (e.target.files && cell) void handleFiles(e.target.files, cell);
              e.target.value = '';
            }} />
-           <input type="file" id="slice-up" hidden accept="image/*" onChange={(e) => { if (e.target.files && e.target.files[0]) handleSliceFile(e.target.files[0]); e.target.value = ''; }} />
+           <input type="file" id="slice-up" hidden multiple accept="image/*" onChange={(e) => { if (e.target.files && e.target.files.length > 0) void handleSliceFiles(e.target.files); e.target.value = ''; }} />
            <input type="file" id="project-up" hidden accept=".joa,.zip,application/zip" onChange={(e) => { if (e.target.files && e.target.files[0]) openProjectFile(e.target.files[0]); e.target.value = ''; }} />
            <div style={{ height: '24px', width: '1px', background: 'var(--border)', margin: '0 2px', flexShrink: 0 }} />
            <button className="btn btn-outline" onClick={() => setBatchExportFormat('png')} disabled={sprites.length === 0 || isSaving}>
@@ -14200,8 +14432,9 @@ const App: React.FC = () => {
         <GhostCompareModal
           sprite={sprites.find(s => s.id === ghostCompareTargetId)!}
           sprites={sprites}
-          onChangeSprite={(next) => {
-            commitSprites(sprites.map((s) => (s.id === next.id ? next : s)));
+          onChangeSprites={(updates) => {
+            const map = new Map(updates.map((u) => [u.id, u]));
+            commitSprites(sprites.map((s) => map.get(s.id) ?? s));
           }}
           onClose={() => setGhostCompareTargetId(null)}
           isWhiteBg={isWhiteBg}

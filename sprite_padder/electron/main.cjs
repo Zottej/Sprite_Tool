@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, shell, clipboard, nativeImage } = require('electron');
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
@@ -223,5 +223,49 @@ ipcMain.handle('desktop:writeFilesToFolder', async (_event, folderPath, files) =
 ipcMain.handle('desktop:revealInFolder', async (_event, targetPath) => {
   if (!targetPath) return false;
   shell.showItemInFolder(targetPath);
+  return true;
+});
+
+/** Copia PNGs al portapapeles de Windows como archivos separados (y como imagen si hay uno solo). */
+ipcMain.handle('desktop:copyImagesToClipboard', async (_event, files) => {
+  if (!Array.isArray(files) || files.length === 0) return false;
+
+  const dir = path.join(app.getPath('temp'), 'joa-sprite-clipboard');
+  await fsp.rm(dir, { recursive: true, force: true });
+  await fsp.mkdir(dir, { recursive: true });
+
+  const used = new Set();
+  const paths = [];
+  let firstBuffer = null;
+
+  for (const file of files) {
+    if (!file || !file.data) continue;
+    const rawName = typeof file.name === 'string' && file.name.trim() ? file.name.trim() : 'sprite.png';
+    let base = path.basename(rawName).replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_');
+    if (!/\.png$/i.test(base)) base = `${base.replace(/\.[^.]+$/, '') || 'sprite'}.png`;
+    let name = base;
+    let n = 2;
+    while (used.has(name.toLowerCase())) {
+      const stem = base.replace(/\.png$/i, '');
+      name = `${stem}_${n}.png`;
+      n += 1;
+    }
+    used.add(name.toLowerCase());
+
+    const buf = Buffer.from(file.data);
+    if (!firstBuffer) firstBuffer = buf;
+    const dest = path.join(dir, name);
+    await fsp.writeFile(dest, buf);
+    paths.push(dest);
+  }
+
+  if (paths.length === 0) return false;
+
+  const payload = { files: paths };
+  if (paths.length === 1 && firstBuffer) {
+    const image = nativeImage.createFromBuffer(firstBuffer);
+    if (!image.isEmpty()) payload.image = image;
+  }
+  clipboard.write(payload);
   return true;
 });

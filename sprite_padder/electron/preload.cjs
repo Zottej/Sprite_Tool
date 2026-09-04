@@ -15,4 +15,5 @@ contextBridge.exposeInMainWorld('joaDesktop', {
   writeFilesToFolder: (folderPath, files) =>
     ipcRenderer.invoke('desktop:writeFilesToFolder', folderPath, files),
   revealInFolder: (targetPath) => ipcRenderer.invoke('desktop:revealInFolder', targetPath),
+  copyImagesToClipboard: (files) => ipcRenderer.invoke('desktop:copyImagesToClipboard', files),
 });
