@@ -417,6 +417,10 @@ const AUTOSAVE_STRIP_PATH_KEY = 'joa-autosave-strip-path';
 const AUTOSAVE_OVERWRITE_FOLDER_KEY = 'joa-autosave-overwrite-folder';
 const LAST_BG_BLACK_SMART_TOL_KEY = 'joa-last-bg-black-smart-tol';
 const LAST_BG_BLACK_PRECISE_TOL_KEY = 'joa-last-bg-black-precise-tol';
+const LAST_BG_WHITE_SMART_TOL_KEY = 'joa-last-bg-white-smart-tol';
+const LAST_BG_WHITE_PRECISE_TOL_KEY = 'joa-last-bg-white-precise-tol';
+const LAST_BG_GREEN_SMART_TOL_KEY = 'joa-last-bg-green-smart-tol';
+const LAST_BG_GREEN_PRECISE_TOL_KEY = 'joa-last-bg-green-precise-tol';
 const LAST_REMOVE_TEXT_TOL_KEY = 'joa-last-remove-text-tol';
 const LAST_ADD_TEXT_SIZE_KEY = 'joa-last-add-text-size';
 const LAST_COMPOSITE_SIZE_KEY = 'joa-last-composite-size';
@@ -4050,6 +4054,67 @@ const PixelEditorModal: React.FC<PixelEditorModalProps> = ({ sprite, onSave, onC
   );
 };
 
+/** `size`/`sizeY` pueden ser fraccionarios cuando la grilla se detecta automáticamente. */
+type PaintGridOrigin = { x: number; y: number; size: number; sizeY: number; auto?: boolean };
+
+const paintGridMod = (n: number, m: number) => ((n % m) + m) % m;
+
+/** Índice de celda que contiene al píxel. */
+const paintGridIndexAt = (px: number, py: number, origin: PaintGridOrigin) => ({
+  ix: Math.floor((px - origin.x) / origin.size),
+  iy: Math.floor((py - origin.y) / origin.sizeY),
+});
+
+/** Rectángulo entero de una celda: los bordes se redondean para no dejar huecos ni solapes. */
+const paintGridCellRect = (origin: PaintGridOrigin, ix: number, iy: number) => {
+  const x = Math.round(origin.x + ix * origin.size);
+  const y = Math.round(origin.y + iy * origin.sizeY);
+  return {
+    x,
+    y,
+    w: Math.max(1, Math.round(origin.x + (ix + 1) * origin.size) - x),
+    h: Math.max(1, Math.round(origin.y + (iy + 1) * origin.sizeY) - y),
+  };
+};
+
+const formatGridSize = (n: number) => (Number.isInteger(n) ? `${n}` : n.toFixed(2).replace(/0$/, ''));
+
+const describeGrid = (origin: PaintGridOrigin) =>
+  Math.abs(origin.size - origin.sizeY) < 0.005
+    ? `${formatGridSize(origin.size)}px`
+    : `${formatGridSize(origin.size)}×${formatGridSize(origin.sizeY)}px`;
+
+/** Recorre celdas (índices) entre dos puntos de la malla, sin saltarse ni repetir. */
+const paintGridCellsOnLine = (
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+): { x: number; y: number }[] => {
+  const cells: { x: number; y: number }[] = [];
+  const dx = Math.abs(x1 - x0);
+  const dy = Math.abs(y1 - y0);
+  const sx = x0 < x1 ? 1 : -1;
+  const sy = y0 < y1 ? 1 : -1;
+  let err = dx - dy;
+  let x = x0;
+  let y = y0;
+  while (true) {
+    cells.push({ x, y });
+    if (x === x1 && y === y1) break;
+    const e2 = 2 * err;
+    if (e2 > -dy) {
+      err -= dy;
+      x += sx;
+    }
+    if (e2 < dx) {
+      err += dx;
+      y += sy;
+    }
+  }
+  return cells;
+};
+
 // --- Eraser Modal Component ---
 interface EraserModalProps {
   sprite: SpriteData;
@@ -4062,6 +4127,8 @@ type EraserPrefs = {
   zoom: number;
   brushSize: number;
   brushShape: 'circle' | 'square';
+  gridLock: boolean;
+  showPixelGrid: boolean;
 };
 
 const ERASER_PREFS_KEY = 'joa-eraser-prefs';
@@ -4072,6 +4139,8 @@ const loadEraserPrefs = (): EraserPrefs => {
     zoom: clampNum(saved.zoom, 0.5, 8, 1),
     brushSize: Math.round(clampNum(saved.brushSize, 1, 100, 20)),
     brushShape: saved.brushShape === 'square' ? 'square' : 'circle',
+    gridLock: saved.gridLock === true,
+    showPixelGrid: saved.showPixelGrid === true,
   };
 };
 
@@ -4080,12 +4149,18 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
   const [brushSize, setBrushSize] = useState(() => loadEraserPrefs().brushSize);
   const [brushShape, setBrushShape] = useState<'circle' | 'square'>(() => loadEraserPrefs().brushShape);
   const [zoom, setZoom] = useState(() => loadEraserPrefs().zoom);
+  const [gridLock, setGridLock] = useState(() => loadEraserPrefs().gridLock);
+  const [showPixelGrid, setShowPixelGrid] = useState(() => loadEraserPrefs().showPixelGrid);
+  const [gridOrigin, setGridOrigin] = useState<PaintGridOrigin | null>(null);
+  const [gridSizeDraft, setGridSizeDraft] = useState('');
   const [mousePos, setMousePos] = useState<{ x: number, y: number } | null>(null);
   const lastPos = useRef<{ x: number, y: number } | null>(null);
   const historyRef = useRef<ImageData[]>([]);
   const [historyLen, setHistoryLen] = useState(0);
   const strokeSavedRef = useRef(false);
   const isDrawingRef = useRef(false);
+  const strokePaintedRef = useRef<Set<string> | null>(null);
+  const gridOriginRef = useRef<PaintGridOrigin | null>(null);
   const { workspaceRef, onWorkspaceScroll } = useRememberedScroll('joa-eraser-scroll', sprite.name);
   useModalWheelControls({ zoom, setZoom, brushSize, setBrushSize, workspaceRef });
 
@@ -4095,12 +4170,26 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
     const ctx = canvas.getContext('2d')!;
     canvas.width = sprite.img.width;
     canvas.height = sprite.img.height;
+    ctx.imageSmoothingEnabled = false;
     ctx.drawImage(sprite.img, 0, 0);
   }, [sprite]);
 
   useEffect(() => {
-    savePref(ERASER_PREFS_KEY, { zoom, brushSize, brushShape });
-  }, [zoom, brushSize, brushShape]);
+    savePref(ERASER_PREFS_KEY, { zoom, brushSize, brushShape, gridLock, showPixelGrid });
+  }, [zoom, brushSize, brushShape, gridLock, showPixelGrid]);
+
+  useEffect(() => {
+    const size = Math.max(1, brushSize);
+    const current = gridOriginRef.current;
+    if (!gridLock || (current && !current.auto && current.size !== size)) {
+      gridOriginRef.current = null;
+      setGridOrigin(null);
+    }
+  }, [gridLock, brushSize]);
+
+  useEffect(() => {
+    setGridSizeDraft(gridOrigin ? String(Number(gridOrigin.size.toFixed(2))) : '');
+  }, [gridOrigin]);
 
   const pushHistory = () => {
     const canvas = canvasRef.current;
@@ -4137,27 +4226,130 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
     return () => window.removeEventListener('keydown', onKey, true);
   }, []);
 
+  const ensureGridOrigin = (px: number, py: number): PaintGridOrigin => {
+    if (gridOriginRef.current) return gridOriginRef.current;
+    const size = Math.max(1, brushSize);
+    const origin: PaintGridOrigin = {
+      x: Math.floor(px) - Math.floor(size / 2),
+      y: Math.floor(py) - Math.floor(size / 2),
+      size,
+      sizeY: size,
+    };
+    gridOriginRef.current = origin;
+    setGridOrigin(origin);
+    return origin;
+  };
+
+  const anchorMeasuredGrid = (offsetX: number, offsetY: number, cellW: number, cellH: number) => {
+    const origin: PaintGridOrigin = {
+      x: offsetX - Math.ceil(offsetX / cellW) * cellW,
+      y: offsetY - Math.ceil(offsetY / cellH) * cellH,
+      size: cellW,
+      sizeY: cellH,
+      auto: true,
+    };
+    gridOriginRef.current = origin;
+    setGridOrigin(origin);
+    setGridLock(true);
+  };
+
+  const autoDetectGrid = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    const found = detectPixelGrid(ctx.getImageData(0, 0, canvas.width, canvas.height));
+    if (!found) {
+      alert('No pude medir una grilla clara en este dibujo. Probá anclar la grilla a mano con el primer clic.');
+      return;
+    }
+    anchorMeasuredGrid(found.offsetX, found.offsetY, found.cellW, found.cellH);
+  };
+
+  const applyGridSize = (size: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const cell = Math.min(200, Math.max(1, size));
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    const aligned = alignPixelGrid(ctx.getImageData(0, 0, canvas.width, canvas.height), cell, cell);
+    anchorMeasuredGrid(aligned?.offsetX ?? 0, aligned?.offsetY ?? 0, cell, cell);
+  };
+
+  const commitGridSizeDraft = () => {
+    const value = parseFloat(gridSizeDraft.replace(',', '.'));
+    if (!Number.isFinite(value) || value < 1) {
+      setGridSizeDraft(gridOrigin ? String(Number(gridOrigin.size.toFixed(2))) : '');
+      return;
+    }
+    applyGridSize(value);
+  };
+
+  const eraseGridCell = (
+    ctx: CanvasRenderingContext2D,
+    ix: number,
+    iy: number,
+    origin: PaintGridOrigin,
+    painted: Set<string> | null,
+  ) => {
+    const key = `${ix},${iy}`;
+    if (painted) {
+      if (painted.has(key)) return;
+      painted.add(key);
+    }
+    const rect = paintGridCellRect(origin, ix, iy);
+    if (brushShape === 'circle') {
+      const rx = rect.w / 2;
+      const ry = rect.h / 2;
+      const cx = rect.x + rx;
+      const cy = rect.y + ry;
+      for (let y = rect.y; y < rect.y + rect.h; y++) {
+        for (let x = rect.x; x < rect.x + rect.w; x++) {
+          const dx = (x + 0.5 - cx) / rx;
+          const dy = (y + 0.5 - cy) / ry;
+          if (dx * dx + dy * dy > 1) continue;
+          ctx.clearRect(x, y, 1, 1);
+        }
+      }
+      return;
+    }
+    ctx.clearRect(rect.x, rect.y, rect.w, rect.h);
+  };
+
   const erase = (e: React.MouseEvent, forceFirstPoint = false) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    
-    const ctx = canvas.getContext('2d')!;
-    const rect = canvas.getBoundingClientRect();
-    const x = (e.clientX - rect.left) / zoom;
-    const y = (e.clientY - rect.top) / zoom;
 
-    setMousePos({ x, y });
+    const ctx = canvas.getContext('2d')!;
+    ctx.imageSmoothingEnabled = false;
+    const rect = canvas.getBoundingClientRect();
+    const currX = Math.floor((e.clientX - rect.left) * (canvas.width / Math.max(1, rect.width)));
+    const currY = Math.floor((e.clientY - rect.top) * (canvas.height / Math.max(1, rect.height)));
+
+    setMousePos({ x: currX, y: currY });
 
     if (!isDrawingRef.current && !forceFirstPoint) {
       lastPos.current = null;
       return;
     }
 
-    const scaleX = canvas.width / (rect.width / zoom);
-    const scaleY = canvas.height / (rect.height / zoom);
-    const currX = x * scaleX;
-    const currY = y * scaleY;
-    
+    if (gridLock) {
+      ctx.globalCompositeOperation = 'destination-out';
+      // clearRect ignora composite; usamos fill con destination-out para celdas cuadradas vía clearRect OK
+      // clearRect always clears regardless of composite — good for full erase
+      const origin = ensureGridOrigin(currX, currY);
+      const cell = paintGridIndexAt(currX, currY, origin);
+      const painted = strokePaintedRef.current;
+      if (lastPos.current && !forceFirstPoint) {
+        const prev = paintGridIndexAt(lastPos.current.x, lastPos.current.y, origin);
+        for (const c of paintGridCellsOnLine(prev.ix, prev.iy, cell.ix, cell.iy)) {
+          eraseGridCell(ctx, c.x, c.y, origin, painted);
+        }
+      } else {
+        eraseGridCell(ctx, cell.ix, cell.iy, origin, painted);
+      }
+      lastPos.current = { x: currX, y: currY };
+      return;
+    }
+
     ctx.globalCompositeOperation = 'destination-out';
     if (lastPos.current && !forceFirstPoint) {
       if (brushShape === 'circle') {
@@ -4180,14 +4372,12 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
           ctx.fillRect(x - brushSize, y - brushSize, brushSize * 2, brushSize * 2);
         }
       }
+    } else if (brushShape === 'circle') {
+      ctx.beginPath();
+      ctx.arc(currX, currY, brushSize, 0, Math.PI * 2);
+      ctx.fill();
     } else {
-      if (brushShape === 'circle') {
-        ctx.beginPath();
-        ctx.arc(currX, currY, brushSize, 0, Math.PI * 2);
-        ctx.fill();
-      } else {
-        ctx.fillRect(currX - brushSize, currY - brushSize, brushSize * 2, brushSize * 2);
-      }
+      ctx.fillRect(currX - brushSize, currY - brushSize, brushSize * 2, brushSize * 2);
     }
     lastPos.current = { x: currX, y: currY };
   };
@@ -4197,6 +4387,7 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
       pushHistory();
       strokeSavedRef.current = true;
     }
+    strokePaintedRef.current = gridLock ? new Set() : null;
     isDrawingRef.current = true;
     erase(e, true);
   };
@@ -4204,6 +4395,7 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
   const endStroke = () => {
     isDrawingRef.current = false;
     lastPos.current = null;
+    strokePaintedRef.current = null;
     strokeSavedRef.current = false;
   };
 
@@ -4227,13 +4419,31 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
     ctx.drawImage(sprite.originalImg || sprite.img, 0, 0);
   };
 
+  const cellGridOverlay: PaintGridOrigin | null = (() => {
+    if (!gridLock) return null;
+    if (gridOrigin) return gridOrigin;
+    if (!mousePos) return null;
+    const size = Math.max(1, brushSize);
+    return {
+      x: Math.floor(mousePos.x) - Math.floor(size / 2),
+      y: Math.floor(mousePos.y) - Math.floor(size / 2),
+      size,
+      sizeY: size,
+    };
+  })();
+
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal-content" onClick={e => e.stopPropagation()}>
         <div className="modal-header">
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
             <Eraser size={18} color="var(--accent)" />
             <h3 style={{ fontSize: '1rem' }}>Editar: {sprite.name}</h3>
+            {gridLock && (
+              <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                {gridOrigin ? `Grilla ${describeGrid(gridOrigin)}${gridOrigin.auto ? ' auto' : ''}` : 'Grilla: clic para anclar'}
+              </span>
+            )}
           </div>
           <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
         </div>
@@ -4248,6 +4458,21 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
              height: sprite.img.height * zoom,
              position: 'relative'
            }}>
+             {showPixelGrid && zoom >= 4 && (
+               <div
+                 style={{
+                   position: 'absolute',
+                   left: 0,
+                   top: 0,
+                   width: sprite.img.width * zoom,
+                   height: sprite.img.height * zoom,
+                   pointerEvents: 'none',
+                   backgroundImage: 'linear-gradient(to right, rgba(255,255,255,0.14) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.14) 1px, transparent 1px)',
+                   backgroundSize: `${zoom}px ${zoom}px`,
+                   zIndex: 999,
+                 }}
+               />
+             )}
              <div style={{ 
                position: 'absolute',
                left: 0,
@@ -4265,27 +4490,69 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
               onMouseMove={(e) => erase(e)}
               onMouseEnter={(e) => {
                 const rect = e.currentTarget.getBoundingClientRect();
-                setMousePos({ x: (e.clientX - rect.left) / zoom, y: (e.clientY - rect.top) / zoom });
+                const mx = Math.floor((e.clientX - rect.left) * (e.currentTarget.width / Math.max(1, rect.width)));
+                const my = Math.floor((e.clientY - rect.top) * (e.currentTarget.height / Math.max(1, rect.height)));
+                setMousePos({ x: mx, y: my });
               }}
               onMouseLeave={() => {
                 endStroke();
                 setMousePos(null);
               }}
              />
-             {mousePos && canvasRef.current && (
-               <div className="brush-preview" style={{
-                 left: mousePos.x,
-                 top: mousePos.y,
-                 width: brushSize * (canvasRef.current.offsetWidth / canvasRef.current.width) * 2,
-                 height: brushSize * (canvasRef.current.offsetWidth / canvasRef.current.width) * 2,
-                 borderRadius: brushShape === 'circle' ? '50%' : '0'
-               }} />
+             {cellGridOverlay && (
+               <div
+                 style={{
+                   position: 'absolute',
+                   left: 0,
+                   top: 0,
+                   width: sprite.img.width,
+                   height: sprite.img.height,
+                   pointerEvents: 'none',
+                   backgroundImage: 'linear-gradient(to right, rgba(255,255,255,0.28) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.28) 1px, transparent 1px)',
+                   backgroundSize: `${cellGridOverlay.size}px ${cellGridOverlay.sizeY}px`,
+                   backgroundPosition: `${paintGridMod(cellGridOverlay.x, cellGridOverlay.size)}px ${paintGridMod(cellGridOverlay.y, cellGridOverlay.sizeY)}px`,
+                   zIndex: 1000,
+                 }}
+               />
              )}
+             {mousePos && canvasRef.current && (() => {
+               const canvas = canvasRef.current!;
+               const scale = canvas.offsetWidth / canvas.width;
+               if (gridLock) {
+                 const size = Math.max(1, brushSize);
+                 const origin: PaintGridOrigin = gridOrigin ?? {
+                   x: Math.floor(mousePos.x) - Math.floor(size / 2),
+                   y: Math.floor(mousePos.y) - Math.floor(size / 2),
+                   size,
+                   sizeY: size,
+                 };
+                 const cell = paintGridIndexAt(mousePos.x, mousePos.y, origin);
+                 const cellRect = paintGridCellRect(origin, cell.ix, cell.iy);
+                 return (
+                   <div className="brush-preview" style={{
+                     left: cellRect.x + cellRect.w / 2,
+                     top: cellRect.y + cellRect.h / 2,
+                     width: cellRect.w * scale,
+                     height: cellRect.h * scale,
+                     borderRadius: brushShape === 'circle' ? '50%' : '0',
+                   }} />
+                 );
+               }
+               return (
+                 <div className="brush-preview" style={{
+                   left: mousePos.x,
+                   top: mousePos.y,
+                   width: brushSize * scale * 2,
+                   height: brushSize * scale * 2,
+                   borderRadius: brushShape === 'circle' ? '50%' : '0',
+                 }} />
+               );
+             })()}
              </div>
            </div>
         </div>
-        <div className="modal-footer" style={{ padding: '20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '24px' }}>
-          <div className="slider-item" style={{ flex: 1, marginBottom: 0 }}>
+        <div className="modal-footer" style={{ padding: '20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '16px', flexWrap: 'wrap' }}>
+          <div className="slider-item" style={{ flex: 1, marginBottom: 0, minWidth: '140px' }}>
             <div className="slider-label">
               <span><Search size={14} /> Zoom</span>
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: '2px' }}>
@@ -4310,7 +4577,7 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
             </div>
             <input type="range" min="0.5" max="8" step="0.1" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
           </div>
-          <div className="slider-item" style={{ flex: 1, marginBottom: 0 }}>
+          <div className="slider-item" style={{ flex: 1, marginBottom: 0, minWidth: '140px' }}>
             <div className="slider-label">
               <span>Tamaño de Goma</span>
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: '2px' }}>
@@ -4346,7 +4613,65 @@ const EraserModal: React.FC<EraserModalProps> = ({ sprite, onSave, onClose, isWh
               </button>
             </div>
           </div>
-          <div style={{ display: 'flex', gap: '12px' }}>
+          <div className="slider-item" style={{ width: 'auto', marginBottom: 0 }}>
+            <div className="slider-label"><span>Grilla</span></div>
+            <div style={{ display: 'flex', gap: '4px', alignItems: 'center', flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                className={`btn-ghost ${gridLock ? 'active' : ''}`}
+                onClick={() => setGridLock((v) => !v)}
+                title="Tras el primer clic, la goma borra celdas enteras de la malla"
+                style={{ width: 'auto', padding: '4px 8px', gap: '4px' }}
+              >
+                <Grid size={14} />
+                {gridLock && gridOrigin ? describeGrid(gridOrigin) : 'Grilla'}
+              </button>
+              <button
+                type="button"
+                className={`btn-ghost ${gridOrigin?.auto ? 'active' : ''}`}
+                onClick={autoDetectGrid}
+                title="Mide los bloques del dibujo y arma la grilla con ese tamaño y desfase"
+                style={{ width: 'auto', padding: '4px 8px', gap: '4px' }}
+              >
+                <Target size={14} /> Auto
+              </button>
+              {gridOrigin && (
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: '3px', fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                  <input
+                    type="number"
+                    step={0.05}
+                    min={1}
+                    max={200}
+                    value={gridSizeDraft}
+                    onChange={(e) => setGridSizeDraft(e.target.value)}
+                    onBlur={commitGridSizeDraft}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        commitGridSizeDraft();
+                      }
+                    }}
+                    title="Tamaño de celda (admite decimales); se realinea con el dibujo"
+                    style={{
+                      width: '52px', background: '#1a1a1a', border: '1px solid #333', color: 'white',
+                      padding: '2px 4px', borderRadius: '4px', textAlign: 'right', fontSize: '0.75rem',
+                    }}
+                  />
+                  px
+                </span>
+              )}
+              <button
+                type="button"
+                className={`btn-ghost ${showPixelGrid ? 'active' : ''}`}
+                onClick={() => setShowPixelGrid((v) => !v)}
+                title="Malla de 1 px del lienzo (se ve a zoom 4× o más)"
+                style={{ width: 'auto', padding: '4px 8px' }}
+              >
+                Px
+              </button>
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: '12px', marginLeft: 'auto' }}>
             <button className="btn btn-outline" onClick={undo} disabled={historyLen === 0} title="Ctrl+Z">
               <RotateCcw size={16} /> Deshacer
             </button>
@@ -8316,67 +8641,6 @@ type PaintPrefs = {
 /** Color CSS a usar en una celda; varía por celda cuando el pincel está "sucio". */
 type PaintStyle = (ix: number, iy: number) => string;
 
-/** `size`/`sizeY` pueden ser fraccionarios cuando la grilla se detecta automáticamente. */
-type PaintGridOrigin = { x: number; y: number; size: number; sizeY: number; auto?: boolean };
-
-const paintGridMod = (n: number, m: number) => ((n % m) + m) % m;
-
-/** Índice de celda que contiene al píxel. */
-const paintGridIndexAt = (px: number, py: number, origin: PaintGridOrigin) => ({
-  ix: Math.floor((px - origin.x) / origin.size),
-  iy: Math.floor((py - origin.y) / origin.sizeY),
-});
-
-/** Rectángulo entero de una celda: los bordes se redondean para no dejar huecos ni solapes. */
-const paintGridCellRect = (origin: PaintGridOrigin, ix: number, iy: number) => {
-  const x = Math.round(origin.x + ix * origin.size);
-  const y = Math.round(origin.y + iy * origin.sizeY);
-  return {
-    x,
-    y,
-    w: Math.max(1, Math.round(origin.x + (ix + 1) * origin.size) - x),
-    h: Math.max(1, Math.round(origin.y + (iy + 1) * origin.sizeY) - y),
-  };
-};
-
-const formatGridSize = (n: number) => (Number.isInteger(n) ? `${n}` : n.toFixed(2).replace(/0$/, ''));
-
-const describeGrid = (origin: PaintGridOrigin) =>
-  Math.abs(origin.size - origin.sizeY) < 0.005
-    ? `${formatGridSize(origin.size)}px`
-    : `${formatGridSize(origin.size)}×${formatGridSize(origin.sizeY)}px`;
-
-/** Recorre celdas (índices) entre dos puntos de la malla, sin saltarse ni repetir. */
-const paintGridCellsOnLine = (
-  x0: number,
-  y0: number,
-  x1: number,
-  y1: number,
-): { x: number; y: number }[] => {
-  const cells: { x: number; y: number }[] = [];
-  const dx = Math.abs(x1 - x0);
-  const dy = Math.abs(y1 - y0);
-  const sx = x0 < x1 ? 1 : -1;
-  const sy = y0 < y1 ? 1 : -1;
-  let err = dx - dy;
-  let x = x0;
-  let y = y0;
-  while (true) {
-    cells.push({ x, y });
-    if (x === x1 && y === y1) break;
-    const e2 = 2 * err;
-    if (e2 > -dy) {
-      err -= dy;
-      x += sx;
-    }
-    if (e2 < dx) {
-      err += dx;
-      y += sy;
-    }
-  }
-  return cells;
-};
-
 const PAINT_PREFS_KEY = 'joa-paint-prefs';
 
 const snapPaintBrushSize = (v: number) =>
@@ -12248,77 +12512,20 @@ const App: React.FC = () => {
     commitSprites(next);
   };
 
-  const removeBlackBackground = async (img: HTMLImageElement, threshold: number): Promise<HTMLImageElement> => {
-    return new Promise((resolve) => {
-      const canvas = document.createElement('canvas');
-      canvas.width = img.width;
-      canvas.height = img.height;
-      const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
-      ctx.drawImage(img, 0, 0);
-      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const data = imgData.data;
-
-      const w = canvas.width;
-      const h = canvas.height;
-      
-      const isBlack = (idx: number) => {
-        return data[idx] <= threshold && data[idx + 1] <= threshold && data[idx + 2] <= threshold && data[idx + 3] > 0;
-      };
-
-      const stack: number[] = [];
-      
-      for (let x = 0; x < w; x++) {
-        const top = (0 * w + x) * 4;
-        if (isBlack(top)) stack.push(top);
-        
-        const bottom = ((h - 1) * w + x) * 4;
-        if (isBlack(bottom)) stack.push(bottom);
-      }
-      for (let y = 0; y < h; y++) {
-        const left = (y * w + 0) * 4;
-        if (isBlack(left)) stack.push(left);
-        
-        const right = (y * w + w - 1) * 4;
-        if (isBlack(right)) stack.push(right);
-      }
-
-      while (stack.length > 0) {
-        const idx = stack.pop()!;
-        if (data[idx + 3] === 0) continue;
-        
-        data[idx + 3] = 0;
-
-        const pixelIndex = idx / 4;
-        const x = pixelIndex % w;
-        const y = Math.floor(pixelIndex / w);
-
-        if (x > 0) {
-          const left = idx - 4;
-          if (data[left + 3] > 0 && isBlack(left)) stack.push(left);
-        }
-        if (x < w - 1) {
-          const right = idx + 4;
-          if (data[right + 3] > 0 && isBlack(right)) stack.push(right);
-        }
-        if (y > 0) {
-          const top = idx - w * 4;
-          if (data[top + 3] > 0 && isBlack(top)) stack.push(top);
-        }
-        if (y < h - 1) {
-          const bottom = idx + w * 4;
-          if (data[bottom + 3] > 0 && isBlack(bottom)) stack.push(bottom);
-        }
-      }
-
-      ctx.putImageData(imgData, 0, 0);
-      const newImg = new Image();
-      newImg.onload = () => resolve(newImg);
-      newImg.src = canvas.toDataURL('image/png');
-    });
+  const isBgColorMatch = (r: number, g: number, b: number, a: number, color: 'black' | 'white' | 'green', threshold: number) => {
+    if (a <= 0) return false;
+    if (color === 'black') return r <= threshold && g <= threshold && b <= threshold;
+    if (color === 'white') return r >= 255 - threshold && g >= 255 - threshold && b >= 255 - threshold;
+    // Verde chroma: cerca de #00FF00 con la misma tolerancia por canal.
+    return r <= threshold && g >= 255 - threshold && b <= threshold;
   };
 
-  /** Quita todo píxel negro (umbral), aunque esté cerrado por otros colores. */
-  const removeBlackBackgroundPrecise = async (img: HTMLImageElement, threshold: number): Promise<HTMLImageElement> => {
+  const removeColorBackground = async (
+    img: HTMLImageElement,
+    threshold: number,
+    color: 'black' | 'white' | 'green',
+    mode: 'smart' | 'precise',
+  ): Promise<HTMLImageElement> => {
     return new Promise((resolve) => {
       const canvas = document.createElement('canvas');
       canvas.width = img.width;
@@ -12327,16 +12534,58 @@ const App: React.FC = () => {
       ctx.drawImage(img, 0, 0);
       const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
       const data = imgData.data;
-      for (let i = 0; i < data.length; i += 4) {
-        if (
-          data[i + 3] > 0 &&
-          data[i] <= threshold &&
-          data[i + 1] <= threshold &&
-          data[i + 2] <= threshold
-        ) {
-          data[i + 3] = 0;
+      const w = canvas.width;
+      const h = canvas.height;
+      const matches = (idx: number) =>
+        isBgColorMatch(data[idx], data[idx + 1], data[idx + 2], data[idx + 3], color, threshold);
+
+      if (mode === 'precise') {
+        for (let i = 0; i < data.length; i += 4) {
+          if (matches(i)) data[i + 3] = 0;
+        }
+      } else {
+        const stack: number[] = [];
+        for (let x = 0; x < w; x++) {
+          const top = (0 * w + x) * 4;
+          if (matches(top)) stack.push(top);
+          const bottom = ((h - 1) * w + x) * 4;
+          if (matches(bottom)) stack.push(bottom);
+        }
+        for (let y = 0; y < h; y++) {
+          const left = (y * w + 0) * 4;
+          if (matches(left)) stack.push(left);
+          const right = (y * w + w - 1) * 4;
+          if (matches(right)) stack.push(right);
+        }
+
+        while (stack.length > 0) {
+          const idx = stack.pop()!;
+          if (data[idx + 3] === 0) continue;
+          data[idx + 3] = 0;
+
+          const pixelIndex = idx / 4;
+          const x = pixelIndex % w;
+          const y = Math.floor(pixelIndex / w);
+
+          if (x > 0) {
+            const left = idx - 4;
+            if (data[left + 3] > 0 && matches(left)) stack.push(left);
+          }
+          if (x < w - 1) {
+            const right = idx + 4;
+            if (data[right + 3] > 0 && matches(right)) stack.push(right);
+          }
+          if (y > 0) {
+            const top = idx - w * 4;
+            if (data[top + 3] > 0 && matches(top)) stack.push(top);
+          }
+          if (y < h - 1) {
+            const bottom = idx + w * 4;
+            if (data[bottom + 3] > 0 && matches(bottom)) stack.push(bottom);
+          }
         }
       }
+
       ctx.putImageData(imgData, 0, 0);
       const newImg = new Image();
       newImg.onload = () => resolve(newImg);
@@ -12376,35 +12625,49 @@ const App: React.FC = () => {
     }
   };
 
-  const removeBackgroundBulk = async (mode: 'smart' | 'precise' = 'smart') => {
+  const removeBackgroundBulk = async (
+    mode: 'smart' | 'precise' = 'smart',
+    color: 'black' | 'white' | 'green' = 'black',
+  ) => {
     if (selection.length === 0) return;
 
+    const prefKey =
+      color === 'white'
+        ? (mode === 'precise' ? LAST_BG_WHITE_PRECISE_TOL_KEY : LAST_BG_WHITE_SMART_TOL_KEY)
+        : color === 'green'
+          ? (mode === 'precise' ? LAST_BG_GREEN_PRECISE_TOL_KEY : LAST_BG_GREEN_SMART_TOL_KEY)
+          : (mode === 'precise' ? LAST_BG_BLACK_PRECISE_TOL_KEY : LAST_BG_BLACK_SMART_TOL_KEY);
+
+    const colorLabel = color === 'white' ? 'blanco' : color === 'green' ? 'verde' : 'negro';
+    const pureHint =
+      color === 'white' ? 'solo blanco absoluto'
+        : color === 'green' ? 'solo verde puro (#00FF00)'
+          : 'solo negro absoluto';
+
     const tol = promptLastInt(
-      mode === 'precise' ? LAST_BG_BLACK_PRECISE_TOL_KEY : LAST_BG_BLACK_SMART_TOL_KEY,
+      prefKey,
       mode === 'precise'
-        ? 'Negro preciso: borra TODO píxel negro (aunque esté cerrado). Tolerancia 0–100 (0 = solo negro absoluto):'
-        : 'Fondo inteligente: solo negro conectado al borde. Tolerancia 0–100 (0 = solo negro absoluto):',
+        ? `${colorLabel.charAt(0).toUpperCase()}${colorLabel.slice(1)} preciso: borra TODO píxel ${colorLabel} (aunque esté cerrado). Tolerancia 0–100 (0 = ${pureHint}):`
+        : `Fondo ${colorLabel} inteligente: solo ${colorLabel} conectado al borde. Tolerancia 0–100 (0 = ${pureHint}):`,
       5,
       { min: 0, max: 255, invalidMessage: 'Tolerancia inválida.' },
     );
     if (tol === null) return;
 
     setIsSaving(true);
-    
+
     try {
       const next = [...sprites];
       let changed = false;
       for (let i = 0; i < next.length; i++) {
         if (selection.includes(next[i].id)) {
           const src = next[i].originalImg || next[i].img;
-          const newImg = mode === 'precise'
-            ? await removeBlackBackgroundPrecise(src, tol)
-            : await removeBlackBackground(src, tol);
+          const newImg = await removeColorBackground(src, tol, color, mode);
           next[i] = { ...next[i], img: newImg, originalImg: newImg };
           changed = true;
         }
       }
-      
+
       if (changed) {
         commitSprites(next);
       }
@@ -13822,7 +14085,7 @@ const App: React.FC = () => {
               <button
                 className="btn btn-outline"
                 style={{ flex: 1, minWidth: 0, fontSize: '0.7rem', padding: '8px 6px', whiteSpace: 'normal', lineHeight: 1.25 }}
-                onClick={() => removeBackgroundBulk('smart')}
+                onClick={() => removeBackgroundBulk('smart', 'black')}
                 disabled={selection.length === 0}
                 title="Solo negro conectado al borde del canvas (no toca huecos cerrados)"
               >
@@ -13831,11 +14094,51 @@ const App: React.FC = () => {
               <button
                 className="btn btn-outline"
                 style={{ flex: 1, minWidth: 0, fontSize: '0.7rem', padding: '8px 6px', whiteSpace: 'normal', lineHeight: 1.25 }}
-                onClick={() => removeBackgroundBulk('precise')}
+                onClick={() => removeBackgroundBulk('precise', 'black')}
                 disabled={selection.length === 0}
                 title="Borra todo píxel negro bajo la tolerancia, aunque esté rodeado de otros colores"
               >
                 <Eraser size={14} /> Negro Preciso
+              </button>
+            </div>
+            <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
+              <button
+                className="btn btn-outline"
+                style={{ flex: 1, minWidth: 0, fontSize: '0.7rem', padding: '8px 6px', whiteSpace: 'normal', lineHeight: 1.25 }}
+                onClick={() => removeBackgroundBulk('smart', 'white')}
+                disabled={selection.length === 0}
+                title="Solo blanco conectado al borde del canvas (no toca huecos cerrados)"
+              >
+                <Eraser size={14} /> Fondo Blanco Inteligente
+              </button>
+              <button
+                className="btn btn-outline"
+                style={{ flex: 1, minWidth: 0, fontSize: '0.7rem', padding: '8px 6px', whiteSpace: 'normal', lineHeight: 1.25 }}
+                onClick={() => removeBackgroundBulk('precise', 'white')}
+                disabled={selection.length === 0}
+                title="Borra todo píxel blanco bajo la tolerancia, aunque esté rodeado de otros colores"
+              >
+                <Eraser size={14} /> Blanco Preciso
+              </button>
+            </div>
+            <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
+              <button
+                className="btn btn-outline"
+                style={{ flex: 1, minWidth: 0, fontSize: '0.7rem', padding: '8px 6px', whiteSpace: 'normal', lineHeight: 1.25 }}
+                onClick={() => removeBackgroundBulk('smart', 'green')}
+                disabled={selection.length === 0}
+                title="Solo verde chroma (#00FF00 ± tolerancia) conectado al borde del canvas"
+              >
+                <Eraser size={14} /> Fondo Verde Inteligente
+              </button>
+              <button
+                className="btn btn-outline"
+                style={{ flex: 1, minWidth: 0, fontSize: '0.7rem', padding: '8px 6px', whiteSpace: 'normal', lineHeight: 1.25 }}
+                onClick={() => removeBackgroundBulk('precise', 'green')}
+                disabled={selection.length === 0}
+                title="Borra todo píxel verde chroma bajo la tolerancia, aunque esté rodeado de otros colores"
+              >
+                <Eraser size={14} /> Verde Preciso
               </button>
             </div>
             <button
