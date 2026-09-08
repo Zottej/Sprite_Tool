@@ -882,6 +882,22 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 160px;
+  cursor: text;
+}
+
+.module-title-input {
+  font-size: 0.75rem;
+  font-weight: 700;
+  font-family: inherit;
+  color: var(--text-main);
+  background: #1a1a1a;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 2px 6px;
+  min-width: 0;
+  width: 100%;
+  max-width: 180px;
+  outline: none;
 }
 
 .module-canvas-area {
@@ -2004,4 +2020,219 @@ input[type="range"] { accent-color: var(--accent); height: 4px; }
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
+}
+
+/* --- Font maker (flujo aparte del padder) --- */
+.font-maker-modal {
+  max-width: 1100px;
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+.font-maker-banner {
+  margin: 0;
+  font-size: 0.72rem;
+  line-height: 1.35;
+  color: var(--text-muted);
+  max-width: 720px;
+}
+
+.font-maker-body {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 0;
+  flex: 1;
+  min-height: 0;
+  border-top: 1px solid var(--border);
+}
+
+.font-maker-side {
+  padding: 14px 14px 16px;
+  border-right: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-panel));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: auto;
+}
+
+.font-maker-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.font-maker-field input {
+  width: 100%;
+  background: #1a1a1a;
+  border: 1px solid #333;
+  color: white;
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-size: 0.8rem;
+}
+
+.font-maker-hint,
+.font-maker-warn {
+  margin: 0;
+  font-size: 0.7rem;
+  line-height: 1.35;
+}
+
+.font-maker-hint { color: var(--text-muted); }
+.font-maker-warn { color: #e8a45a; }
+
+.font-maker-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.font-maker-empty {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  border: 1px dashed var(--border);
+  margin: 16px;
+  border-radius: 8px;
+}
+
+.font-maker-grid {
+  flex: 1;
+  overflow: auto;
+  padding: 12px 14px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+  align-content: start;
+}
+
+.font-maker-card {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr) auto;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  align-items: start;
+}
+
+.font-maker-card.is-unmapped {
+  border-color: color-mix(in srgb, #e8a45a 55%, var(--border));
+}
+
+.font-maker-thumb {
+  width: 56px;
+  height: 56px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.font-maker-thumb img {
+  image-rendering: pixelated;
+  max-width: 100%;
+  max-height: 100%;
+}
+
+.font-maker-card-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.font-maker-name {
+  font-size: 0.72rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.font-maker-size {
+  font-size: 0.65rem;
+  color: var(--text-muted);
+}
+
+.font-maker-char-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.font-maker-char-row input {
+  width: 36px;
+  text-align: center;
+  background: #1a1a1a;
+  border: 1px solid #333;
+  color: white;
+  padding: 4px;
+  border-radius: 4px;
+  font-size: 0.9rem;
+}
+
+.font-maker-char-desc {
+  font-size: 0.65rem;
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.font-maker-remove {
+  align-self: start;
+}
+
+.font-maker-preview-block {
+  border-top: 1px solid var(--border);
+  padding: 10px 14px 14px;
+  background: var(--bg-panel);
+}
+
+.font-maker-preview-input {
+  width: 100%;
+  resize: vertical;
+  min-height: 56px;
+  background: #1a1a1a;
+  border: 1px solid #333;
+  color: white;
+  border-radius: 4px;
+  padding: 8px;
+  font-size: 0.8rem;
+  font-family: inherit;
+  margin-bottom: 8px;
+}
+
+.font-maker-preview-out {
+  min-height: 64px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  line-height: 1.25;
+  color: var(--text-main);
+  overflow: auto;
+  max-height: 160px;
+}
+
+@media (max-width: 800px) {
+  .font-maker-body {
+    grid-template-columns: 1fr;
+  }
+  .font-maker-side {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
 }

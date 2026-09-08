@@ -6,7 +6,7 @@ import {
   ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Pipette, Stamp, Lock, Columns2, FolderOpen, Rows3, Hash, ChevronDown, Maximize2, X, ShieldOff, Boxes
 } from 'lucide-react';
 import JSZip from 'jszip';
-import { canvasToBc7Dds, spriteNameToDds } from './ddsExport';
+import { canvasToBc7Dds } from './ddsExport';
 import {
   arrayBufferFromBlob,
   filesFromDesktopOpen,
@@ -30,6 +30,7 @@ import {
   rgbToHex,
   type DitherPattern,
 } from './paintPixelArt';
+import { FontMakerModal } from './font/FontMakerModal';
 
 // Chrome/Edge recuerdan la última carpeta asociada a este mismo ID.
 // Importar archivos usa otro ID: compartir el de carpetas hace fallar
@@ -3060,16 +3061,57 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
 
   const [isDragging, setIsDragging] = useState(false);
   const [compareDraft, setCompareDraft] = useState(sprite.compareValue ?? '');
+  const [renaming, setRenaming] = useState(false);
+  const [nameDraft, setNameDraft] = useState(sprite.name);
+  const renameInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     setCompareDraft(sprite.compareValue ?? '');
   }, [sprite.id, sprite.compareValue]);
+
+  useEffect(() => {
+    if (!renaming) setNameDraft(sprite.name);
+  }, [sprite.name, renaming]);
+
+  useEffect(() => {
+    if (!renaming) return;
+    const input = renameInputRef.current;
+    if (!input) return;
+    input.focus();
+    input.select();
+  }, [renaming]);
 
   const commitCompareValue = () => {
     const next = compareDraft.trim();
     const prev = (sprite.compareValue ?? '').trim();
     if (next === prev) return;
     onUpdateSprite(sprite.id, { compareValue: next || undefined });
+  };
+
+  const commitRename = () => {
+    let next = nameDraft.trim();
+    setRenaming(false);
+    if (!next) {
+      setNameDraft(sprite.name);
+      return;
+    }
+    // Mismo criterio que al importar: el nombre visible lleva extensión .png
+    if (!/\.(png|jpe?g|webp|gif|bmp|ico|dds)$/i.test(next)) {
+      next = `${next}.png`;
+    } else if (!/\.png$/i.test(next)) {
+      next = next.replace(/\.[^.]+$/i, '.png');
+    }
+    if (next === sprite.name) {
+      setNameDraft(sprite.name);
+      return;
+    }
+    onUpdateSprite(sprite.id, { name: next });
+    setNameDraft(next);
+  };
+
+  const cancelRename = () => {
+    setRenaming(false);
+    setNameDraft(sprite.name);
   };
 
   useEffect(() => {
@@ -3200,7 +3242,7 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
            }, 500);
          }}
          onDoubleClick={(e) => {
-           if ((e.target as HTMLElement).closest('input, textarea, button')) return;
+           if ((e.target as HTMLElement).closest('input, textarea, button, .module-title, .module-title-input')) return;
            e.preventDefault();
            e.stopPropagation();
            if (leftClickTimerRef.current) {
@@ -3243,11 +3285,51 @@ const SpriteModule: React.FC<SpriteModuleProps> = ({ sprite, isSelected, onToggl
            onToggleSelect(sprite.id, 'replace');
          }}>
       <div className="module-header">
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0, flex: 1 }}>
           {isSelected ? <CheckSquare size={14} color="#6b66ff" /> : <Square size={14} color="var(--text-muted)" />}
-          <span className="module-title" title={sprite.name}>{sprite.name}</span>
+          {renaming ? (
+            <input
+              ref={renameInputRef}
+              className="module-title-input"
+              value={nameDraft}
+              title="Enter para guardar · Esc para cancelar"
+              onChange={(e) => setNameDraft(e.target.value)}
+              onClick={(e) => e.stopPropagation()}
+              onDoubleClick={(e) => e.stopPropagation()}
+              onPointerDown={(e) => e.stopPropagation()}
+              onMouseDown={(e) => e.stopPropagation()}
+              onBlur={commitRename}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  commitRename();
+                } else if (e.key === 'Escape') {
+                  e.preventDefault();
+                  cancelRename();
+                }
+              }}
+            />
+          ) : (
+            <span
+              className="module-title"
+              title={`${sprite.name} — doble clic para renombrar`}
+              onDoubleClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (leftClickTimerRef.current) {
+                  window.clearTimeout(leftClickTimerRef.current);
+                  leftClickTimerRef.current = null;
+                }
+                setNameDraft(sprite.name);
+                setRenaming(true);
+              }}
+            >
+              {sprite.name}
+            </span>
+          )}
         </div>
-        <div style={{ display: 'flex', gap: '4px', position: 'relative' }}>
+        <div style={{ display: 'flex', gap: '4px', position: 'relative', flexShrink: 0 }}>
           <button className={`btn-ghost ${toolsMenu ? 'active' : ''}`}
             onClick={(e) => {
               e.stopPropagation();
@@ -6675,6 +6757,19 @@ const CopyRectModal: React.FC<CopyRectModalProps> = ({ sprite, sprites, onSave, 
     setPhase('place');
   };
 
+  const selectEntireSource = () => {
+    if (!source) return;
+    const next: CropRect = {
+      x: 0,
+      y: 0,
+      w: Math.max(1, source.img.width),
+      h: Math.max(1, source.img.height),
+    };
+    setCrop(next);
+    rebuildCrop(next);
+    setDraft(null);
+  };
+
   const onPlaceDown = (e: React.MouseEvent) => {
     if (!crop) return;
     const canvas = destCanvasRef.current;
@@ -7052,9 +7147,20 @@ const CopyRectModal: React.FC<CopyRectModalProps> = ({ sprite, sprites, onSave, 
             )}
             <div style={{ display: 'flex', gap: '8px', marginLeft: 'auto', flexWrap: 'wrap' }}>
               {phase === 'select' ? (
-                <button className="btn btn-primary" disabled={!crop} onClick={goPlace}>
-                  Colocar recorte
-                </button>
+                <>
+                  <button
+                    type="button"
+                    className="btn btn-outline"
+                    disabled={!source}
+                    onClick={selectEntireSource}
+                    title="Marca toda la imagen fuente como recorte"
+                  >
+                    <Maximize2 size={16} /> Seleccionar todo
+                  </button>
+                  <button className="btn btn-primary" disabled={!crop} onClick={goPlace}>
+                    Colocar recorte
+                  </button>
+                </>
               ) : (
                 <>
                   <button className="btn btn-outline" onClick={undo} disabled={historyLen === 0} title="Ctrl+Z">
@@ -10391,6 +10497,7 @@ const App: React.FC = () => {
   const [stretchTargetId, setStretchTargetId] = useState<string | null>(null);
   const [compositeTarget, setCompositeTarget] = useState<{ id: string, size: number } | null>(null);
   const [showAnimationModal, setShowAnimationModal] = useState(false);
+  const [showFontMakerModal, setShowFontMakerModal] = useState(false);
   const [animationInitialSprites, setAnimationInitialSprites] = useState<SpriteData[] | undefined>(undefined);
   const [animationModalKey, setAnimationModalKey] = useState(0);
   const [quadrantPreviewIds, setQuadrantPreviewIds] = useState<string[]>([]);
@@ -10399,7 +10506,7 @@ const App: React.FC = () => {
   const anyModalOpen = !!(
     eraserTargetId || ghostCompareTargetId || replaceTargetId || copyRectTargetId || splitPartsTargetId || pixelEditorTargetId || transformTargetId ||
     taggingTargetId || effectMaskTargetId || paintTargetId || bucketTargetId ||
-    stretchTargetId || compositeTarget || showAnimationModal || (quadrantPreviewIds.length > 0 && !quadrantPicking)
+    stretchTargetId || compositeTarget || showAnimationModal || showFontMakerModal || (quadrantPreviewIds.length > 0 && !quadrantPicking)
   );
   const quadrantBoard = columnView && quadrantView;
   const quadrantPreviewSprites = quadrantPreviewIds
@@ -13103,9 +13210,6 @@ const App: React.FC = () => {
     }
   };
 
-  const spriteNameToPng = (name: string) => name.replace(/\.[^.]+$/i, '') + '.png';
-  const spriteNameToJpg = (name: string) => name.replace(/\.[^.]+$/i, '') + '.jpg';
-
   const exportBatch = async (format: 'png' | 'jpg' | 'dds', destination: 'zip' | 'folder') => {
     if (sprites.length === 0) return;
     setBatchExportFormat(null);
@@ -13143,9 +13247,9 @@ const App: React.FC = () => {
       for (const s of sprites) {
         const canvas = renderSpriteToCanvas(s, true);
         const fileName =
-          format === 'dds' ? spriteNameToDds(s.name)
-          : format === 'jpg' ? spriteNameToJpg(s.name)
-          : spriteNameToPng(s.name);
+          format === 'dds' ? sanitizeExportFileName(s.name, '.dds')
+          : format === 'jpg' ? sanitizeExportFileName(s.name, '.jpg')
+          : sanitizeExportFileName(s.name, '.png');
         let content: Blob | ArrayBuffer;
 
         if (format === 'dds') {
@@ -13416,6 +13520,14 @@ const App: React.FC = () => {
            </button>
            <button className="btn btn-outline" onClick={exportGridSpritesheet} disabled={sprites.length === 0}>
              <Grid size={16} /> Exportar como Tira
+           </button>
+           <div style={{ height: '24px', width: '1px', background: 'var(--border)', margin: '0 2px', flexShrink: 0 }} />
+           <button
+             className="btn btn-outline"
+             onClick={() => setShowFontMakerModal(true)}
+             title="Flujo aparte: arma un .ttf pixel a partir de imágenes/glifos (no altera el tablero)"
+           >
+             <Type size={16} /> Crear fuente TTF
            </button>
            <input type="file" id="grid-up" hidden multiple accept="image/*" onChange={(e) => { if (e.target.files) handleFiles(e.target.files); e.target.value = ''; }} />
            <input type="file" id="cell-up" hidden accept="image/*" onChange={(e) => {
@@ -14885,6 +14997,21 @@ const App: React.FC = () => {
           key={animationModalKey}
           initialSprites={animationInitialSprites}
           onClose={() => setShowAnimationModal(false)}
+        />
+      )}
+      {showFontMakerModal && (
+        <FontMakerModal
+          seedSprites={
+            selection.length > 0
+              ? sprites
+                  .filter((s) => selection.includes(s.id))
+                  .map((s) => ({ id: s.id, name: s.name, img: s.img }))
+              : undefined
+          }
+          onSaveTtf={(blob, fileName) =>
+            saveBlobToDisk(blob, fileName, [{ name: 'TrueType Font', extensions: ['ttf'] }])
+          }
+          onClose={() => setShowFontMakerModal(false)}
         />
       )}
       {dragGhost && (
