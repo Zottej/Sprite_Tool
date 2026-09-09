@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { 
   Trash2, Plus, Archive, CheckSquare, Square, 
-  Target, FolderSync, Save, AlertTriangle, Eraser, RotateCcw, Search, MapPin, Pencil, MoreHorizontal, FlipHorizontal, FlipVertical, Droplets, Grid, Circle, Maximize, Layers, Play, Pause, Film, PaintBucket, Scissors, Type, Crop, Brush, ChevronLeft, ChevronRight,
+  Target, FolderSync, Save, AlertTriangle, Eraser, RotateCcw, RotateCw, Search, MapPin, Pencil, MoreHorizontal, FlipHorizontal, FlipVertical, Droplets, Grid, Circle, Maximize, Layers, Play, Pause, Film, PaintBucket, Scissors, Type, Crop, Brush, ChevronLeft, ChevronRight,
   ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Pipette, Stamp, Lock, Columns2, FolderOpen, Rows3, Hash, ChevronDown, Maximize2, X, ShieldOff, Boxes
 } from 'lucide-react';
 import JSZip from 'jszip';
@@ -6572,6 +6572,8 @@ const CopyRectModal: React.FC<CopyRectModalProps> = ({ sprite, sprites, onSave, 
   const [crop, setCrop] = useState<CropRect | null>(null);
   const [draft, setDraft] = useState<CropRect | null>(null);
   const [destPos, setDestPos] = useState({ x: 0, y: 0 });
+  const [pasteRotation, setPasteRotation] = useState(0);
+  const [rotatedPreview, setRotatedPreview] = useState<string | null>(null);
   const [historyLen, setHistoryLen] = useState(0);
   const [adjusting, setAdjusting] = useState(false);
 
@@ -6750,6 +6752,7 @@ const CopyRectModal: React.FC<CopyRectModalProps> = ({ sprite, sprites, onSave, 
 
   const goPlace = () => {
     if (!crop) return;
+    setPasteRotation(0);
     setDestPos({
       x: Math.max(0, Math.min(sprite.img.width - crop.w, crop.x)),
       y: Math.max(0, Math.min(sprite.img.height - crop.h, crop.y)),
@@ -6770,6 +6773,68 @@ const CopyRectModal: React.FC<CopyRectModalProps> = ({ sprite, sprites, onSave, 
     setDraft(null);
   };
 
+  const rotatedCropSize = (w: number, h: number, deg: number) => {
+    const rad = ((deg % 360) * Math.PI) / 180;
+    const cos = Math.abs(Math.cos(rad));
+    const sin = Math.abs(Math.sin(rad));
+    return {
+      w: Math.max(1, Math.round(w * cos + h * sin)),
+      h: Math.max(1, Math.round(w * sin + h * cos)),
+    };
+  };
+
+  const rotateCropCanvas = (src: HTMLCanvasElement, deg: number): HTMLCanvasElement => {
+    const norm = ((Math.round(deg) % 360) + 360) % 360;
+    if (norm === 0) return src;
+    const w = src.width;
+    const h = src.height;
+    const size = rotatedCropSize(w, h, norm);
+    const out = document.createElement('canvas');
+    out.width = size.w;
+    out.height = size.h;
+    const ctx = out.getContext('2d')!;
+    ctx.imageSmoothingEnabled = false;
+    ctx.translate(size.w / 2, size.h / 2);
+    ctx.rotate((norm * Math.PI) / 180);
+    ctx.drawImage(src, -w / 2, -h / 2);
+    return out;
+  };
+
+  const pasteSize = crop
+    ? rotatedCropSize(crop.w, crop.h, pasteRotation)
+    : { w: 0, h: 0 };
+
+  useEffect(() => {
+    const src = cropCanvasRef.current;
+    if (!src || !crop) {
+      setRotatedPreview(null);
+      return;
+    }
+    const norm = ((Math.round(pasteRotation) % 360) + 360) % 360;
+    if (norm === 0) {
+      setRotatedPreview(cropPreview);
+      return;
+    }
+    const rotated = rotateCropCanvas(src, norm);
+    setRotatedPreview(rotated.toDataURL('image/png'));
+  }, [pasteRotation, cropPreview, crop]);
+
+  const setPasteRotationKeepingCenter = (nextDeg: number) => {
+    if (!crop) {
+      setPasteRotation(nextDeg);
+      return;
+    }
+    const prev = rotatedCropSize(crop.w, crop.h, pasteRotation);
+    const next = rotatedCropSize(crop.w, crop.h, nextDeg);
+    const cx = destPos.x + prev.w / 2;
+    const cy = destPos.y + prev.h / 2;
+    setDestPos({
+      x: Math.round(cx - next.w / 2),
+      y: Math.round(cy - next.h / 2),
+    });
+    setPasteRotation(((nextDeg % 360) + 360) % 360);
+  };
+
   const onPlaceDown = (e: React.MouseEvent) => {
     if (!crop) return;
     const canvas = destCanvasRef.current;
@@ -6777,15 +6842,17 @@ const CopyRectModal: React.FC<CopyRectModalProps> = ({ sprite, sprites, onSave, 
     const rect = canvas.getBoundingClientRect();
     const mx = (e.clientX - rect.left) / zoom;
     const my = (e.clientY - rect.top) / zoom;
+    const pw = pasteSize.w;
+    const ph = pasteSize.h;
     const inside =
-      mx >= destPos.x && mx < destPos.x + crop.w &&
-      my >= destPos.y && my < destPos.y + crop.h;
+      mx >= destPos.x && mx < destPos.x + pw &&
+      my >= destPos.y && my < destPos.y + ph;
     if (!inside) {
       setDestPos({
-        x: Math.round(mx - crop.w / 2),
-        y: Math.round(my - crop.h / 2),
+        x: Math.round(mx - pw / 2),
+        y: Math.round(my - ph / 2),
       });
-      placeDragRef.current = { mx, my, ox: Math.round(mx - crop.w / 2), oy: Math.round(my - crop.h / 2) };
+      placeDragRef.current = { mx, my, ox: Math.round(mx - pw / 2), oy: Math.round(my - ph / 2) };
       return;
     }
     placeDragRef.current = { mx, my, ox: destPos.x, oy: destPos.y };
@@ -6838,6 +6905,11 @@ const CopyRectModal: React.FC<CopyRectModalProps> = ({ sprite, sprites, onSave, 
         return;
       }
       if (phase !== 'place' || !crop) return;
+      if (e.key.toLowerCase() === 'r') {
+        e.preventDefault();
+        setPasteRotationKeepingCenter(pasteRotation + (e.shiftKey ? -90 : 90));
+        return;
+      }
       const step = e.shiftKey ? 10 : 1;
       if (e.key === 'ArrowLeft') { e.preventDefault(); setDestPos((p) => ({ ...p, x: p.x - step })); }
       if (e.key === 'ArrowRight') { e.preventDefault(); setDestPos((p) => ({ ...p, x: p.x + step })); }
@@ -6846,7 +6918,7 @@ const CopyRectModal: React.FC<CopyRectModalProps> = ({ sprite, sprites, onSave, 
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [phase, crop]);
+  }, [phase, crop, pasteRotation, destPos]);
 
   const stampCrop = () => {
     const canvas = destCanvasRef.current;
@@ -6855,11 +6927,12 @@ const CopyRectModal: React.FC<CopyRectModalProps> = ({ sprite, sprites, onSave, 
     pushHistory();
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     ctx.imageSmoothingEnabled = false;
+    const rotated = rotateCropCanvas(cropCanvas, pasteRotation);
     if (includeEmpty) {
-      ctx.clearRect(destPos.x, destPos.y, crop.w, crop.h);
+      ctx.clearRect(destPos.x, destPos.y, rotated.width, rotated.height);
     }
     ctx.globalCompositeOperation = 'source-over';
-    ctx.drawImage(cropCanvas, destPos.x, destPos.y);
+    ctx.drawImage(rotated, destPos.x, destPos.y);
   };
 
   const handleReset = () => {
@@ -7029,16 +7102,16 @@ const CopyRectModal: React.FC<CopyRectModalProps> = ({ sprite, sprites, onSave, 
                   position: 'absolute',
                   left: destPos.x,
                   top: destPos.y,
-                  width: crop.w,
-                  height: crop.h,
+                  width: pasteSize.w,
+                  height: pasteSize.h,
                   outline: '1px solid #6b66ff',
                   outlineOffset: 0,
                   pointerEvents: 'none',
                   imageRendering: 'pixelated',
                 }}>
-                  {cropPreview && !hidePreview && previewOpacity > 0 && (
+                  {rotatedPreview && !hidePreview && previewOpacity > 0 && (
                     <img
-                      src={cropPreview}
+                      src={rotatedPreview}
                       alt=""
                       draggable={false}
                       style={{
@@ -7070,7 +7143,7 @@ const CopyRectModal: React.FC<CopyRectModalProps> = ({ sprite, sprites, onSave, 
                 {phase === 'select'
                   ? `Recorte ${shownRect.w}×${shownRect.h} en (${shownRect.x}, ${shownRect.y}) · Arrastrá los lados para ajustar`
                   : crop
-                    ? `Pegar ${crop.w}×${crop.h} en (${destPos.x}, ${destPos.y})`
+                    ? `Pegar ${pasteSize.w}×${pasteSize.h}${pasteRotation ? ` · ${Math.round(pasteRotation)}°` : ''} en (${destPos.x}, ${destPos.y}) · R/+90° Shift+R/−90°`
                     : ''}
               </span>
             )}
@@ -7142,6 +7215,43 @@ const CopyRectModal: React.FC<CopyRectModalProps> = ({ sprite, sprites, onSave, 
                   value={previewOpacity}
                   onChange={(e) => setPreviewOpacity(parseInt(e.target.value, 10))}
                   title="Transparencia de lo que vas a pegar"
+                />
+              </div>
+            )}
+            {phase === 'place' && (
+              <div className="slider-item" style={{ flex: 1, marginBottom: 0, minWidth: '180px' }}>
+                <div className="slider-label">
+                  <span>Rotación</span>
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                    <button
+                      type="button"
+                      className="btn-ghost"
+                      title="−90° (Shift+R)"
+                      onClick={() => setPasteRotationKeepingCenter(pasteRotation - 90)}
+                      style={{ width: 'auto', padding: '2px 4px' }}
+                    >
+                      <RotateCcw size={14} />
+                    </button>
+                    <span>{Math.round(pasteRotation)}°</span>
+                    <button
+                      type="button"
+                      className="btn-ghost"
+                      title="+90° (R)"
+                      onClick={() => setPasteRotationKeepingCenter(pasteRotation + 90)}
+                      style={{ width: 'auto', padding: '2px 4px' }}
+                    >
+                      <RotateCw size={14} />
+                    </button>
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max="360"
+                  step="1"
+                  value={pasteRotation}
+                  onChange={(e) => setPasteRotationKeepingCenter(parseFloat(e.target.value))}
+                  title="Rotá el recorte antes de pegarlo"
                 />
               </div>
             )}
@@ -7711,7 +7821,7 @@ const TransformModal: React.FC<TransformModalProps> = ({ sprite, onSave, onClose
   );
 };
 
-// --- Stretch Modal Component ---
+// --- Stretch Modal: aplasta/estira el dibujo dentro del mismo tamaño de PNG ---
 interface StretchModalProps {
   sprite: SpriteData;
   onSave: (id: string, updates: Partial<SpriteData>) => void;
@@ -7719,58 +7829,122 @@ interface StretchModalProps {
   isWhiteBg?: boolean;
 }
 
+/** Escala el PNG alrededor del centro del dibujo, manteniendo el tamaño del archivo. */
+const bakeContentStretch = (
+  img: HTMLImageElement,
+  stretchX: number,
+  stretchY: number,
+): HTMLCanvasElement => {
+  const w = Math.max(1, img.width);
+  const h = Math.max(1, img.height);
+  const sx = Math.max(0.01, stretchX);
+  const sy = Math.max(0.01, stretchY);
+  const out = document.createElement('canvas');
+  out.width = w;
+  out.height = h;
+  const ctx = out.getContext('2d')!;
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, w, h);
+  const center = getPaintedContentCenter(img);
+  const dw = w * sx;
+  const dh = h * sy;
+  const dx = center.x * (1 - sx);
+  const dy = center.y * (1 - sy);
+  ctx.drawImage(img, 0, 0, w, h, dx, dy, dw, dh);
+  return out;
+};
+
 const StretchModal: React.FC<StretchModalProps> = ({ sprite, onSave, onClose, isWhiteBg }) => {
-  const [stretchX, setStretchX] = useState(sprite.stretchX || 1);
-  const [stretchY, setStretchY] = useState(sprite.stretchY || 1);
+  const [stretchX, setStretchX] = useState(1);
+  const [stretchY, setStretchY] = useState(1);
   const [zoom, setZoom] = useState(() => clampNum(loadPref('joa-stretch-zoom', 1), 0.5, 8, 1));
+  const [busy, setBusy] = useState(false);
   useModalWheelControls({ zoom, setZoom });
-  
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const hadResolutionStretch = (sprite.stretchX || 1) !== 1 || (sprite.stretchY || 1) !== 1;
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d')!;
-    
-    // Scale preview to fit 800x800 area
-    const baseSc = (sprite.scale || 1) * 0.8 * zoom;
-    const sw = sprite.img.width * baseSc * stretchX;
-    const sh = sprite.img.height * baseSc * stretchY;
-    
-    canvas.width = 800;
-    canvas.height = 800;
-    ctx.clearRect(0, 0, 800, 800);
+    const w = Math.max(1, sprite.img.width);
+    const h = Math.max(1, sprite.img.height);
+    const fit = Math.min(760 / w, 760 / h) * zoom;
+    const fw = Math.max(1, Math.round(w * fit));
+    const fh = Math.max(1, Math.round(h * fit));
+    canvas.width = fw;
+    canvas.height = fh;
     ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, fw, fh);
 
-    ctx.save();
-    ctx.translate(400, 400);
-    ctx.drawImage(sprite.img, -sw/2, -sh/2, sw, sh);
-    ctx.restore();
+    const baked = bakeContentStretch(sprite.img, stretchX, stretchY);
+    ctx.drawImage(baked, 0, 0, w, h, 0, 0, fw, fh);
+
+    ctx.strokeStyle = 'rgba(107, 102, 255, 0.85)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(0.5, 0.5, fw - 1, fh - 1);
   }, [sprite, stretchX, stretchY, zoom]);
 
   useEffect(() => {
     savePref('joa-stretch-zoom', zoom);
   }, [zoom]);
 
+  const handleSave = () => {
+    setBusy(true);
+    try {
+      const baked = bakeContentStretch(sprite.img, stretchX, stretchY);
+      const dataUrl = baked.toDataURL('image/png');
+      const newImg = new Image();
+      newImg.onload = () => {
+        onSave(sprite.id, {
+          img: newImg,
+          stretchX: 1,
+          stretchY: 1,
+        });
+      };
+      newImg.onerror = () => {
+        setBusy(false);
+        alert('No se pudo guardar el estirado.');
+      };
+      newImg.src = dataUrl;
+    } catch (err) {
+      console.error(err);
+      setBusy(false);
+      alert('No se pudo aplicar el estirado.');
+    }
+  };
+
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal-content" onClick={e => e.stopPropagation()}>
         <div className="modal-header">
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <Maximize size={18} color="var(--accent)" />
-            <h3 style={{ fontSize: '1rem' }}>Estirar: {sprite.name}</h3>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <Maximize size={18} color="var(--accent)" />
+              <h3 style={{ fontSize: '1rem', margin: 0 }}>Estirar: {sprite.name}</h3>
+            </div>
+            <p style={{ margin: 0, fontSize: '0.72rem', color: 'var(--text-muted)', lineHeight: 1.35 }}>
+              Aplasta o estira el dibujo dentro del PNG ({sprite.img.width}×{sprite.img.height}). La resolución del archivo no cambia.
+            </p>
           </div>
           <button className="btn-ghost" onClick={onClose}><Trash2 size={16} /></button>
         </div>
-        <div className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`} style={{ overflow: 'auto' }}>
-           <canvas ref={canvasRef} />
+        <div className={`eraser-workspace checker-mini ${isWhiteBg ? 'white-bg' : ''}`} style={{ overflow: 'auto', display: 'grid', placeItems: 'center' }}>
+           <canvas ref={canvasRef} style={{ imageRendering: 'pixelated' }} />
         </div>
-        <div className="modal-footer" style={{ padding: '20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '24px' }}>
-          <div className="slider-item" style={{ flex: 1, marginBottom: 0 }}>
+        <div className="modal-footer" style={{ padding: '20px', background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', gap: '16px', flexWrap: 'wrap' }}>
+          {hadResolutionStretch && (
+            <p style={{ margin: 0, width: '100%', fontSize: '0.72rem', color: '#e8a45a' }}>
+              Este sprite tenía estirado viejo sobre la resolución ({(sprite.stretchX || 1).toFixed(2)}×{(sprite.stretchY || 1).toFixed(2)}).
+              Al guardar queda limpio: solo el dibujo dentro del tamaño real del PNG.
+            </p>
+          )}
+          <div className="slider-item" style={{ flex: 1, marginBottom: 0, minWidth: '140px' }}>
             <div className="slider-label"><span>Ancho (X)</span><span>{stretchX.toFixed(2)}x</span></div>
             <input type="range" min="0.1" max="4" step="0.01" value={stretchX} onChange={(e) => setStretchX(parseFloat(e.target.value))} />
           </div>
-          <div className="slider-item" style={{ flex: 1, marginBottom: 0 }}>
+          <div className="slider-item" style={{ flex: 1, marginBottom: 0, minWidth: '140px' }}>
             <div className="slider-label"><span>Alto (Y)</span><span>{stretchY.toFixed(2)}x</span></div>
             <input type="range" min="0.1" max="4" step="0.01" value={stretchY} onChange={(e) => setStretchY(parseFloat(e.target.value))} />
           </div>
@@ -7778,9 +7952,17 @@ const StretchModal: React.FC<StretchModalProps> = ({ sprite, onSave, onClose, is
             <div className="slider-label"><span>Zoom</span><span>{zoom.toFixed(1)}x</span></div>
             <input type="range" min="0.5" max="8" step="0.1" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} />
           </div>
-          <div style={{ display: 'flex', gap: '12px' }}>
-            <button className="btn btn-outline" onClick={() => { setStretchX(1); setStretchY(1); }}>Reset</button>
-            <button className="btn btn-primary" style={{ paddingLeft: '24px', paddingRight: '24px' }} onClick={() => onSave(sprite.id, { stretchX, stretchY })}>Guardar Cambios</button>
+          <div style={{ display: 'flex', gap: '12px', marginLeft: 'auto' }}>
+            <button type="button" className="btn btn-outline" onClick={() => { setStretchX(1); setStretchY(1); }}>Reset</button>
+            <button
+              type="button"
+              className="btn btn-primary"
+              style={{ paddingLeft: '24px', paddingRight: '24px' }}
+              disabled={busy}
+              onClick={handleSave}
+            >
+              {busy ? 'Guardando…' : 'Guardar Cambios'}
+            </button>
           </div>
         </div>
       </div>
